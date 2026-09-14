@@ -19,6 +19,7 @@ import {
   getTrelloReadiness,
   requireTrelloReadiness,
   revokeBlacklistCard,
+  type TrelloReadiness,
 } from "./trello";
 import {
   findActiveSnapshot,
@@ -92,6 +93,26 @@ const commands = [
         .setDescription("Optional: ping the Discord member directly."),
     ),
 ].map((command) => command.toJSON());
+
+export type BotRecoveryStatus = "pending" | "successful" | "blocked";
+
+interface BotRecoveryState {
+  status: BotRecoveryStatus;
+  lastAttemptAt: string | null;
+  lastSuccessfulAt: string | null;
+  error: string | null;
+}
+
+const recovery: BotRecoveryState = {
+  status: "pending",
+  lastAttemptAt: null,
+  lastSuccessfulAt: null,
+  error: null,
+};
+
+let discordClient: Client | null = null;
+let commandsRegistered = false;
+let recoveryAttempt: Promise<BotRefreshResult> | null = null;
 
 function keyFor(guildId: string, robloxUserId: number): string {
   return `${guildId}:${robloxUserId}`;
@@ -287,30 +308,60 @@ export function getBotStatus() {
   return {
     configured: getMissingConfiguration().length === 0,
     missing: getMissingConfiguration(),
-    commandsEnabled: trello.ready,
+    commandsEnabled: commandsRegistered,
+    discordConnected: discordClient?.isReady() ?? false,
+    recoveryStatus: recovery.status,
+    recovery: {
+      ...recovery,
+    },
+    trelloReady: trello.ready,
   };
 }
 
-export async function startBot(): Promise<void> {
-  const missing = getMissingConfiguration();
-  if (missing.length > 0) {
-    logger.warn({ missing }, "Blacklist bot is waiting for configuration");
-    return;
+function setRecoveryStatus(
+  status: BotRecoveryStatus,
+  error: string | null = null,
+): void {
+  recovery.status = status;
+  recovery.error = error;
+  if (status === "successful") {
+    recovery.lastSuccessfulAt = new Date().toISOString();
   }
+}
 
-  const trello = await checkTrelloReadiness();
-  if (!trello.ready) {
-    logger.warn(
+function refreshResult(): BotRefreshResult {
+  const bot = getBotStatus();
+  return {
+    ...bot,
+    trello: getTrelloReadiness(),
+    error: recovery.error,
+  };
+}
+
+async function registerCommands(readyClient: Client<true>): Promise<void> {
+  if (config.discordGuildId) {
+    const guild = await readyClient.guilds.fetch(config.discordGuildId);
+    await guild.commands.set(commands);
+    logger.info(
       {
-        readiness: trello.status,
-        missingLists: trello.missingLists,
-        error: trello.error,
+        guildId: config.discordGuildId,
+        commandCount: commands.length,
       },
-      "Blacklist bot is waiting for Trello board readiness",
+      "Blacklist commands registered for guild",
     );
-    return;
+  } else {
+    const rest = new REST({ version: "10" }).setToken(config.discordToken!);
+    await rest.put(Routes.applicationCommands(readyClient.user.id), {
+      body: commands,
+    });
+    logger.info(
+      { commandCount: commands.length },
+      "Blacklist commands registered globally",
+    );
   }
+}
 
+async function connectDiscord(): Promise<void> {
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
@@ -320,23 +371,20 @@ export async function startBot(): Promise<void> {
     partials: [Partials.Channel],
   });
 
-  client.once("ready", async (readyClient) => {
-    if (config.discordGuildId) {
-      const guild = await readyClient.guilds.fetch(config.discordGuildId);
-      await guild.commands.set(commands);
-      logger.info(
-        { guildId: config.discordGuildId, commandCount: commands.length },
-        "Blacklist commands registered for guild",
-      );
-    } else {
-      const rest = new REST({ version: "10" }).setToken(config.discordToken!);
-      await rest.put(Routes.applicationCommands(readyClient.user.id), {
-        body: commands,
-      });
-      logger.info({ commandCount: commands.length }, "Blacklist commands registered globally");
-    }
+  discordClient = client;
+  commandsRegistered = false;
 
-    logger.info({ user: readyClient.user.tag }, "Discord blacklist bot is online");
+  const ready = new Promise<void>((resolve, reject) => {
+    client.once("ready", (readyClient) => {
+      void registerCommands(readyClient)
+        .then(() => {
+          commandsRegistered = true;
+          setRecoveryStatus("successful");
+          logger.info({ user: readyClient.user.tag }, "Discord blacklist bot is online");
+          resolve();
+        })
+        .catch(reject);
+    });
   });
 
   client.on("interactionCreate", (interaction) => {
@@ -349,5 +397,96 @@ export async function startBot(): Promise<void> {
     logger.error({ err: error }, "Discord client error");
   });
 
-  await client.login(config.discordToken);
+  try {
+    await client.login(config.discordToken);
+    await ready;
+  } catch (error) {
+    commandsRegistered = false;
+    if (discordClient === client) {
+      discordClient = null;
+    }
+    client.destroy();
+    throw error;
+  }
+}
+
+export interface BotRefreshResult {
+  configured: boolean;
+  missing: string[];
+  commandsEnabled: boolean;
+  discordConnected: boolean;
+  recoveryStatus: BotRecoveryStatus;
+  recovery: BotRecoveryState;
+  trelloReady: boolean;
+  trello: TrelloReadiness;
+  error: string | null;
+}
+
+export async function refreshBot(): Promise<BotRefreshResult> {
+  if (recoveryAttempt) {
+    return recoveryAttempt;
+  }
+
+  recoveryAttempt = (async () => {
+    recovery.lastAttemptAt = new Date().toISOString();
+    setRecoveryStatus("pending");
+
+    try {
+      const trello = await checkTrelloReadiness();
+      if (!trello.ready) {
+        setRecoveryStatus("blocked", trello.error);
+        logger.warn(
+          {
+            readiness: trello.status,
+            missingLists: trello.missingLists,
+            error: trello.error,
+          },
+          "Blacklist bot is waiting for Trello board readiness",
+        );
+        return refreshResult();
+      }
+
+      const missing = getMissingConfiguration();
+      if (missing.length > 0) {
+        const error = `Bot configuration is incomplete: ${missing.join(", ")}.`;
+        setRecoveryStatus("blocked", error);
+        logger.warn({ missing }, "Blacklist bot is waiting for configuration");
+        return refreshResult();
+      }
+
+      if (discordClient?.isReady() && commandsRegistered) {
+        setRecoveryStatus("successful");
+        return refreshResult();
+      }
+
+      await connectDiscord();
+      return refreshResult();
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "The bot could not be started.";
+      setRecoveryStatus("blocked", message);
+      logger.error({ err: error }, "Blacklist bot recovery failed");
+      return refreshResult();
+    }
+  })();
+
+  try {
+    return await recoveryAttempt;
+  } finally {
+    recoveryAttempt = null;
+  }
+}
+
+export async function startBot(): Promise<void> {
+  const result = await refreshBot();
+  if (!result.commandsEnabled) {
+    logger.warn(
+      {
+        recoveryStatus: result.recoveryStatus,
+        trello: result.trello,
+        error: result.error,
+      },
+      "Blacklist bot is not online after recovery attempt",
+    );
+  }
 }

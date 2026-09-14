@@ -152,7 +152,7 @@ export async function checkTrelloReadiness(): Promise<TrelloReadiness> {
         ready: false,
         status: "missing_lists",
         missingLists,
-        error: `Missing Trello list(s) on the configured board: ${missingLists.join(", ")}. Create or rename them, then restart the bot.`,
+        error: `Missing Trello list(s) on the configured board: ${missingLists.join(", ")}. Create or rename them, then refresh the bot.`,
       });
     }
 
@@ -168,7 +168,7 @@ export async function checkTrelloReadiness(): Promise<TrelloReadiness> {
       status: "unavailable",
       missingLists: [],
       error:
-        "Trello readiness could not be verified. Check the configured board and Trello access, then restart the bot.",
+        "Trello readiness could not be verified. Check the configured board and Trello access, then refresh the bot.",
     });
   }
 }

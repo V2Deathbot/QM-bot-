@@ -17,9 +17,11 @@ process.env.TRELLO_TOKEN = "test-token";
 process.env.TRELLO_BOARD_ID = "test-board";
 process.env.TRELLO_LIST_REVOKED = "Revoked Blacklist";
 
+const { config } = await import("../src/bot/config.ts");
 const { findActiveSnapshot, revokeRoleSnapshot, saveRoleSnapshot } =
   await import("../src/bot/role-store.ts");
-const { revokeBlacklistCard } = await import("../src/bot/trello.ts");
+const { checkTrelloReadiness, revokeBlacklistCard } =
+  await import("../src/bot/trello.ts");
 const { handleBlacklist } = await import("../src/bot/index.ts");
 
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -216,6 +218,36 @@ test("restores removed roles when Trello blacklist card creation fails", async (
     const snapshot = await findActiveSnapshot("guild-failure", 42);
     assert.deepEqual(snapshot?.roleIds, ["role-1", "role-2"]);
     assert.equal(snapshot?.status, "active");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rechecks all configured Trello lists after a setup fix", async () => {
+  let listsFixed = false;
+  const configuredListNames = [...new Set(Object.values(config.trelloListNames))];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const pathname = requestPath(input);
+    if (!pathname.endsWith("/lists")) {
+      throw new Error(`Unexpected readiness request: ${pathname}`);
+    }
+
+    const lists = (listsFixed ? configuredListNames : configuredListNames.slice(0, 1))
+      .map((name, index) => ({ id: `list-${index}`, name }));
+    return jsonResponse(lists);
+  };
+
+  try {
+    const blocked = await checkTrelloReadiness();
+    assert.equal(blocked.status, "missing_lists");
+    assert.deepEqual(blocked.missingLists, configuredListNames.slice(1));
+
+    listsFixed = true;
+    const ready = await checkTrelloReadiness();
+    assert.equal(ready.status, "ready");
+    assert.equal(ready.ready, true);
+    assert.deepEqual(ready.missingLists, []);
   } finally {
     globalThis.fetch = originalFetch;
   }
