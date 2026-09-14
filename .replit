@@ -32,11 +32,3 @@ TRELLO_LIST_CONDITIONAL = "Conditional Blacklists"
 TRELLO_LIST_GROUP = "Blacklisted Groups"
 TRELLO_LIST_PERMANENT = "Permanent Blacklists"
 TRELLO_LIST_REVOKED = "Revoked Blacklists"
-
-[[ports]]
-localPort = 8080
-externalPort = 8080
-
-[[ports]]
-localPort = 8081
-externalPort = 80
