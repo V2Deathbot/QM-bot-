@@ -21,6 +21,28 @@
       "revocationCardMovedAt": "2026-09-14T15:46:11.443Z",
       "revokedAt": "2026-09-14T15:46:11.621Z",
       "revocationNotificationAttemptedAt": "2026-09-14T15:46:11.621Z"
+    },
+    {
+      "key": "1114860005334716422:663770855",
+      "guildId": "1114860005334716422",
+      "discordUserId": "1170780243754242199",
+      "robloxUserId": 663770855,
+      "robloxUsername": "26138z",
+      "roleIds": [
+        "1548958021160411216"
+      ],
+      "cardId": "6aa87e37fb1df5e020ccf077",
+      "cardUrl": "https://trello.com/c/Z6oEKEYm/6-26138z-663770855",
+      "blacklistType": "permanent",
+      "blacklistReason": "Super cool best qm had to get him out to make it fair",
+      "source": "command",
+      "blacklistNotificationAttemptedAt": "2026-09-14T23:07:37.311Z",
+      "status": "revoked",
+      "createdAt": "2026-09-14T23:07:37.311Z",
+      "cardUpdatedAt": "2026-09-14T23:07:36.326Z",
+      "revocationCardMovedAt": "2026-09-14T23:11:41.246Z",
+      "revokedAt": "2026-09-14T23:11:41.497Z",
+      "revocationNotificationAttemptedAt": "2026-09-14T23:11:41.497Z"
     }
   ],
   "notes": [
