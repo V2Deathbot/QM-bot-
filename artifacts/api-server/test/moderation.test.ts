@@ -1,4 +1,5 @@
 import { mkdtemp, readFile } from "node:fs/promises";
+import { createServer, request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
@@ -22,7 +23,16 @@ const { findActiveSnapshot, revokeRoleSnapshot, saveRoleSnapshot } =
   await import("../src/bot/role-store.ts");
 const { checkTrelloReadiness, revokeBlacklistCard } =
   await import("../src/bot/trello.ts");
-const { handleBlacklist } = await import("../src/bot/index.ts");
+const { handleBlacklist, refreshBot } = await import("../src/bot/index.ts");
+const { default: app } = await import("../src/app.ts");
+
+type MutableTrelloConfig = {
+  trelloApiKey: string | undefined;
+  trelloToken: string | undefined;
+  trelloBoardId: string | undefined;
+};
+
+const mutableTrelloConfig = config as unknown as MutableTrelloConfig;
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -33,6 +43,64 @@ function jsonResponse(payload: unknown, status = 200): Response {
 
 function requestPath(input: RequestInfo | URL): string {
   return new URL(input.toString()).pathname;
+}
+
+async function requestBotStatus(): Promise<{
+  statusCode: number;
+  body: Record<string, unknown>;
+  raw: string;
+}> {
+  const server = createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("The test server did not expose a TCP address.");
+  }
+
+  try {
+    const response = await new Promise<{ statusCode: number; raw: string }>(
+      (resolve, reject) => {
+        const request = httpRequest(
+          {
+            hostname: "127.0.0.1",
+            port: address.port,
+            path: "/api/bot/status",
+            method: "GET",
+          },
+          (response) => {
+            const chunks: Buffer[] = [];
+            response.on("data", (chunk: Buffer) => chunks.push(chunk));
+            response.on("end", () =>
+              resolve({
+                statusCode: response.statusCode ?? 0,
+                raw: Buffer.concat(chunks).toString("utf8"),
+              }),
+            );
+          },
+        );
+        request.on("error", reject);
+        request.end();
+      },
+    );
+
+    return {
+      ...response,
+      body: JSON.parse(response.raw) as Record<string, unknown>,
+    };
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+}
+
+function restoreTrelloConfig(previous: MutableTrelloConfig): void {
+  Object.assign(mutableTrelloConfig, previous);
 }
 
 test("persists snapshots and only considers matching active snapshots restorable", async () => {
@@ -223,31 +291,132 @@ test("restores removed roles when Trello blacklist card creation fails", async (
   }
 });
 
-test("rechecks all configured Trello lists after a setup fix", async () => {
-  let listsFixed = false;
+test("reports Trello readiness when every configured list is available", async () => {
   const configuredListNames = [...new Set(Object.values(config.trelloListNames))];
+  const requests: {
+    url: string;
+    method: string | undefined;
+    body: BodyInit | null | undefined;
+  }[] = [];
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (input) => {
-    const pathname = requestPath(input);
-    if (!pathname.endsWith("/lists")) {
-      throw new Error(`Unexpected readiness request: ${pathname}`);
-    }
-
-    const lists = (listsFixed ? configuredListNames : configuredListNames.slice(0, 1))
-      .map((name, index) => ({ id: `list-${index}`, name }));
-    return jsonResponse(lists);
+  globalThis.fetch = async (input, init) => {
+    requests.push({
+      url: input.toString(),
+      method: init?.method,
+      body: init?.body,
+    });
+    return jsonResponse(
+      configuredListNames.map((name, index) => ({ id: `list-${index}`, name })),
+    );
   };
 
   try {
-    const blocked = await checkTrelloReadiness();
-    assert.equal(blocked.status, "missing_lists");
-    assert.deepEqual(blocked.missingLists, configuredListNames.slice(1));
-
-    listsFixed = true;
     const ready = await checkTrelloReadiness();
     assert.equal(ready.status, "ready");
     assert.equal(ready.ready, true);
     assert.deepEqual(ready.missingLists, []);
+    assert.equal(requests.length, 1);
+    assert.equal(requestPath(requests[0]!.url), "/1/boards/test-board/lists");
+    assert.equal(new URL(requests[0]!.url).searchParams.get("filter"), "open");
+    assert.equal(requests[0]!.method, undefined);
+    assert.equal(requests[0]!.body, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reports the exact missing Trello lists with actionable status details", async () => {
+  const configuredListNames = [...new Set(Object.values(config.trelloListNames))];
+  const missingLists = configuredListNames.slice(1);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    assert.equal(init?.method, undefined);
+    assert.equal(init?.body, undefined);
+    assert.equal(requestPath(input), "/1/boards/test-board/lists");
+    return jsonResponse([
+      { id: "list-present", name: configuredListNames[0] },
+    ]);
+  };
+
+  try {
+    const status = await requestBotStatus();
+    const trello = status.body.trello as {
+      ready: boolean;
+      status: string;
+      missingLists: string[];
+      error: string | null;
+    };
+
+    assert.equal(status.statusCode, 200);
+    assert.equal(trello.ready, false);
+    assert.equal(trello.status, "missing_lists");
+    assert.deepEqual(trello.missingLists, missingLists);
+    assert.match(trello.error ?? "", /Create or rename them, then refresh the bot/);
+    assert.match(status.raw, new RegExp(missingLists.join("|")));
+    assert.doesNotMatch(status.raw, /test-key|test-token/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reports an unconfigured Trello integration without probing the API", async () => {
+  const previousConfig = { ...mutableTrelloConfig };
+  const originalFetch = globalThis.fetch;
+  let fetchCalled = false;
+  Object.assign(mutableTrelloConfig, { trelloApiKey: undefined });
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    throw new Error("The Trello API should not be called when unconfigured.");
+  };
+
+  try {
+    const readiness = await checkTrelloReadiness();
+    assert.equal(readiness.ready, false);
+    assert.equal(readiness.status, "not_configured");
+    assert.deepEqual(readiness.missingLists, []);
+    assert.match(readiness.error ?? "", /TRELLO_API_KEY/);
+    assert.equal(fetchCalled, false);
+    assert.doesNotMatch(readiness.error ?? "", /test-key|test-token/);
+  } finally {
+    restoreTrelloConfig(previousConfig);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reports Trello outages without exposing credentials", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    assert.equal(init?.method, undefined);
+    assert.equal(init?.body, undefined);
+    assert.equal(requestPath(input), "/1/boards/test-board/lists");
+    return jsonResponse({ error: "temporary Trello outage" }, 503);
+  };
+
+  try {
+    const readiness = await checkTrelloReadiness();
+    assert.equal(readiness.ready, false);
+    assert.equal(readiness.status, "unavailable");
+    assert.deepEqual(readiness.missingLists, []);
+    assert.match(readiness.error ?? "", /Check the configured board and Trello access/);
+    assert.doesNotMatch(readiness.error ?? "", /test-key|test-token/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("keeps moderation commands disabled while Trello setup is incomplete", async () => {
+  const configuredListNames = [...new Set(Object.values(config.trelloListNames))];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    jsonResponse([{ id: "list-present", name: configuredListNames[0] }]);
+
+  try {
+    const result = await refreshBot();
+    assert.equal(result.commandsEnabled, false);
+    assert.equal(result.trelloReady, false);
+    assert.equal(result.trello.status, "missing_lists");
+    assert.equal(result.recoveryStatus, "blocked");
+    assert.match(result.error ?? "", /Create or rename them, then refresh the bot/);
   } finally {
     globalThis.fetch = originalFetch;
   }
