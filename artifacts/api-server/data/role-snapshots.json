@@ -9,18 +9,18 @@
       "roleIds": [
         "1548958021160411216"
       ],
-      "cardId": "6aa7d3947600667ddabbc6cb",
-      "cardUrl": "https://trello.com/c/etpaNsCp/5-lumiivqs-1231098394",
-      "blacklistType": "appealable",
-      "blacklistReason": "trrdfvgr",
+      "cardId": "6aa7b66c42a7d00bcd539797",
+      "cardUrl": "https://trello.com/c/qBKrzIQt/4-lumiivqs-1231098394",
+      "blacklistType": "conditional",
+      "blacklistReason": "reban",
       "source": "command",
-      "blacklistNotificationAttemptedAt": "2026-09-14T10:59:34.637Z",
+      "blacklistNotificationAttemptedAt": "2026-09-14T15:44:32.260Z",
       "status": "revoked",
-      "createdAt": "2026-09-14T10:59:34.638Z",
-      "cardUpdatedAt": "2026-09-14T10:59:33.695Z",
-      "revocationCardMovedAt": "2026-09-14T11:00:22.205Z",
-      "revokedAt": "2026-09-14T11:00:22.443Z",
-      "revocationNotificationAttemptedAt": "2026-09-14T11:00:22.443Z"
+      "createdAt": "2026-09-14T15:44:32.260Z",
+      "cardUpdatedAt": "2026-09-14T15:44:31.181Z",
+      "revocationCardMovedAt": "2026-09-14T15:46:11.443Z",
+      "revokedAt": "2026-09-14T15:46:11.621Z",
+      "revocationNotificationAttemptedAt": "2026-09-14T15:46:11.621Z"
     }
   ],
   "notes": [
