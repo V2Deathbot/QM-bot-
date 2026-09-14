@@ -3,11 +3,11 @@
     {
       "guildId": "1114860005334716422",
       "lockdown": {
-        "active": true,
+        "active": false,
         "automatic": false,
-        "reason": "lumi is gay",
-        "startedAt": "2026-09-14T08:57:12.401Z",
-        "startedBy": "555727322695860234"
+        "reason": "",
+        "startedAt": null,
+        "startedBy": null
       },
       "destructiveActions": [
         {

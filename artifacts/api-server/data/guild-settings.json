@@ -67,14 +67,14 @@
           "{ACTIVE_BLACKLISTS} Active Blacklists",
           "{SERVER_MEMBERS} Personnel"
         ],
-        "rotationEnabled": true,
+        "rotationEnabled": false,
         "minIntervalMinutes": 5,
         "maxIntervalMinutes": 20,
         "disabledActivities": [],
-        "dynamicActivitiesEnabled": true
+        "dynamicActivitiesEnabled": false
       },
       "updatedBy": "555727322695860234",
-      "updatedAt": "2026-09-14T08:43:34.474Z"
+      "updatedAt": "2026-09-14T10:25:42.233Z"
     }
   ]
 }
