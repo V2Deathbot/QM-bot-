@@ -29,14 +29,16 @@ A Discord moderation bot that looks up Roblox users, manages blacklist records i
 
 ## Architecture decisions
 
-- The configured guild receives only `/setup` until a valid moderator role and audit channel are saved; moderation commands are registered after setup.
-- Moderation authorization is based on Discord role position, with the server owner and administrators always permitted.
+- The configured guild receives only `/setup` until a valid audit channel is saved; administrative commands are registered after setup.
+- Administrative authorization is based exclusively on a freshly fetched Discord `Administrator` permission (the server owner is recognized too). Legacy moderator-role IDs remain in setup JSON only for migration and never authorize commands.
 - Audit delivery is verified before moderation side effects begin, then role and Trello changes are recorded without provider credentials or raw error bodies.
 - Trello list names are configurable, while card names and descriptions follow the requested format exactly.
-- Trello is the blacklist source of truth. The bot indexes configured user lists at startup and on a bounded polling interval, reconciles manual card changes by immutable Roblox ID, and applies the selected latest card state to Discord.
+- Bot-approved command snapshots are the Discord enforcement source of truth. Trello is polled for monitoring, desync reports, and approved-record enforcement only; manual Trello cards/moves are audited but never add/remove Discord roles automatically.
 - A role snapshot is persisted after the Trello card exists but before roles are removed. Pending enforcement and revocation states survive restarts, and the original assignable roles are preserved until restoration succeeds.
 - Duplicate cards are resolved by latest Trello activity; revoked wins exact timestamp ties. Closed and group-list cards are excluded from individual-member enforcement.
 - Full scans and member joins serialize changes per Discord member. Ambiguous identity matches are skipped and audited rather than risking incorrect removal or restoration.
+- Per-admin and global destructive-action windows, lockdown state, observed permission escalations, and identity associations are stored atomically in `BOT_SECURITY_FILE` (default `data/guild-security.json`). Defaults are 3/admin and 8/global in five minutes, confirmation and automatic lockdown enabled.
+- `/setup` uses administrator-bound, expiring Discord components for security, protected IDs/roles, audit channels, presence, Trello monitoring, identity warnings, and blacklist-role controls. Every saved change is audited without credentials.
 - The bot is deliberately not started when required configuration is missing; the API health endpoint remains available and the status route reports only missing names.
 
 ## Product
@@ -44,7 +46,9 @@ A Discord moderation bot that looks up Roblox users, manages blacklist records i
 - `/blacklist user type reason` looks up the Roblox username, resolves or pings the Discord member, creates a categorized Trello card with `blacklisted` and type labels, persists a role snapshot, removes assignable roles, and DMs the Trello link.
 - `/group_blacklist id reason` creates a group URL card in the group blacklist list with a `- ` reason prefix and no Discord link preview.
 - `/revoke_blacklist username` moves the user card to the revoked list, updates labels, restores saved roles, and DMs the revoked card link.
-- `/setup role audit_channel_id` lets the server owner or an administrator choose the minimum moderator role and the text channel used for audit records.
+- `/setup` is administrator-only and opens the interactive configuration menu after first-time audit-channel setup. It can retain a legacy role field but no role tier grants command access.
+- `/setup` persists per-guild Trello mappings for all five blacklist lists and six labels. Each mapping change (and reset) is validated against the configured board before it is saved; blacklist creation, group blacklist creation, lookup, revocation, and monitoring use the saved mapping rather than environment defaults.
+- `/security_status`, `/security_lockdown`, `/security_unlock`, `/blacklist_lookup`, `/blacklist_note`, `/blacklist_sync`, and `/identity_lookup` are administrator-only. `/blacklist_sync` is explicitly report-only.
 
 ## User preferences
 
@@ -57,6 +61,7 @@ A Discord moderation bot that looks up Roblox users, manages blacklist records i
 - The configured moderator role must be below the bot's highest role, and the bot needs View Channel, Send Messages, and Embed Links in the audit channel.
 - Trello list names must match the configured names exactly, ignoring case and surrounding whitespace.
 - `TRELLO_SYNC_INTERVAL_MS` controls polling and is clamped to a safe range of 15 seconds through 1 hour.
+- `BOT_SECURITY_FILE` may be set to relocate persisted rate-limit/lockdown/identity state. The unauthenticated `POST /api/bot/refresh` endpoint intentionally returns 403; it cannot bypass Discord authorization.
 
 ## Pointers
 

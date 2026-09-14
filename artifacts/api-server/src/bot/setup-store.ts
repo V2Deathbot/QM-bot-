@@ -6,8 +6,165 @@ export interface GuildSetup {
   guildId: string;
   moderatorRoleId: string;
   auditChannelId: string;
+  securityAlertChannelId?: string;
+  trelloAlertChannelId?: string;
+  blacklistRoleId?: string;
+  trello?: TrelloMappings;
+  audit?: AuditSettings;
+  presence?: PresenceSettings;
+  security?: SecuritySettings;
+  monitoring?: TrelloMonitoringSettings;
+  identity?: IdentitySettings;
   updatedBy: string;
   updatedAt: string;
+}
+
+export interface SecuritySettings {
+  perAdminLimit: number;
+  globalLimit: number;
+  windowMinutes: number;
+  automaticLockdown: boolean;
+  automaticLockdownThreshold: number;
+  confirmationsRequired: boolean;
+  protectedUserIds: string[];
+  protectedRoleIds: string[];
+  altDetectionEnabled: boolean;
+  robloxAltDetectionEnabled: boolean;
+  historicalAssociationWarnings: boolean;
+  recentPermissionEscalationProtection: boolean;
+  securityAuditAlerts: boolean;
+}
+
+export interface TrelloMonitoringSettings {
+  manualChangeDetection: boolean;
+  desyncDetection: boolean;
+  pollingIntervalSeconds: number;
+}
+
+export interface TrelloMappings {
+  lists: {
+    appealable: string;
+    conditional: string;
+    permanent: string;
+    group: string;
+    revoked: string;
+  };
+  labels: {
+    blacklisted: string;
+    appealable: string;
+    conditional: string;
+    permanent: string;
+    group: string;
+    revoked: string;
+  };
+}
+
+export interface AuditSettings {
+  trelloAlerts: boolean;
+  blacklistLogs: boolean;
+  roleEnforcementLogs: boolean;
+  joinLeaveBlacklistLogs: boolean;
+}
+
+export interface IdentitySettings {
+  sameRobloxDifferentDiscord: boolean;
+  sameDiscordDifferentRoblox: boolean;
+  historicalAssociationWarnings: boolean;
+  /** Deliberately fixed off: identity associations are warnings, never punishment. */
+  autoPunishPossibleAlts: false;
+}
+
+export interface PresenceSettings {
+  enabled: boolean;
+  activities: string[];
+  rotationEnabled: boolean;
+  minIntervalMinutes: number;
+  maxIntervalMinutes: number;
+}
+
+export const defaultSecuritySettings = (): SecuritySettings => ({
+  perAdminLimit: 3,
+  globalLimit: 8,
+  windowMinutes: 5,
+  automaticLockdown: true,
+  automaticLockdownThreshold: 8,
+  confirmationsRequired: true,
+  protectedUserIds: [],
+  protectedRoleIds: [],
+  altDetectionEnabled: true,
+  robloxAltDetectionEnabled: true,
+  historicalAssociationWarnings: true,
+  recentPermissionEscalationProtection: true,
+  securityAuditAlerts: true,
+});
+
+export const defaultMonitoringSettings = (): TrelloMonitoringSettings => ({
+  manualChangeDetection: true,
+  desyncDetection: true,
+  pollingIntervalSeconds: 60,
+});
+
+export const defaultTrelloMappings = (): TrelloMappings => ({
+  lists: { ...config.trelloListNames },
+  labels: {
+    blacklisted: "blacklisted",
+    appealable: "appealable",
+    conditional: "conditional",
+    permanent: "permanent",
+    group: "group blacklist",
+    revoked: "revoked",
+  },
+});
+
+export const defaultAuditSettings = (): AuditSettings => ({
+  trelloAlerts: true,
+  blacklistLogs: true,
+  roleEnforcementLogs: true,
+  joinLeaveBlacklistLogs: true,
+});
+
+export const defaultIdentitySettings = (): IdentitySettings => ({
+  sameRobloxDifferentDiscord: true,
+  sameDiscordDifferentRoblox: true,
+  historicalAssociationWarnings: true,
+  autoPunishPossibleAlts: false,
+});
+
+export const defaultPresenceSettings = (): PresenceSettings => ({
+  enabled: true,
+  activities: [
+    "Customers",
+    "Quartermaster Corps",
+    "Blacklist Records",
+    "Supply Operations",
+    "Active Blacklists",
+  ],
+  rotationEnabled: true,
+  minIntervalMinutes: 5,
+  maxIntervalMinutes: 20,
+});
+
+export function securitySettingsFor(setup: GuildSetup): SecuritySettings {
+  return { ...defaultSecuritySettings(), ...setup.security,
+    protectedUserIds: [...(setup.security?.protectedUserIds ?? [])],
+    protectedRoleIds: [...(setup.security?.protectedRoleIds ?? [])] };
+}
+
+export function presenceSettingsFor(setup: GuildSetup): PresenceSettings {
+  return { ...defaultPresenceSettings(), ...setup.presence,
+    activities: [...(setup.presence?.activities ?? defaultPresenceSettings().activities)] };
+}
+
+export function trelloMappingsFor(setup: GuildSetup): TrelloMappings {
+  const defaults = defaultTrelloMappings();
+  return {
+    lists: { ...defaults.lists, ...setup.trello?.lists },
+    labels: { ...defaults.labels, ...setup.trello?.labels },
+  };
+}
+
+export function auditSettingsFor(setup: GuildSetup): AuditSettings {
+  return { ...defaultAuditSettings(), ...setup.audit };
 }
 
 interface GuildSetupFile {

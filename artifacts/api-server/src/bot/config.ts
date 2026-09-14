@@ -34,6 +34,8 @@ export const config = {
     process.env["ROLE_SNAPSHOT_FILE"] ?? "data/role-snapshots.json",
   setupFile:
     process.env["BOT_SETUP_FILE"] ?? "data/guild-settings.json",
+  securityFile:
+    process.env["BOT_SECURITY_FILE"] ?? "data/guild-security.json",
 } as const;
 
 function parseDelay(value: string | undefined, fallback: number): number {

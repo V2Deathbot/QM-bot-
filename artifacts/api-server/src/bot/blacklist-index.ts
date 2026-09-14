@@ -4,6 +4,7 @@ import {
   type TrelloBlacklistListType,
   type TrelloCard,
 } from "./trello";
+import type { TrelloMappings } from "./setup-store";
 import {
   findRobloxUserById,
   RobloxUserNotFoundError,
@@ -337,9 +338,12 @@ export const indexBlacklistCards = buildBlacklistIndex;
 
 /** Fetch the configured Trello lists and then construct their Roblox index. */
 export async function fetchBlacklistIndex(
-  options: Omit<BuildBlacklistIndexOptions, "listTypeById"> = {},
+  options: Omit<BuildBlacklistIndexOptions, "listTypeById"> & {
+    mappings?: TrelloMappings;
+  } = {},
 ): Promise<BlacklistIndex> {
-  return buildBlacklistIndex(await fetchBlacklistCards(), options);
+  const { mappings, ...buildOptions } = options;
+  return buildBlacklistIndex(await fetchBlacklistCards(mappings), buildOptions);
 }
 
 export const getBlacklistIndex = fetchBlacklistIndex;

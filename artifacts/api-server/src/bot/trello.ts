@@ -1,4 +1,8 @@
 import { config, type BlacklistType } from "./config";
+import {
+  defaultTrelloMappings,
+  type TrelloMappings,
+} from "./setup-store";
 
 export interface TrelloList {
   id: string;
@@ -117,13 +121,15 @@ async function getOpenLists(): Promise<TrelloList[]> {
  * separate from the card request so a group list can never accidentally be
  * treated as a user blacklist list.
  */
-export async function fetchBlacklistCards(): Promise<TrelloBlacklistCard[]> {
+export async function fetchBlacklistCards(
+  mappings: TrelloMappings = defaultTrelloMappings(),
+): Promise<TrelloBlacklistCard[]> {
   const lists = await getOpenLists();
   const listTypes: Array<[TrelloBlacklistListType, string]> = [
-    ["appealable", config.trelloListNames.appealable],
-    ["conditional", config.trelloListNames.conditional],
-    ["permanent", config.trelloListNames.permanent],
-    ["revoked", config.trelloListNames.revoked],
+    ["appealable", mappings.lists.appealable],
+    ["conditional", mappings.lists.conditional],
+    ["permanent", mappings.lists.permanent],
+    ["revoked", mappings.lists.revoked],
   ];
   const listTypeById = new Map<string, TrelloBlacklistListType>();
   for (const [type, name] of listTypes) {
@@ -151,8 +157,8 @@ export async function fetchBlacklistCards(): Promise<TrelloBlacklistCard[]> {
 // This name is useful to callers that use "get" for provider reads.
 export const getBlacklistCards = fetchBlacklistCards;
 
-function configuredListNames(): string[] {
-  return [...new Set(Object.values(config.trelloListNames))];
+function configuredListNames(mappings: TrelloMappings): string[] {
+  return [...new Set(Object.values(mappings.lists))];
 }
 
 function updateReadiness(
@@ -172,7 +178,9 @@ export function getTrelloReadiness(): TrelloReadiness {
   };
 }
 
-export async function checkTrelloReadiness(): Promise<TrelloReadiness> {
+export async function checkTrelloReadiness(
+  mappings: TrelloMappings = defaultTrelloMappings(),
+): Promise<TrelloReadiness> {
   try {
     requireTrelloConfig();
   } catch {
@@ -190,7 +198,7 @@ export async function checkTrelloReadiness(): Promise<TrelloReadiness> {
     const normalizedListNames = new Set(
       lists.map((list) => list.name.trim().toLowerCase()),
     );
-    const missingLists = configuredListNames().filter(
+    const missingLists = configuredListNames(mappings).filter(
       (listName) => !normalizedListNames.has(listName.trim().toLowerCase()),
     );
 
@@ -220,10 +228,10 @@ export async function checkTrelloReadiness(): Promise<TrelloReadiness> {
   }
 }
 
-export async function requireTrelloReadiness(): Promise<void> {
-  const current = getTrelloReadiness();
-  const currentOrChecked =
-    current.status === "unknown" ? await checkTrelloReadiness() : current;
+export async function requireTrelloReadiness(
+  mappings: TrelloMappings = defaultTrelloMappings(),
+): Promise<void> {
+  const currentOrChecked = await checkTrelloReadiness(mappings);
 
   if (!currentOrChecked.ready) {
     throw new Error(
@@ -246,6 +254,21 @@ export async function findList(listName: string): Promise<TrelloList> {
   }
 
   return list;
+}
+
+function assertMappings(mappings: TrelloMappings): void {
+  const values = [...Object.values(mappings.lists), ...Object.values(mappings.labels)];
+  if (values.some((value) => !value.trim() || value.length > 100 || /[\u0000-\u001f\u007f]/.test(value))) {
+    throw new Error("Trello list and label mappings must contain 1–100 printable characters.");
+  }
+  const normalizedLists = Object.values(mappings.lists).map((value) => value.trim().toLowerCase());
+  if (new Set(normalizedLists).size !== normalizedLists.length) {
+    throw new Error("Each Trello blacklist list must map to a distinct board list.");
+  }
+  const normalizedLabels = Object.values(mappings.labels).map((value) => value.trim().toLowerCase());
+  if (new Set(normalizedLabels).size !== normalizedLabels.length) {
+    throw new Error("Each Trello blacklist label must map to a distinct board label.");
+  }
 }
 
 async function getLabels(): Promise<TrelloLabel[]> {
@@ -271,12 +294,37 @@ async function ensureLabel(
   );
 }
 
+/** Validate every saved list and label mapping against the configured board. */
+export async function validateTrelloMappings(
+  mappings: TrelloMappings,
+): Promise<void> {
+  assertMappings(mappings);
+  const [lists, labels] = await Promise.all([getOpenLists(), getLabels()]);
+  const boardLists = new Set(lists.map((list) => list.name.trim().toLowerCase()));
+  const boardLabels = new Set(labels.map((label) => label.name.trim().toLowerCase()));
+  const missingLists = Object.values(mappings.lists).filter(
+    (name) => !boardLists.has(name.trim().toLowerCase()),
+  );
+  const missingLabels = Object.values(mappings.labels).filter(
+    (name) => !boardLabels.has(name.trim().toLowerCase()),
+  );
+  if (missingLists.length || missingLabels.length) {
+    const details = [
+      ...(missingLists.length ? [`missing lists: ${missingLists.join(", ")}`] : []),
+      ...(missingLabels.length ? [`missing labels: ${missingLabels.join(", ")}`] : []),
+    ].join("; ");
+    throw new Error(`The proposed Trello mapping is not present on the configured board (${details}).`);
+  }
+}
+
 export async function createBlacklistCard(input: {
   name: string;
   reason: string;
   type: BlacklistType;
+  mappings?: TrelloMappings;
 }): Promise<TrelloCard> {
-  const list = await findList(config.trelloListNames[input.type]);
+  const mappings = input.mappings ?? defaultTrelloMappings();
+  const list = await findList(mappings.lists[input.type]);
   const card = await request<TrelloCard>(
     "/cards",
     body({
@@ -286,16 +334,18 @@ export async function createBlacklistCard(input: {
     }),
   );
 
-  await addLabel(card.id, await ensureLabel("blacklisted", "red"));
-  await addLabel(card.id, await ensureLabel(input.type, "orange"));
+  await addLabel(card.id, await ensureLabel(mappings.labels.blacklisted, "red"));
+  await addLabel(card.id, await ensureLabel(mappings.labels[input.type], "orange"));
   return card;
 }
 
 export async function createGroupBlacklistCard(input: {
   groupUrl: string;
   reason: string;
+  mappings?: TrelloMappings;
 }): Promise<TrelloCard> {
-  const list = await findList(config.trelloListNames.group);
+  const mappings = input.mappings ?? defaultTrelloMappings();
+  const list = await findList(mappings.lists.group);
   const card = await request<TrelloCard>(
     "/cards",
     body({
@@ -305,7 +355,8 @@ export async function createGroupBlacklistCard(input: {
     }),
   );
 
-  await addLabel(card.id, await ensureLabel("blacklisted", "red"));
+  await addLabel(card.id, await ensureLabel(mappings.labels.blacklisted, "red"));
+  await addLabel(card.id, await ensureLabel(mappings.labels.group, "orange"));
   return card;
 }
 
@@ -323,9 +374,10 @@ export async function findBlacklistCard(
 
 export async function findBlacklistCardByRobloxId(
   robloxId: number,
+  mappings: TrelloMappings = defaultTrelloMappings(),
 ): Promise<TrelloBlacklistCard | undefined> {
   if (!Number.isSafeInteger(robloxId) || robloxId <= 0) return undefined;
-  const cards = (await fetchBlacklistCards()).filter((card) => {
+  const cards = (await fetchBlacklistCards(mappings)).filter((card) => {
     const match = /^\s*[^|]+?\s*\|\s*(\d+)\s*$/.exec(card.name);
     return match ? Number(match[1]) === robloxId : false;
   });
@@ -363,26 +415,49 @@ async function removeLabel(cardId: string, labelId: string): Promise<void> {
 
 export async function revokeBlacklistCard(
   card: TrelloCard,
+  mappings: TrelloMappings = defaultTrelloMappings(),
 ): Promise<TrelloCard> {
-  const revokedList = await findList(config.trelloListNames.revoked);
-  await request<TrelloCard>(`/cards/${encodeURIComponent(card.id)}`, {
-    method: "PUT",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ idList: revokedList.id }),
-  });
+  return revokeBlacklistCardById(card.id, mappings);
+}
+
+/**
+ * Idempotently move one exact card into the revoked state.  Recovery uses the
+ * saved card ID rather than a name/identity lookup, so a retry cannot affect a
+ * subsequently created card for the same Roblox user.
+ */
+export async function revokeBlacklistCardById(
+  cardId: string,
+  mappings: TrelloMappings = defaultTrelloMappings(),
+): Promise<TrelloCard> {
+  const card = await request<TrelloCard>(
+    `/cards/${encodeURIComponent(cardId)}?fields=id,name,desc,idList,idLabels,url,dateLastActivity,closed`,
+  );
+  if (card.closed) {
+    throw new Error("The approved Trello blacklist card is closed and cannot be revoked.");
+  }
+  const revokedList = await findList(mappings.lists.revoked);
+  if (card.idList !== revokedList.id) {
+    await request<TrelloCard>(`/cards/${encodeURIComponent(card.id)}`, {
+      method: "PUT",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ idList: revokedList.id }),
+    });
+  }
 
   const labels = await getLabels();
   for (const label of labels) {
     if (
-      ["appealable", "conditional", "permanent"].includes(
-        label.name.toLowerCase(),
-      ) &&
+        [mappings.labels.appealable, mappings.labels.conditional, mappings.labels.permanent, mappings.labels.group]
+          .map((name) => name.toLowerCase()).includes(label.name.toLowerCase()) &&
       card.idLabels.includes(label.id)
     ) {
       await removeLabel(card.id, label.id);
     }
   }
 
-  await addLabel(card.id, await ensureLabel("revoked", "green"));
+  const revokedLabel = await ensureLabel(mappings.labels.revoked, "green");
+  if (!card.idLabels.includes(revokedLabel.id)) {
+    await addLabel(card.id, revokedLabel);
+  }
   return { ...card, idList: revokedList.id };
 }

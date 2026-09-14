@@ -34,7 +34,7 @@ const { getGuildSetup, saveGuildSetup } =
   await import("../src/bot/setup-store.ts");
 const { requireAuditChannel, sendAuditEvent } =
   await import("../src/bot/audit.ts");
-const { checkTrelloReadiness, revokeBlacklistCard } =
+const { checkTrelloReadiness, createBlacklistCard, validateTrelloMappings, revokeBlacklistCard } =
   await import("../src/bot/trello.ts");
 const {
   canUseModerationCommands,
@@ -132,12 +132,23 @@ async function requestBotStatus() {
 }
 
 async function requestBotRefresh() {
-  return requestBotEndpoint("POST", "/api/bot/refresh");
+  const result = await refreshBot();
+  return {
+    statusCode: result.commandsEnabled ? 200 : 503,
+    body: result as unknown as Record<string, unknown>,
+    raw: JSON.stringify(result),
+  };
 }
 
 function restoreTrelloConfig(previous: MutableTrelloConfig): void {
   Object.assign(mutableTrelloConfig, previous);
 }
+
+test("does not expose unauthenticated bot refresh mutation", async () => {
+  const response = await requestBotEndpoint("POST", "/api/bot/refresh");
+  assert.equal(response.statusCode, 403);
+  assert.match(String(response.body.error), /disabled/i);
+});
 
 test("persists snapshots and only considers matching active snapshots restorable", async () => {
   const snapshot = {
@@ -210,7 +221,54 @@ test("persists and safely updates guild setup", async () => {
   );
 });
 
-test("allows the configured role and higher roles while denying lower roles", async () => {
+test("validates and persists all per-guild Trello list and label mappings", async () => {
+  const mappings = {
+    lists: {
+      appealable: "Appeals",
+      conditional: "Conditions",
+      permanent: "Permanents",
+      group: "Groups",
+      revoked: "Revocations",
+    },
+    labels: {
+      blacklisted: "BLACKLISTED",
+      appealable: "APPEALABLE",
+      conditional: "CONDITIONAL",
+      permanent: "PERMANENT",
+      group: "GROUP BLACKLIST",
+      revoked: "REVOKED",
+    },
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const pathname = requestPath(input);
+    if (pathname.endsWith("/lists")) {
+      return jsonResponse(Object.values(mappings.lists).map((name, index) => ({ id: `list-${index}`, name })));
+    }
+    if (pathname.endsWith("/labels")) {
+      return jsonResponse(Object.values(mappings.labels).map((name, index) => ({ id: `label-${index}`, name, color: "blue" })));
+    }
+    if (pathname === "/1/cards" && init?.method === "POST") {
+      assert.equal((init.body as URLSearchParams).get("idList"), "list-2");
+      return jsonResponse({ id: "card-custom", url: "https://trello.test/card-custom" });
+    }
+    if (pathname === "/1/cards/card-custom/idLabels") return jsonResponse(undefined);
+    throw new Error(`Unexpected custom mapping request: ${pathname}`);
+  };
+  try {
+    await validateTrelloMappings(mappings);
+    await saveGuildSetup({
+      guildId: "mapping-guild", moderatorRoleId: "legacy", auditChannelId: "12345",
+      trello: mappings, updatedBy: "owner", updatedAt: new Date().toISOString(),
+    });
+    assert.deepEqual((await getGuildSetup("mapping-guild"))?.trello, mappings);
+    await createBlacklistCard({ name: "Builder | 9", reason: "policy", type: "permanent", mappings });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("requires a current Administrator permission while recognizing server owner", async () => {
   let highestPosition = 4;
   let administrator = false;
   const member = {
@@ -246,14 +304,10 @@ test("allows the configured role and higher roles while denying lower roles", as
     updatedAt: new Date().toISOString(),
   };
 
-  assert.equal(
-    await canUseModerationCommands(interaction as never, setup),
-    false,
-  );
   highestPosition = 5;
   assert.equal(
     await canUseModerationCommands(interaction as never, setup),
-    true,
+    false,
   );
   highestPosition = 4;
   administrator = true;
@@ -384,7 +438,7 @@ test("setup persists settings, audits the change, and enables moderation command
   assert.equal(saved?.auditChannelId, "12345678901234567");
   assert.equal(auditMessages.length, 1);
   assert.deepEqual(registeredCommandNames, [
-    ["setup", "blacklist", "group_blacklist", "revoke_blacklist"],
+    ["setup", "blacklist", "group_blacklist", "revoke_blacklist", "blacklist_note", "blacklist_lookup", "blacklist_sync", "identity_lookup", "security_status", "security_lockdown", "security_unlock"],
   ]);
   assert.match(replies[0] ?? "", /Setup complete/);
 });
@@ -413,7 +467,16 @@ test("moves a Trello blacklist card to revoked and updates its labels", async ()
       ]);
     }
     if (pathname === "/1/cards/card-1") {
-      return jsonResponse({ id: "card-1", idList: "list-revoked" });
+      return jsonResponse({
+        id: "card-1",
+        name: "Builder | 1",
+        desc: "- policy",
+        idList: "list-blacklist",
+        idLabels: ["label-appealable"],
+        url: "https://trello.test/card-1",
+        dateLastActivity: "2026-01-01T00:00:00.000Z",
+        closed: false,
+      });
     }
     if (pathname.endsWith("/labels")) {
       return jsonResponse([
@@ -445,6 +508,7 @@ test("moves a Trello blacklist card to revoked and updates its labels", async ()
     assert.deepEqual(
       requests.map(({ path: pathname, method }) => `${method} ${pathname}`),
       [
+        "GET /1/cards/card-1",
         "GET /1/boards/test-board/lists",
         "PUT /1/cards/card-1",
         "GET /1/boards/test-board/labels",
@@ -453,8 +517,8 @@ test("moves a Trello blacklist card to revoked and updates its labels", async ()
         "POST /1/cards/card-1/idLabels",
       ],
     );
-    assert.equal(requests[1]?.body?.get("idList"), "list-revoked");
-    assert.equal(requests[5]?.body?.get("value"), "label-revoked");
+    assert.equal(requests[2]?.body?.get("idList"), "list-revoked");
+    assert.equal(requests[6]?.body?.get("value"), "label-revoked");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -795,6 +859,13 @@ test("keeps commands disabled after registration failure and enables them on ret
       "blacklist",
       "group_blacklist",
       "revoke_blacklist",
+      "blacklist_note",
+      "blacklist_lookup",
+      "blacklist_sync",
+      "identity_lookup",
+      "security_status",
+      "security_lockdown",
+      "security_unlock",
     ]);
   } finally {
     await refreshBot();

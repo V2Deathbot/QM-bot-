@@ -1,3 +1,4 @@
 - [Discord privileged intents](discord-privileged-intents.md) — Gateway “Used disallowed intents” errors require enabling the exact app’s privileged intent in Discord, not a code-side workaround.
 - [Role snapshot runtime state](role-snapshot-runtime-state.md) — File cleanup requires a bot restart because snapshots are cached in memory.
-- [Trello list configuration](trello-list-configuration.md) — List names are deployment-configured; tests should derive them from active configuration.
+- [Trello list configuration](trello-list-configuration.md) — Tests should derive list names from effective guild settings rather than hardcoded defaults.
+- [Authority and recovery review](authority-recovery-review.md) — Permission tests do not cover lifecycle safety; verify provider/store interruption boundaries and role ownership.

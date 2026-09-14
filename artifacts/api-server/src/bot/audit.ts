@@ -7,7 +7,7 @@ import {
   type Role,
 } from "discord.js";
 import { config } from "./config";
-import type { GuildSetup } from "./setup-store";
+import { auditSettingsFor, type GuildSetup } from "./setup-store";
 
 export type AuditStatus = "started" | "success" | "failed";
 
@@ -101,13 +101,12 @@ export async function validateGuildSetup(
   guild: Guild,
   setup: GuildSetup,
 ): Promise<void> {
-  const role = await guild.roles.fetch(setup.moderatorRoleId);
-  if (!role) {
-    throw new Error(
-      "The configured moderator role no longer exists. Run /setup again.",
-    );
+  // moderatorRoleId is retained only to migrate old setup JSON. Authorization
+  // is now the member's current Administrator permission, not role position.
+  const botMember = guild.members.me;
+  if (!botMember?.permissions.has(PermissionFlagsBits.ManageRoles)) {
+    throw new Error("The bot needs the Manage Roles permission before moderation.");
   }
-  validateModeratorRole(guild, role);
   await requireAuditChannel(guild, setup);
 }
 
@@ -116,7 +115,33 @@ export async function sendAuditEvent(
   setup: GuildSetup,
   event: AuditEvent,
 ): Promise<void> {
-  const channel = await requireAuditChannel(guild, setup);
+  const normalizedAction = event.action.toLowerCase();
+  const mandatory = /(security|rate limit|protected|unauthorized|configuration|setup)/.test(normalizedAction);
+  const settings = auditSettingsFor(setup);
+  if (!mandatory) {
+    if (normalizedAction.includes("trello") && !settings.trelloAlerts) return;
+    if (/(role|enforcement|restoration)/.test(normalizedAction) && !settings.roleEnforcementLogs) return;
+    if (/(join|joined)/.test(normalizedAction) && !settings.joinLeaveBlacklistLogs) return;
+    if (normalizedAction.includes("blacklist") && !settings.blacklistLogs) return;
+  }
+  const selectedChannelId =
+    (/(security|rate limit|protected|unauthorized)/.test(normalizedAction)
+      ? setup.securityAlertChannelId
+      : undefined) ??
+    (normalizedAction.includes("trello") ? setup.trelloAlertChannelId : undefined) ??
+    setup.auditChannelId;
+  // Audit controls are destinations, not suppression controls: every event
+  // always has the main audit channel as a safe fallback.
+  let channel: Awaited<ReturnType<typeof requireAuditChannel>>;
+  try {
+    channel = await requireAuditChannel(guild, {
+      ...setup,
+      auditChannelId: selectedChannelId,
+    });
+  } catch (error) {
+    if (selectedChannelId === setup.auditChannelId) throw error;
+    channel = await requireAuditChannel(guild, setup);
+  }
   const embed = new EmbedBuilder()
     .setTitle(clean(event.action))
     .setColor(statusColors[event.status])

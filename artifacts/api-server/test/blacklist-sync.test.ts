@@ -160,7 +160,7 @@ function setupFor(guildId: string) {
   };
 }
 
-test("enforces manual cards, restores manual revocations, and remains idempotent", async () => {
+test("monitors manual Trello cards and revocations without changing Discord roles", async () => {
   const fixture = createDiscordFixture("sync-guild", true);
   let cards = [
     trelloCard({
@@ -188,12 +188,9 @@ test("enforces manual cards, restores manual revocations, and remains idempotent
       setupFor(fixture.guild.id),
       "startup",
     );
-    const activeSnapshot = await findActiveSnapshot(fixture.guild.id, 42);
-    assert.deepEqual(activeSnapshot?.roleIds, ["role-1", "role-2"]);
-    assert.equal(activeSnapshot?.cardId, "active-card");
-    assert.equal(activeSnapshot?.source, "sync");
-    assert.deepEqual(fixture.removed, [["role-1", "role-2"]]);
-    assert.equal(fixture.directMessages.length, 1);
+    assert.equal(await findActiveSnapshot(fixture.guild.id, 42), undefined);
+    assert.deepEqual(fixture.removed, []);
+    assert.equal(fixture.directMessages.length, 0);
     const auditCountAfterFirstScan = fixture.auditMessages.length;
 
     await synchronizeBlacklists(
@@ -201,8 +198,8 @@ test("enforces manual cards, restores manual revocations, and remains idempotent
       setupFor(fixture.guild.id),
       "manual",
     );
-    assert.deepEqual(fixture.removed, [["role-1", "role-2"]]);
-    assert.equal(fixture.directMessages.length, 1);
+    assert.deepEqual(fixture.removed, []);
+    assert.equal(fixture.directMessages.length, 0);
     assert.equal(fixture.auditMessages.length, auditCountAfterFirstScan);
 
     cards = [
@@ -219,16 +216,9 @@ test("enforces manual cards, restores manual revocations, and remains idempotent
       setupFor(fixture.guild.id),
       "manual",
     );
-    assert.deepEqual(fixture.restored, [["role-1", "role-2"]]);
-    assert.equal(fixture.directMessages.length, 2);
+    assert.deepEqual(fixture.restored, []);
+    assert.equal(fixture.directMessages.length, 0);
     assert.equal(await findActiveSnapshot(fixture.guild.id, 42), undefined);
-    const persisted = JSON.parse(
-      await readFile(process.env.ROLE_SNAPSHOT_FILE!, "utf8"),
-    ) as {
-      snapshots: Array<{ status: string; cardId?: string }>;
-    };
-    assert.equal(persisted.snapshots[0]?.status, "revoked");
-    assert.equal(persisted.snapshots[0]?.cardId, "revoked-card");
     const auditCountAfterRevoke = fixture.auditMessages.length;
 
     await synchronizeBlacklists(
@@ -236,8 +226,8 @@ test("enforces manual cards, restores manual revocations, and remains idempotent
       setupFor(fixture.guild.id),
       "manual",
     );
-    assert.deepEqual(fixture.restored, [["role-1", "role-2"]]);
-    assert.equal(fixture.directMessages.length, 2);
+    assert.deepEqual(fixture.restored, []);
+    assert.equal(fixture.directMessages.length, 0);
     assert.equal(fixture.auditMessages.length, auditCountAfterRevoke);
     assert.equal(getBlacklistSyncStatus().state, "successful");
   } finally {
@@ -245,7 +235,7 @@ test("enforces manual cards, restores manual revocations, and remains idempotent
   }
 });
 
-test("enforces the cached Trello index when a matching member joins", async () => {
+test("does not enforce a manual cached Trello record when a member joins", async () => {
   const fixture = createDiscordFixture("join-guild", false);
   const cards = [
     trelloCard({
@@ -285,12 +275,9 @@ test("enforces the cached Trello index when a matching member joins", async () =
       setupFor(fixture.guild.id),
     );
 
-    assert.deepEqual(fixture.removed, [["role-1", "role-2"]]);
-    assert.equal(fixture.directMessages.length, 1);
-    assert.deepEqual(
-      (await findActiveSnapshot(fixture.guild.id, 77))?.roleIds,
-      ["role-1", "role-2"],
-    );
+    assert.deepEqual(fixture.removed, []);
+    assert.equal(fixture.directMessages.length, 0);
+    assert.equal(await findActiveSnapshot(fixture.guild.id, 77), undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -365,7 +352,7 @@ test("reports unavailable Roblox cards and Trello scans without leaking credenti
   }
 });
 
-test("persists a pending revocation while the member is absent and restores on rejoin", async () => {
+test("does not promote manual revocations into Discord restoration work", async () => {
   const fixture = createDiscordFixture("absent-revoke-guild", true);
   let cards = [
     trelloCard({
@@ -409,23 +396,7 @@ test("persists a pending revocation while the member is absent and restores on r
       "manual",
     );
 
-    const pendingFile = JSON.parse(
-      await readFile(process.env.ROLE_SNAPSHOT_FILE!, "utf8"),
-    ) as {
-      snapshots: Array<{
-        guildId: string;
-        robloxUserId: number;
-        status: string;
-      }>;
-    };
-    assert.equal(
-      pendingFile.snapshots.find(
-        (snapshot) =>
-          snapshot.guildId === fixture.guild.id &&
-          snapshot.robloxUserId === 88,
-      )?.status,
-      "revocation_pending",
-    );
+    assert.equal(await findActiveSnapshot(fixture.guild.id, 88), undefined);
     assert.equal(fixture.restored.length, 0);
 
     fixture.members.set(fixture.member.id, fixture.member);
@@ -433,9 +404,9 @@ test("persists a pending revocation while the member is absent and restores on r
       fixture.member as never,
       setupFor(fixture.guild.id),
     );
-    assert.deepEqual(fixture.restored, [["role-1", "role-2"]]);
+    assert.deepEqual(fixture.restored, []);
     assert.equal(await findActiveSnapshot(fixture.guild.id, 88), undefined);
-    assert.equal(fixture.directMessages.length, 2);
+    assert.equal(fixture.directMessages.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -494,7 +465,7 @@ test("skips one Discord member matching multiple active Roblox identities", asyn
   }
 });
 
-test("does not regress a completed join restoration to pending during a concurrent scan", async () => {
+test.skip("legacy automatic Trello restoration race (manual Trello changes are monitoring-only)", async () => {
   const fixture = createDiscordFixture("revoke-race-guild", true);
   let cards = [
     trelloCard({
@@ -602,7 +573,7 @@ test("does not regress a completed join restoration to pending during a concurre
   }
 });
 
-test("reports action failures as a partial scan and failed completion audit", async () => {
+test.skip("legacy manual Trello enforcement failure path (manual records are not enforced)", async () => {
   const fixture = createDiscordFixture("partial-sync-guild", true);
   fixture.member.roles.remove = async () => {
     throw new Error("Discord role update rejected");
@@ -645,7 +616,7 @@ test("reports action failures as a partial scan and failed completion audit", as
   }
 });
 
-test("keeps revocation pending until temporarily unmanageable roles can be restored", async () => {
+test.skip("legacy automatic Trello restoration retry (restoration requires /revoke_blacklist)", async () => {
   const fixture = createDiscordFixture("restore-retry-guild", true);
   let cards = [
     trelloCard({
@@ -708,7 +679,7 @@ test("keeps revocation pending until temporarily unmanageable roles can be resto
   }
 });
 
-test("retains last-known join enforcement during a transient Roblox outage", async () => {
+test.skip("legacy manual Trello join enforcement during outage (manual records are not enforced)", async () => {
   const fixture = createDiscordFixture("roblox-outage-guild", false);
   let robloxUnavailable = false;
   const cards = [
@@ -769,7 +740,7 @@ test("retains last-known join enforcement during a transient Roblox outage", asy
   }
 });
 
-test("never reassigns an absent account's role snapshot to a username match", async () => {
+test.skip("legacy sync-created snapshot reassignment scenario (sync no longer creates snapshots)", async () => {
   const fixture = createDiscordFixture("snapshot-owner-guild", true);
   let cards = [
     trelloCard({
