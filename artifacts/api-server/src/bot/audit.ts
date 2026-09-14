@@ -116,7 +116,7 @@ export async function sendAuditEvent(
   event: AuditEvent,
 ): Promise<void> {
   const normalizedAction = event.action.toLowerCase();
-  const mandatory = /(security|rate limit|protected|unauthorized|configuration|setup)/.test(normalizedAction);
+  const mandatory = /(security|maintenance|rate limit|protected|unauthorized|configuration|setup)/.test(normalizedAction);
   const settings = auditSettingsFor(setup);
   if (!mandatory) {
     if (normalizedAction.includes("trello") && !settings.trelloAlerts) return;

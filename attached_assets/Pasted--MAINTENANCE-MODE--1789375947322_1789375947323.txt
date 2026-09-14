@@ -1,0 +1,504 @@
+==================================================
+MAINTENANCE MODE
+==================================================
+
+Add a new administrator-only command:
+
+/maintenance
+
+This command should toggle the bot's MAINTENANCE MODE.
+
+Only users with the Discord Administrator permission or the Server Owner may use this command.
+
+Use a confirmation button before enabling or disabling maintenance mode.
+
+
+==================================================
+MAINTENANCE MODE BEHAVIOR
+==================================================
+
+When maintenance mode is ENABLED:
+
+Bot Status:
+Idle / Yellow
+
+Presence:
+Watching Maintenance
+
+Normal presence rotation must PAUSE completely.
+
+Do NOT continue rotating between normal activities while maintenance mode is active.
+
+The maintenance presence should remain:
+
+🟡 Quartermaster
+Watching Maintenance
+
+until maintenance mode is disabled.
+
+
+==================================================
+COMMAND LOCKING DURING MAINTENANCE
+==================================================
+
+While maintenance mode is active:
+
+BLOCK all normal bot management commands.
+
+This includes:
+
+/blacklist
+/group_blacklist
+/revoke_blacklist
+/blacklist_note
+/blacklist_sync
+/identity_lookup
+/blacklist_lookup
+/setup
+
+and any other normal administrative/action command.
+
+When somebody tries to use a blocked command, respond privately/ephemerally with something like:
+
+🛠️ BOT UNDER MAINTENANCE
+
+Quartermaster is currently undergoing maintenance.
+
+Commands are temporarily unavailable.
+Please try again later.
+
+Do NOT execute any part of the requested command.
+
+
+==================================================
+COMMANDS ALLOWED DURING MAINTENANCE
+==================================================
+
+The following commands should still work:
+
+/maintenance
+/security_status
+
+Optionally allow:
+
+/security_lockdown
+/security_unlock
+
+because these are emergency/security commands.
+
+Do not allow ordinary blacklist operations during maintenance.
+
+
+==================================================
+IMPORTANT: BACKGROUND SECURITY MUST CONTINUE
+==================================================
+
+Maintenance mode should block USER COMMANDS.
+
+It must NOT disable important background protections.
+
+While maintenance mode is active, the bot must STILL:
+
+- remain connected to Discord
+- monitor existing blacklisted members
+- prevent active blacklisted users from receiving roles
+- detect blacklisted users joining the server
+- keep Trello monitoring running if available
+- keep database connections alive
+- send important security/audit alerts
+- detect manual Trello changes
+- detect blacklist/database desyncs
+- enforce existing blacklist restrictions
+
+Maintenance mode must NOT temporarily remove protections from already-blacklisted users.
+
+
+==================================================
+MAINTENANCE MODE PERSISTENCE
+==================================================
+
+Maintenance mode must survive bot restarts.
+
+Example:
+
+Administrator enables maintenance
+↓
+Bot restarts/redeploys
+↓
+Bot reconnects
+↓
+Maintenance mode is STILL active
+↓
+Presence immediately returns to:
+
+Idle
+Watching Maintenance
+
+Do not automatically disable maintenance just because the process restarted.
+
+
+==================================================
+/maintenance COMMAND
+==================================================
+
+Preferred command:
+
+/maintenance mode:enable reason:Updating blacklist system
+
+or:
+
+/maintenance mode:disable
+
+Options:
+
+mode:
+- Enable
+- Disable
+
+reason:
+Optional when disabling
+Required or strongly recommended when enabling
+
+
+Example:
+
+/maintenance mode:enable reason:Updating Trello integration
+
+Bot responds:
+
+🛠️ ENABLE MAINTENANCE MODE?
+
+Reason:
+Updating Trello integration
+
+While enabled:
+• Normal commands will be disabled
+• Background blacklist protection will continue
+• Presence will change to yellow
+• Presence rotation will stop
+
+[ Enable Maintenance ]
+[ Cancel ]
+
+
+==================================================
+WHEN MAINTENANCE IS ENABLED
+==================================================
+
+After confirmation:
+
+Set:
+
+maintenanceMode = true
+
+Store persistently.
+
+Immediately change Discord presence to:
+
+Status:
+Idle
+
+Activity Type:
+Watching
+
+Activity:
+Maintenance
+
+Pause/cancel the normal random presence rotation timer.
+
+Do not allow a normal presence update to overwrite Maintenance mode.
+
+
+==================================================
+WHEN MAINTENANCE IS DISABLED
+==================================================
+
+After confirmation:
+
+Set:
+
+maintenanceMode = false
+
+Store persistently.
+
+Resume normal command operation.
+
+Resume presence rotation.
+
+Immediately restore:
+
+Status:
+Online
+
+Activity:
+Watching Customers
+
+Then continue the normal random 5–20 minute presence rotation.
+
+
+==================================================
+MAINTENANCE PRESENCE PRIORITY
+==================================================
+
+Update presence priority to:
+
+1. SECURITY LOCKDOWN
+2. MAINTENANCE MODE
+3. MAJOR SERVICE FAILURE
+4. STARTUP
+5. NORMAL ROTATION
+
+Example:
+
+Normal:
+🟢 Watching Customers
+
+Maintenance:
+🟡 Watching Maintenance
+
+Security Lockdown while maintenance is enabled:
+🔴 Watching Security Lockdown
+
+Security lockdown ends but maintenance remains enabled:
+🟡 Watching Maintenance
+
+Maintenance disabled:
+🟢 Watching Customers
+
+
+==================================================
+AUDIT LOG
+==================================================
+
+Log maintenance changes.
+
+Example:
+
+🛠️ MAINTENANCE MODE ENABLED
+
+Administrator:
+@Username
+
+Discord ID:
+123456789012345678
+
+Reason:
+Updating blacklist system
+
+Time:
+...
+
+Normal commands have been disabled.
+
+
+When disabled:
+
+✅ MAINTENANCE MODE DISABLED
+
+Administrator:
+@Username
+
+Duration:
+42 minutes
+
+Reason:
+Maintenance completed
+
+Normal command operation restored.
+
+
+==================================================
+SECURITY
+==================================================
+
+Maintenance mode must NOT be usable to bypass security restrictions.
+
+The /maintenance command must:
+
+- require current Administrator permission
+- re-check Administrator permission on confirmation
+- tie confirmation buttons to the administrator who created them
+- expire confirmation buttons
+- audit enable/disable actions
+
+If another user presses the confirmation button:
+DENY.
+
+If the administrator loses Administrator permission before confirming:
+DENY.
+
+
+==================================================
+RATE LIMITS DURING MAINTENANCE
+==================================================
+
+Do not count blocked maintenance-mode command attempts toward normal destructive-action rate limits.
+
+Example:
+
+Maintenance active
+↓
+Admin tries /blacklist
+↓
+Command blocked immediately
+↓
+Do NOT increase blacklist rate-limit counter
+
+Audit repeated attempts only if excessive.
+
+
+==================================================
+/SECURITY_STATUS INTEGRATION
+==================================================
+
+Add Maintenance Mode to /security_status.
+
+Example:
+
+Quartermaster Security Status
+
+Maintenance Mode:
+ENABLED
+
+Security Lockdown:
+OFF
+
+Blacklist Commands:
+DISABLED - MAINTENANCE
+
+Presence:
+Watching Maintenance
+
+Trello:
+ONLINE
+
+Database:
+ONLINE
+
+
+==================================================
+/SETUP INTEGRATION
+==================================================
+
+Add maintenance information to the existing setup/security interface.
+
+Example:
+
+BOT STATE
+
+Maintenance:
+Disabled
+
+Security Lockdown:
+Disabled
+
+[ Enable Maintenance ]
+[ Security Lockdown ]
+[ Back ]
+
+Do not create a separate configuration system.
+
+
+==================================================
+OPTIONAL MAINTENANCE REASON
+==================================================
+
+Store the current maintenance reason.
+
+This can optionally be shown in /security_status.
+
+Example:
+
+Maintenance:
+Enabled
+
+Reason:
+Updating Trello integration
+
+Enabled By:
+@Administrator
+
+Since:
+14 September 2026, 10:45
+
+
+==================================================
+IMPORTANT DISTINCTION
+==================================================
+
+MAINTENANCE:
+
+🟡
+Planned bot downtime / configuration work.
+Commands blocked.
+Background protections remain active.
+
+
+SECURITY LOCKDOWN:
+
+🔴
+Possible compromise / mass abuse protection.
+Destructive operations blocked for security reasons.
+
+
+These must be treated as separate states.
+
+
+==================================================
+TESTING
+==================================================
+
+Test:
+
+1.
+Administrator enables maintenance
+→ Yellow/Idle presence
+→ Watching Maintenance
+→ Normal rotation stops
+
+2.
+Normal administrator runs /blacklist
+→ BLOCKED with maintenance message
+
+3.
+Normal administrator runs /setup
+→ BLOCKED
+
+4.
+Administrator runs /security_status
+→ ALLOWED
+
+5.
+Non-administrator runs /maintenance
+→ DENIED
+
+6.
+Another administrator tries to click somebody else's maintenance confirmation
+→ DENIED
+
+7.
+Bot restarts during maintenance
+→ Maintenance remains enabled
+
+8.
+Blacklisted user joins during maintenance
+→ Existing blacklist restrictions still applied
+
+9.
+Someone manually changes Trello during maintenance
+→ Monitoring/audit still operates
+
+10.
+Administrator disables maintenance
+→ Commands restored
+→ Presence becomes Online
+→ Watching Customers
+→ Random rotation resumes
+
+11.
+Security Lockdown activates during maintenance
+→ Red/DND Watching Security Lockdown
+
+12.
+Lockdown ends while maintenance remains enabled
+→ Yellow/Idle Watching Maintenance

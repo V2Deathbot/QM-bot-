@@ -1,3 +1,42 @@
 {
-  "snapshots": []
+  "snapshots": [
+    {
+      "key": "1114860005334716422:1231098394",
+      "guildId": "1114860005334716422",
+      "discordUserId": "937942479980859412",
+      "robloxUserId": 1231098394,
+      "robloxUsername": "lumiivqs",
+      "roleIds": [],
+      "cardId": "6aa7b66c42a7d00bcd539797",
+      "cardUrl": "https://trello.com/c/qBKrzIQt/4-lumiivqs-1231098394",
+      "blacklistType": "appealable",
+      "blacklistReason": "ee",
+      "source": "command",
+      "blacklistNotificationAttemptedAt": "2026-09-14T08:55:09.760Z",
+      "status": "revoked",
+      "createdAt": "2026-09-14T08:55:09.760Z",
+      "cardUpdatedAt": "2026-09-14T08:55:08.925Z",
+      "revocationCardMovedAt": "2026-09-14T08:56:01.324Z",
+      "revokedAt": "2026-09-14T08:56:01.325Z",
+      "revocationNotificationAttemptedAt": "2026-09-14T08:56:01.325Z"
+    }
+  ],
+  "notes": [
+    {
+      "id": "1114860005334716422:555727322695860234:1789376311297",
+      "guildId": "1114860005334716422",
+      "actorId": "555727322695860234",
+      "text": "ee",
+      "createdAt": "2026-09-14T08:58:31.297Z"
+    },
+    {
+      "id": "1114860005334716422:555727322695860234:1789376332017",
+      "guildId": "1114860005334716422",
+      "robloxUserId": 1231098394,
+      "robloxUsername": "lumiivqs",
+      "actorId": "555727322695860234",
+      "text": "ee",
+      "createdAt": "2026-09-14T08:58:52.017Z"
+    }
+  ]
 }

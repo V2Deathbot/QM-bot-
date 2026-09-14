@@ -3,28 +3,43 @@
     {
       "guildId": "1114860005334716422",
       "lockdown": {
-        "active": false,
+        "active": true,
         "automatic": false,
-        "reason": "",
-        "startedAt": null,
-        "startedBy": null
+        "reason": "lumi is gay",
+        "startedAt": "2026-09-14T08:57:12.401Z",
+        "startedBy": "555727322695860234"
       },
       "destructiveActions": [
         {
           "actorId": "555727322695860234",
           "action": "blacklist",
-          "at": "2026-09-14T08:46:13.696Z"
+          "at": "2026-09-14T08:55:07.711Z"
         },
         {
           "actorId": "555727322695860234",
-          "action": "blacklist",
-          "at": "2026-09-14T08:47:16.139Z"
+          "action": "revoke_blacklist",
+          "at": "2026-09-14T08:55:59.882Z"
         }
       ],
       "observedAdministrators": {
         "555727322695860234": "1970-01-01T00:00:00.000Z"
       },
-      "identityLedger": []
+      "identityLedger": [
+        {
+          "discordUserId": "937942479980859412",
+          "robloxUserId": 1231098394,
+          "observedAt": "2026-09-14T08:55:09.521Z",
+          "source": "command"
+        }
+      ],
+      "maintenance": {
+        "active": false,
+        "reason": "",
+        "startedAt": null,
+        "startedBy": null,
+        "revision": 0
+      },
+      "maintenanceAudit": []
     }
   ]
 }

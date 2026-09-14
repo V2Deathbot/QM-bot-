@@ -23,6 +23,45 @@ export const DEFAULT_PRESENCE_SETTINGS: PresenceSettings = {
 };
 
 let timer: ReturnType<typeof setTimeout> | undefined;
+export interface PresencePriorityState {
+  lockdown: boolean;
+  maintenance: boolean;
+  serviceFailure: boolean;
+  startup: boolean;
+}
+
+type PresenceMode = "lockdown" | "maintenance" | "serviceFailure" | "startup" | "normal";
+let priority: PresencePriorityState = {
+  lockdown: false, maintenance: false, serviceFailure: false, startup: false,
+};
+let normalSettings = { ...DEFAULT_PRESENCE_SETTINGS };
+let activityIndex = 0;
+
+export function getEffectivePresence(): {
+  status: "online" | "idle" | "dnd";
+  activity: string | null;
+  mode: PresenceMode;
+} {
+  if (priority.lockdown) return { status: "dnd", activity: "Security Lockdown", mode: "lockdown" };
+  if (priority.maintenance) return { status: "idle", activity: "Maintenance", mode: "maintenance" };
+  if (priority.serviceFailure) return { status: "dnd", activity: "Service Unavailable", mode: "serviceFailure" };
+  if (priority.startup) return { status: "idle", activity: "Starting Up", mode: "startup" };
+  return {
+    status: "online",
+    activity: normalSettings.enabled ? normalSettings.activities[activityIndex]! : null,
+    mode: "normal",
+  };
+}
+
+/** Updating an unchanged/lower-priority flag must not reset the rotation timer. */
+export function setPresencePriority(client: Client, update: Partial<PresencePriorityState>): void {
+  const before = getEffectivePresence();
+  priority = { ...priority, ...update };
+  const after = getEffectivePresence();
+  if (before.mode === after.mode) return;
+  activityIndex = 0;
+  renderPresence(client);
+}
 
 export function validatePresenceSettings(settings: PresenceSettings): PresenceSettings {
   if (typeof settings.enabled !== "boolean" || typeof settings.rotationEnabled !== "boolean") {
@@ -58,29 +97,32 @@ export function stopPresenceRotation(): void {
 }
 
 export function applyPresenceSettings(client: Client, input: PresenceSettings): void {
-  const settings = validatePresenceSettings(input);
+  normalSettings = validatePresenceSettings(input);
+  activityIndex = 0;
+  renderPresence(client);
+}
+
+function renderPresence(client: Client): void {
   stopPresenceRotation();
   if (!client.user) return;
-  if (!settings.enabled) {
-    client.user.setPresence({ activities: [] });
-    return;
+  const effective = getEffectivePresence();
+  client.user.setPresence({
+    status: effective.status,
+    activities: effective.activity
+      ? [{ name: effective.activity, type: ActivityType.Watching }]
+      : [],
+  });
+  if (
+    effective.mode === "normal" && normalSettings.enabled &&
+    normalSettings.rotationEnabled && normalSettings.activities.length > 1
+  ) {
+    const minimum = normalSettings.minIntervalMinutes * 60_000;
+    const maximum = normalSettings.maxIntervalMinutes * 60_000;
+    const delay = minimum + Math.floor(Math.random() * (maximum - minimum + 1));
+    timer = setTimeout(() => {
+      activityIndex = (activityIndex + 1) % normalSettings.activities.length;
+      renderPresence(client);
+    }, delay);
+    timer.unref();
   }
-  let activityIndex = 0;
-  const update = () => {
-    if (!client.user) return;
-    client.user.setPresence({
-      activities: [{ name: settings.activities[activityIndex]!, type: ActivityType.Watching }],
-    });
-    if (settings.rotationEnabled && settings.activities.length > 1) {
-      const minimum = settings.minIntervalMinutes * 60_000;
-      const maximum = settings.maxIntervalMinutes * 60_000;
-      const delay = minimum + Math.floor(Math.random() * (maximum - minimum + 1));
-      timer = setTimeout(() => {
-        activityIndex = (activityIndex + 1) % settings.activities.length;
-        update();
-      }, delay);
-      timer.unref();
-    }
-  };
-  update();
 }

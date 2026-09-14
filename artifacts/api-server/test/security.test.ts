@@ -30,7 +30,7 @@ const { config } = await import("../src/bot/config.ts");
 const { saveGuildSetup } = await import("../src/bot/setup-store.ts");
 const { getSecurityState, mutateSecurityState } =
   await import("../src/bot/security-store.ts");
-const { findActiveSnapshot } = await import("../src/bot/role-store.ts");
+const { findActiveSnapshot, saveRoleSnapshot } = await import("../src/bot/role-store.ts");
 const { refreshBot } = await import("../src/bot/index.ts");
 
 type MemberRecord = {
@@ -62,6 +62,11 @@ const replies: string[] = [];
 const auditEvents: unknown[] = [];
 const trelloWrites: string[] = [];
 const trelloCardCreations: string[] = [];
+const shownModals: Array<{ userId: string; customId: string }> = [];
+const presenceCalls: Array<{ status?: string; activities?: Array<{ name: string }> }> = [];
+let providerRequests = 0;
+let roleMutationCalls = 0;
+let trelloCards: Array<Record<string, unknown>> = [];
 let client: Client | undefined;
 
 function memberFor(id: string): Member {
@@ -82,8 +87,8 @@ function memberFor(id: string): Member {
     roles: {
       highest: { position: 1 },
       cache: roles,
-      remove: async () => undefined,
-      add: async () => undefined,
+      remove: async () => { roleMutationCalls += 1; },
+      add: async () => { roleMutationCalls += 1; },
     },
     user: {
       id,
@@ -170,6 +175,8 @@ function command(
     editReply: async (value: unknown) => {
       localReplies.push(value);
       if (typeof value === "string") replies.push(value);
+      else if (typeof value === "object" && value !== null && "content" in value &&
+        typeof value.content === "string") replies.push(value.content);
     },
     reply: async (value: { content?: string }) => {
       localReplies.push(value);
@@ -193,12 +200,38 @@ function button(userId: string, customId: string) {
     replied: false,
     deferUpdate: async () => undefined,
     update: async () => undefined,
+    showModal: async (value: { data: { custom_id: string } }) => {
+      shownModals.push({ userId, customId: value.data.custom_id });
+    },
     reply: async (value: { content?: string }) => {
       if (value.content) replies.push(value.content);
     },
     followUp: async (value: { content?: string }) => {
       if (value.content) replies.push(value.content);
     },
+  };
+}
+
+function modal(userId: string, customId: string, values: Record<string, string>) {
+  const localReplies: unknown[] = [];
+  return {
+    isChatInputCommand: () => false,
+    isButton: () => false,
+    isStringSelectMenu: () => false,
+    isModalSubmit: () => true,
+    customId,
+    guild,
+    guildId: guild.id,
+    user: { id: userId },
+    deferred: false,
+    replied: false,
+    fields: { getTextInputValue: (name: string) => values[name] ?? "" },
+    reply: async (value: { content?: string }) => {
+      localReplies.push(value);
+      if (value.content) replies.push(value.content);
+    },
+    editReply: async (value: unknown) => { localReplies.push(value); },
+    localReplies,
   };
 }
 
@@ -209,6 +242,11 @@ async function settle(): Promise<void> {
 }
 
 async function dispatch(interaction: ReturnType<typeof command>): Promise<void> {
+  client!.emit("interactionCreate", interaction);
+  await settle();
+}
+
+async function dispatchRaw(interaction: object): Promise<void> {
   client!.emit("interactionCreate", interaction);
   await settle();
 }
@@ -241,6 +279,9 @@ async function setSecurity(overrides: Record<string, unknown>): Promise<void> {
     state.lockdown = {
       active: false, automatic: false, reason: "", startedAt: null, startedBy: null,
     };
+    state.maintenance = {
+      active: false, reason: "", startedAt: null, startedBy: null, revision: 0,
+    };
     state.destructiveActions = [];
     state.observedAdministrators = {};
   });
@@ -254,6 +295,25 @@ function lastConfirmationId(interaction: ReturnType<typeof command>): string {
   const id = payload?.components[0]?.components[0]?.data.custom_id;
   assert.ok(id?.startsWith("confirm:"), "command should produce a confirmation button");
   return id;
+}
+
+function lastMaintenanceConfirmationId(interaction: { localReplies: unknown[] }): string {
+  const payload = interaction.localReplies.find(
+    (reply): reply is { components: Array<{ components: Array<{ data: { custom_id: string } }> }> } =>
+      typeof reply === "object" && reply !== null && "components" in reply,
+  );
+  const id = payload?.components[0]?.components[0]?.data.custom_id;
+  assert.ok(id?.startsWith("maintenance-confirm:"), `maintenance should produce a confirmation button: ${JSON.stringify(interaction.localReplies)}`);
+  return id;
+}
+
+async function setMaintenance(active: boolean, actor = "admin-a", reason = "maintenance test"): Promise<void> {
+  const pending = command(actor, "maintenance", {
+    mode: active ? "enable" : "disable",
+    ...(active ? { reason } : {}),
+  });
+  await dispatch(pending);
+  await dispatchRaw(button(actor, lastMaintenanceConfirmationId(pending)));
 }
 
 const originalLogin = Client.prototype.login;
@@ -271,7 +331,9 @@ const originalFetch = globalThis.fetch;
       value: {
         id: "security-bot",
         tag: "security-bot#0000",
-        setPresence: async () => undefined,
+        setPresence: async (value: { status?: string; activities?: Array<{ name: string }> }) => {
+          presenceCalls.push(value);
+        },
       },
     });
     queueMicrotask(() => this.emit(Events.ClientReady, this));
@@ -280,11 +342,15 @@ const originalFetch = globalThis.fetch;
 (GuildManager.prototype as unknown as { fetch(id: string): Promise<typeof guild> }).fetch =
   async () => guild;
 globalThis.fetch = async (input, init) => {
+  providerRequests += 1;
   const url = new URL(input.toString());
   if (url.pathname === "/v1/usernames/users") {
     return new Response(JSON.stringify({
       data: [{ id: 9001, name: "Builder", displayName: "Builder" }],
     }));
+  }
+  if (url.pathname === "/v1/users/9001") {
+    return new Response(JSON.stringify({ id: 9001, name: "Builder", displayName: "Builder" }));
   }
   if (url.pathname.endsWith("/lists")) {
     return new Response(JSON.stringify(
@@ -300,7 +366,7 @@ globalThis.fetch = async (input, init) => {
         url: "https://trello.test/card",
       }));
     }
-    return new Response(JSON.stringify([]));
+    return new Response(JSON.stringify(trelloCards));
   }
   if (url.pathname.endsWith("/labels")) {
     return new Response(JSON.stringify([
@@ -315,6 +381,9 @@ globalThis.fetch = async (input, init) => {
   if (url.pathname.includes("/cards") && (init?.method ?? "GET") === "POST") {
     trelloWrites.push(url.pathname);
     return new Response(JSON.stringify({ id: `card-${trelloWrites.length}`, url: "https://trello.test/card" }));
+  }
+  if (url.pathname.endsWith("/cards")) {
+    return new Response(JSON.stringify(trelloCards));
   }
   return new Response(JSON.stringify([]));
 };
@@ -605,4 +674,245 @@ test("fails closed for corrupt and structurally malformed persisted security sta
   await writeFile(config.securityFile, JSON.stringify({ guilds: [] }), "utf8");
   const persisted = JSON.parse(await readFile(config.securityFile, "utf8")) as { guilds: unknown[] };
   assert.deepEqual(persisted.guilds, []);
+});
+
+test("maintenance enable is confirmed, persisted, audited, and changes presence", async () => {
+  await setSecurity({ confirmationsRequired: false });
+  const beforePresence = presenceCalls.length;
+  const pending = command("admin-a", "maintenance", {
+    mode: "enable", reason: "Updating Trello integration",
+  });
+  await dispatch(pending);
+  const confirmation = lastMaintenanceConfirmationId(pending);
+  await dispatchRaw(button("admin-a", confirmation));
+
+  const state = await getSecurityState(guild.id);
+  assert.equal(state.maintenance.active, true);
+  assert.equal(state.maintenance.reason, "Updating Trello integration");
+  assert.equal(state.maintenance.startedBy, "admin-a");
+  assert.equal(state.maintenanceAudit.at(-1)?.active, true);
+  assert.equal(state.maintenanceAudit.at(-1)?.reason, "Updating Trello integration");
+  assert.deepEqual(presenceCalls.at(-1), {
+    status: "idle", activities: [{ name: "Maintenance", type: 3 }],
+  });
+  assert.ok(presenceCalls.length > beforePresence);
+
+  const restarted = await import(`../src/bot/security-store.ts?maintenance=${Date.now()}`);
+  assert.equal((await restarted.getSecurityState(guild.id)).maintenance.active, true);
+});
+
+test("maintenance confirmations reject foreign, expired, demoted, and stale actions", async () => {
+  await setSecurity({});
+  const unauthorized = command("member", "maintenance", { mode: "enable", reason: "unauthorized" });
+  await dispatch(unauthorized);
+  assert.equal((await getSecurityState(guild.id)).maintenance.active, false);
+  assert.match(replies.at(-1) ?? "", /Only a current Discord Administrator/i);
+
+  const foreign = command("admin-a", "maintenance", { mode: "enable", reason: "foreign" });
+  await dispatch(foreign);
+  await dispatchRaw(button("admin-b", lastMaintenanceConfirmationId(foreign)));
+  assert.equal((await getSecurityState(guild.id)).maintenance.active, false);
+  assert.match(replies.at(-1) ?? "", /belongs to another administrator/i);
+
+  const expired = command("admin-a", "maintenance", { mode: "enable", reason: "expired" });
+  await dispatch(expired);
+  const realNow = Date.now;
+  Date.now = () => realNow() + 11 * 60_000;
+  try {
+    await dispatchRaw(button("admin-a", lastMaintenanceConfirmationId(expired)));
+  } finally {
+    Date.now = realNow;
+  }
+  assert.equal((await getSecurityState(guild.id)).maintenance.active, false);
+
+  const demoted = command("admin-a", "maintenance", { mode: "enable", reason: "demoted" });
+  await dispatch(demoted);
+  members.set("admin-a", { administrator: false });
+  try {
+    await dispatchRaw(button("admin-a", lastMaintenanceConfirmationId(demoted)));
+    assert.equal((await getSecurityState(guild.id)).maintenance.active, false);
+    assert.match(replies.at(-1) ?? "", /Only a current Discord Administrator/i);
+  } finally {
+    members.set("admin-a", { administrator: true });
+  }
+
+  const stale = command("admin-a", "maintenance", { mode: "enable", reason: "stale" });
+  await dispatch(stale);
+  await mutateSecurityState(guild.id, (state) => {
+    state.maintenance.revision += 1;
+  });
+  await dispatchRaw(button("admin-a", lastMaintenanceConfirmationId(stale)));
+  assert.equal((await getSecurityState(guild.id)).maintenance.active, false);
+  assert.match(replies.at(-1) ?? "", /stale/i);
+});
+
+test("maintenance blocks every normal command and old interactive work before providers or limits", async () => {
+  await setSecurity({ confirmationsRequired: true });
+  const oldBlacklist = command("admin-a", "group_blacklist", { id: "888", reason: "old confirmation" });
+  await dispatch(oldBlacklist);
+  const oldBlacklistConfirmation = lastConfirmationId(oldBlacklist);
+
+  const setupStart = command("admin-a", "setup");
+  await dispatch(setupStart);
+  await dispatchRaw(button("admin-a", "setup:bot-state"));
+  await dispatchRaw(button("admin-a", "setup:enable-maintenance"));
+  const oldModal = shownModals.at(-1);
+  assert.ok(oldModal?.customId.startsWith("setup-modal:maintenance-reason:"));
+
+  await setMaintenance(true, "admin-b", "command freeze");
+  const beforeRequests = providerRequests;
+  const beforeCards = trelloCardCreations.length;
+  const beforeActions = (await getSecurityState(guild.id)).destructiveActions.length;
+  for (const name of [
+    "blacklist", "group_blacklist", "revoke_blacklist", "blacklist_note",
+    "blacklist_sync", "identity_lookup", "blacklist_lookup", "setup",
+  ]) {
+    await dispatch(command("admin-a", name));
+  }
+  await dispatchRaw(button("admin-a", oldBlacklistConfirmation));
+  await dispatchRaw(button("admin-a", "setup:presence"));
+  await dispatchRaw(modal("admin-a", oldModal!.customId, { reason: "must not execute" }));
+
+  assert.equal(providerRequests, beforeRequests);
+  assert.equal(trelloCardCreations.length, beforeCards);
+  assert.equal((await getSecurityState(guild.id)).destructiveActions.length, beforeActions);
+  assert.match(replies.at(-1) ?? "", /BOT UNDER MAINTENANCE/i);
+});
+
+test("maintenance allows status and emergency lockdown/unlock, then confirmed disable restores normal presence", async () => {
+  if (!(await getSecurityState(guild.id)).maintenance.active) {
+    await setSecurity({});
+    await setMaintenance(true, "admin-a", "emergency command test");
+  }
+  await dispatch(command("admin-a", "security_status"));
+  assert.match(replies.at(-1) ?? "", /Maintenance: ENABLED/);
+  assert.match(replies.at(-1) ?? "", /Blacklist commands: DISABLED — MAINTENANCE/);
+
+  await dispatch(command("admin-a", "security_lockdown", { reason: "incident during maintenance" }));
+  assert.equal((await getSecurityState(guild.id)).lockdown.active, true);
+  await dispatch(command("admin-a", "security_status"));
+  assert.match(replies.at(-1) ?? "", /^Maintenance: ENABLED/m, "maintenance takes precedence over lockdown in status");
+  assert.deepEqual(presenceCalls.at(-1), {
+    status: "dnd", activities: [{ name: "Security Lockdown", type: 3 }],
+  });
+  const unlock = command("admin-a", "security_unlock", { reason: "resolved" });
+  await dispatch(unlock);
+  await dispatchRaw(button("admin-a", lastConfirmationId(unlock)));
+  assert.equal((await getSecurityState(guild.id)).lockdown.active, false);
+  assert.deepEqual(presenceCalls.at(-1), {
+    status: "idle", activities: [{ name: "Maintenance", type: 3 }],
+  });
+
+  await setMaintenance(false, "admin-a", "maintenance completed");
+  const state = await getSecurityState(guild.id);
+  assert.equal(state.maintenance.active, false);
+  assert.equal(state.maintenanceAudit.at(-1)?.active, false);
+  assert.equal(state.maintenanceAudit.at(-1)?.durationSeconds !== null, true);
+  assert.deepEqual(presenceCalls.at(-1), {
+    status: "online", activities: [{ name: "Customers", type: 3 }],
+  });
+  await dispatch(command("admin-a", "security_lockdown", { reason: "post-maintenance incident" }));
+  await dispatch(command("admin-a", "security_status"));
+  assert.match(replies.at(-1) ?? "", /^Security lockdown: LOCKED/m);
+  assert.match(replies.at(-1) ?? "", /Maintenance: disabled/);
+  const finalUnlock = command("admin-a", "security_unlock", { reason: "resolved" });
+  await dispatch(finalUnlock);
+  await dispatchRaw(button("admin-a", lastConfirmationId(finalUnlock)));
+});
+
+test("security status reports setup-required before setup and persisted maintenance renders before delayed registration", async () => {
+  await writeFile(config.setupFile, JSON.stringify({ guilds: [] }), "utf8");
+  await mutateSecurityState(guild.id, (state) => {
+    state.maintenance = {
+      active: false, reason: "", startedAt: null, startedBy: null, revision: state.maintenance.revision + 1,
+    };
+  });
+  await dispatch(command("admin-a", "security_status"));
+  assert.match(replies.at(-1) ?? "", /^Bot state: SETUP REQUIRED OR COMMANDS UNREGISTERED/m);
+
+  await setSecurity({});
+  await mutateSecurityState(guild.id, (state) => {
+    state.maintenance = {
+      active: true, reason: "reconnect order", startedAt: new Date().toISOString(), startedBy: "admin-a",
+      revision: state.maintenance.revision + 1,
+    };
+  });
+  presenceCalls.splice(0);
+  const originalSet = guild.commands.set;
+  let releaseRegistration!: () => void;
+  const registrationGate = new Promise<void>((resolve) => { releaseRegistration = resolve; });
+  guild.commands.set = async () => {
+    await registrationGate;
+  };
+  try {
+    const reconnect = refreshBot("manual");
+    await settle();
+    assert.deepEqual(presenceCalls[0], {
+      status: "idle", activities: [{ name: "Maintenance", type: 3 }],
+    });
+    releaseRegistration();
+    await reconnect;
+  } finally {
+    guild.commands.set = originalSet;
+  }
+  await setMaintenance(false, "admin-a", "reconnect test complete");
+});
+
+test("setup BOT STATE opens a reason modal and background join/recovery work continues in maintenance", async () => {
+  await setSecurity({});
+  const setupStart = command("admin-a", "setup");
+  await dispatch(setupStart);
+  await dispatchRaw(button("admin-a", "setup:bot-state"));
+  await dispatchRaw(button("admin-a", "setup:enable-maintenance"));
+  const setupModal = shownModals.at(-1);
+  assert.ok(setupModal?.customId.startsWith("setup-modal:maintenance-reason:"));
+  const submitted = modal("admin-a", setupModal!.customId, { reason: "setup initiated" });
+  await dispatchRaw(submitted);
+  const setupConfirmation = lastMaintenanceConfirmationId(submitted);
+  await dispatchRaw(button("admin-a", setupConfirmation));
+  assert.equal((await getSecurityState(guild.id)).maintenance.active, true);
+
+  trelloCards = [{
+    id: "maintenance-active-card",
+    name: "Builder | 9001",
+    desc: "- active during maintenance",
+    idList: "list-0",
+    idLabels: ["label-blacklisted", "label-appealable"],
+    url: "https://trello.test/maintenance-active-card",
+    dateLastActivity: new Date().toISOString(),
+    closed: false,
+  }];
+  members.set("joined-during-maintenance", {
+    administrator: false, username: "Builder", globalName: "Builder", nickname: "Builder",
+    roleIds: ["ordinary-role"],
+  });
+  await saveRoleSnapshot({
+    key: `${guild.id}:9001`,
+    guildId: guild.id,
+    discordUserId: "joined-during-maintenance",
+    robloxUserId: 9001,
+    robloxUsername: "Builder",
+    roleIds: ["ordinary-role"],
+    cardId: "approved-maintenance-card",
+    cardUrl: "https://trello.test/approved-maintenance-card",
+    blacklistType: "appealable",
+    blacklistReason: "approved before maintenance",
+    source: "command",
+    status: "active",
+    createdAt: new Date().toISOString(),
+  });
+  // A recovery scan primes the same cached index that the join listener uses.
+  // It is intentionally executed while maintenance is active.
+  await refreshBot("manual");
+  const beforeRoleMutation = roleMutationCalls;
+  client!.emit(Events.GuildMemberAdd, memberFor("joined-during-maintenance"));
+  await settle();
+  await settle();
+  assert.ok(roleMutationCalls > beforeRoleMutation, "join enforcement must keep applying blacklist restrictions");
+
+  const beforeRecoveryPoll = providerRequests;
+  await refreshBot("manual");
+  assert.ok(providerRequests > beforeRecoveryPoll, "background recovery/synchronization remains active");
+  trelloCards = [];
+  await setMaintenance(false, "admin-a", "background test complete");
 });

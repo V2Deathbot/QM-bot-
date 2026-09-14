@@ -438,7 +438,7 @@ test("setup persists settings, audits the change, and enables moderation command
   assert.equal(saved?.auditChannelId, "12345678901234567");
   assert.equal(auditMessages.length, 1);
   assert.deepEqual(registeredCommandNames, [
-    ["setup", "blacklist", "group_blacklist", "revoke_blacklist", "blacklist_note", "blacklist_lookup", "blacklist_sync", "identity_lookup", "security_status", "security_lockdown", "security_unlock"],
+    ["setup", "blacklist", "group_blacklist", "revoke_blacklist", "blacklist_note", "blacklist_lookup", "blacklist_sync", "identity_lookup", "security_status", "maintenance", "security_lockdown", "security_unlock"],
   ]);
   assert.match(replies[0] ?? "", /Setup complete/);
 });
@@ -832,7 +832,7 @@ test("keeps commands disabled after registration failure and enables them on ret
     assert.equal(setupOnlyBody.commandsEnabled, false);
     assert.equal(setupOnlyBody.setupCommandAvailable, true);
     assert.equal(setupOnlyBody.recoveryStatus, "blocked");
-    assert.deepEqual(registeredCommandNames[1], ["setup"]);
+    assert.deepEqual(registeredCommandNames[1], ["setup", "maintenance", "security_status"]);
 
     await saveGuildSetup({
       guildId: "test-guild",
@@ -864,6 +864,7 @@ test("keeps commands disabled after registration failure and enables them on ret
       "blacklist_sync",
       "identity_lookup",
       "security_status",
+      "maintenance",
       "security_lockdown",
       "security_unlock",
     ]);

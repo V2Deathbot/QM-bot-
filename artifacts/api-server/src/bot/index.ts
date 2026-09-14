@@ -1,6 +1,7 @@
 import {
   Client,
   ActionRowBuilder,
+  ActivityType,
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
@@ -76,6 +77,8 @@ import {
 import {
   applyPresenceSettings,
   DEFAULT_PRESENCE_SETTINGS,
+  getEffectivePresence,
+  setPresencePriority,
   stopPresenceRotation,
   validatePresenceSettings,
   type PresenceSettings,
@@ -106,6 +109,23 @@ const setupCommand = new SlashCommandBuilder()
       .setDescription("The ID of the text channel that receives audit logs.")
       .setRequired(false),
   );
+
+const maintenanceCommand = new SlashCommandBuilder()
+  .setName("maintenance")
+  .setDescription("Enable or disable planned maintenance command locking.")
+  .addStringOption((option) => option
+    .setName("mode")
+    .setDescription("Enable or disable maintenance mode.")
+    .setRequired(true)
+    .addChoices({ name: "Enable", value: "enable" }, { name: "Disable", value: "disable" }))
+  .addStringOption((option) => option
+    .setName("reason")
+    .setDescription("Required when enabling; optional when disabling.")
+    .setRequired(false));
+
+const securityStatusCommand = new SlashCommandBuilder()
+  .setName("security_status")
+  .setDescription("View current rate-limit, maintenance, and lockdown status.");
 
 const moderationCommands = [
   new SlashCommandBuilder()
@@ -185,9 +205,8 @@ const moderationCommands = [
     .setDescription("Look up recorded Discord and Roblox identity associations.")
     .addUserOption((option) => option.setName("discord_user").setDescription("Discord user"))
     .addStringOption((option) => option.setName("roblox_id").setDescription("Roblox numeric ID")),
-  new SlashCommandBuilder()
-    .setName("security_status")
-    .setDescription("View current rate-limit and lockdown status."),
+  securityStatusCommand,
+  maintenanceCommand,
   new SlashCommandBuilder()
     .setName("security_lockdown")
     .setDescription("Immediately stop new destructive blacklist actions.")
@@ -198,7 +217,9 @@ const moderationCommands = [
     .addStringOption((option) => option.setName("reason").setDescription("Optional reason")),
 ];
 
-const setupOnlyCommands = [setupCommand.toJSON()];
+// These recovery controls must remain reachable before first-time setup. In
+// particular, maintenance must never make a partially configured guild stuck.
+const setupOnlyCommands = [setupCommand, maintenanceCommand, securityStatusCommand].map((command) => command.toJSON());
 const enabledCommands = [setupCommand, ...moderationCommands].map((command) =>
   command.toJSON(),
 );
@@ -251,10 +272,54 @@ const confirmations = new Map<string, {
   target?: { discordUserId: string; robloxUserId: number; robloxUsername: string; cardId?: string };
   expiresAt: number;
 }>();
+const maintenanceConfirmations = new Map<string, {
+  userId: string;
+  guildId: string;
+  active: boolean;
+  revision: number;
+  reason: string;
+  expiresAt: number;
+  original: ChatInputCommandInteraction | ModalSubmitInteraction;
+}>();
 
 const destructiveCommands = new Set(["blacklist", "group_blacklist", "revoke_blacklist"]);
 const setupSessionLifetimeMs = 10 * 60_000;
 const permissionEscalationWindowMs = 10 * 60_000;
+
+const maintenanceMessage =
+  "🛠️ **BOT UNDER MAINTENANCE**\n\nQuartermaster is currently undergoing maintenance.\nCommands are temporarily unavailable. Please try again later.";
+const maintenanceAllowedCommands = new Set([
+  "maintenance", "security_status", "security_lockdown", "security_unlock",
+]);
+
+function canRenderPresence(client: Client | null | undefined): client is Client {
+  return typeof client?.user?.setPresence === "function";
+}
+
+async function refreshPresencePriority(guildId: string): Promise<void> {
+  if (!canRenderPresence(discordClient)) return;
+  const state = await getSecurityState(guildId);
+  setPresencePriority(discordClient, {
+    lockdown: state.lockdown.active,
+    maintenance: state.maintenance.active,
+  });
+}
+
+async function maintenanceActive(guildId: string): Promise<boolean> {
+  return (await getSecurityState(guildId)).maintenance.active;
+}
+
+function invalidateGuildInteractiveState(guildId: string): void {
+  for (const [id, session] of setupSessions) {
+    if (session.guildId === guildId) setupSessions.delete(id);
+  }
+  for (const [id, pending] of confirmations) {
+    if (pending.guildId === guildId) confirmations.delete(id);
+  }
+  for (const [id, pending] of maintenanceConfirmations) {
+    if (pending.guildId === guildId) maintenanceConfirmations.delete(id);
+  }
+}
 
 function clearBlacklistSyncTimer(): void {
   if (blacklistSyncTimer) {
@@ -302,7 +367,12 @@ async function runGuildBlacklistSync(
     return;
   }
 
-  await synchronizeBlacklists(guild, setup, trigger);
+  const result = await synchronizeBlacklists(guild, setup, trigger);
+  // A complete scan failure is a service outage; malformed cards and partial
+  // reconciliation remain operator-visible but do not claim a major outage.
+  if (canRenderPresence(discordClient)) {
+    setPresencePriority(discordClient, { serviceFailure: result.state === "failed" });
+  }
   if (trigger !== "poll") scheduleBlacklistSync(guild, setup);
 }
 
@@ -419,6 +489,9 @@ async function reserveDestructiveAction(
     state.destructiveActions = state.destructiveActions.filter(
       (entry) => Date.parse(entry.at) >= since,
     );
+    if (state.maintenance.active) {
+      throw new Error("Bot maintenance mode is active. Commands are temporarily unavailable.");
+    }
     if (state.lockdown.active) {
       throw new Error(`Security lockdown is active: ${state.lockdown.reason || "no reason provided"}.`);
     }
@@ -457,6 +530,8 @@ async function reserveDestructiveAction(
     }
     return { lockdownActivated };
   });
+  // A global-limit denial can itself activate automatic lockdown.
+  await refreshPresencePriority(guild.id);
   if (result.denial) {
     await auditBestEffort(guild, setup, {
       action: "Global blacklist rate limit denied",
@@ -557,6 +632,7 @@ function setupMenu(nonce: string): {
     ["discord", "Discord Settings"],
     ["presence", "Presence Settings"],
     ["identity", "Identity / Alt Detection"],
+    ["bot-state", "Bot State"],
     ["view", "View Configuration"],
   ] as const;
   return {
@@ -696,6 +772,32 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
     });
     return;
   }
+  if (id === "setup:bot-state") {
+    const state = await getSecurityState(guild.id);
+    await interaction.update({
+      embeds: [new EmbedBuilder().setTitle("BOT STATE").setDescription([
+        `Maintenance: ${state.maintenance.active ? "Enabled" : "Disabled"}`,
+        state.maintenance.active && state.maintenance.reason
+          ? `Reason: ${state.maintenance.reason}`
+          : "",
+        `Security Lockdown: ${state.lockdown.active ? "Enabled" : "Disabled"}`,
+      ].filter(Boolean).join("\n"))],
+      components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("setup:enable-maintenance").setLabel("Enable Maintenance").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("setup:security").setLabel("Security Settings").setStyle(ButtonStyle.Secondary),
+      )],
+    });
+    return;
+  }
+  if (id === "setup:enable-maintenance") {
+    await interaction.showModal(new ModalBuilder()
+      .setCustomId(scopedSetupModalId(guild.id, interaction.user.id, "setup-modal:maintenance-reason"))
+      .setTitle("Enable maintenance mode")
+      .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("reason").setLabel("Maintenance reason").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500),
+      )));
+    return;
+  }
   if (id === "setup:rates") {
     const settings = securitySettingsFor(setup);
     await interaction.showModal(new ModalBuilder().setCustomId(scopedSetupModalId(guild.id, interaction.user.id, "setup-modal:rates")).setTitle("Edit blacklist rate limits")
@@ -784,6 +886,7 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
         ? { active: true, automatic: false, reason: "Manual setup lockdown", startedAt: new Date().toISOString(), startedBy: interaction.user.id }
         : { active: false, automatic: false, reason: "", startedAt: null, startedBy: null };
     });
+    await refreshPresencePriority(guild.id);
     await auditBestEffort(guild, setup, {
       action: active ? "Security lockdown enabled" : "Security lockdown unlocked",
       status: "success", actorId: interaction.user.id,
@@ -1016,6 +1119,11 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
   if (!nonce || session?.nonce !== nonce) {
     throw new Error("This setup modal belongs to an expired setup session. Run /setup again.");
   }
+  if (id === "setup-modal:maintenance-reason") {
+    const reason = cleanText(interaction.fields.getTextInputValue("reason"), "Maintenance reason");
+    await createMaintenanceConfirmation(interaction, true, reason);
+    return;
+  }
   if (
     (id === "setup-modal:rates" ||
       id === "setup-modal:threshold" ||
@@ -1178,6 +1286,138 @@ async function createConfirmation(
   });
 }
 
+async function createMaintenanceConfirmation(
+  interaction: ChatInputCommandInteraction | ModalSubmitInteraction,
+  active: boolean,
+  reason: string,
+): Promise<void> {
+  const guild = interaction.guild;
+  if (!guild) throw new Error("Maintenance is only available in a server.");
+  const state = await getSecurityState(guild.id);
+  if (state.maintenance.active !== !active) {
+    throw new Error(active
+      ? "Maintenance mode is already enabled."
+      : "Maintenance mode is already disabled.");
+  }
+  // Discord custom IDs are limited to 100 characters; compact the internal
+  // token while retaining a cryptographically random, user/guild-bound nonce.
+  const id = `${guild.id}:${interaction.user.id}:m:${crypto.randomUUID().replaceAll("-", "")}`;
+  maintenanceConfirmations.set(id, {
+    userId: interaction.user.id,
+    guildId: guild.id,
+    active,
+    revision: state.maintenance.revision,
+    reason,
+    expiresAt: Date.now() + setupSessionLifetimeMs,
+    original: interaction,
+  });
+  const payload = {
+    content: `🛠️ **${active ? "ENABLE" : "DISABLE"} MAINTENANCE MODE?**\nReason: ${reason || "None"}\n\n${active
+      ? "Normal commands will be disabled while background blacklist protection continues."
+      : "Normal command operation will be restored."}\nYour current Administrator permission will be checked again.`,
+    ephemeral: true,
+    components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`maintenance-confirm:${id}`).setLabel(
+        active ? "Enable Maintenance" : "Disable Maintenance",
+      ).setStyle(active ? ButtonStyle.Danger : ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`maintenance-cancel:${id}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
+    )],
+  };
+  if ("isModalSubmit" in interaction && interaction.isModalSubmit()) await interaction.reply(payload);
+  else await interaction.editReply(payload);
+}
+
+async function completeMaintenanceChange(
+  guild: Guild,
+  actorId: string,
+  active: boolean,
+  revision: number,
+  reason: string,
+  setup?: GuildSetup,
+): Promise<void> {
+  let priorStartedAt: string | null = null;
+  let durationSeconds: number | null = null;
+  await withGuildBlacklistLifecycleLock(guild.id, async () => {
+    // This check is deliberately inside the action queue: a user who loses
+    // Administrator while waiting behind a blacklist lifecycle action cannot
+    // commit a maintenance transition afterward.
+    await requireCurrentAdministrator(guild, actorId, setup, "/maintenance confirmation");
+    await mutateSecurityState(guild.id, (state) => {
+      if (state.maintenance.revision !== revision || state.maintenance.active === active) {
+        throw new Error("This maintenance confirmation is stale because maintenance state has changed.");
+      }
+      priorStartedAt = state.maintenance.startedAt;
+      durationSeconds = active
+        ? 0
+        : priorStartedAt
+          ? Math.max(0, Math.round((Date.now() - Date.parse(priorStartedAt)) / 1000))
+          : null;
+      const at = new Date().toISOString();
+      state.maintenance = {
+        active,
+        reason: active ? reason : "",
+        startedAt: active ? at : null,
+        startedBy: active ? actorId : null,
+        revision: state.maintenance.revision + 1,
+      };
+      state.maintenanceAudit.push({
+        active,
+        actorId,
+        reason: reason || "None",
+        at,
+        durationSeconds,
+      });
+      state.maintenanceAudit = state.maintenanceAudit.slice(-100);
+    });
+  });
+  invalidateGuildInteractiveState(guild.id);
+  await refreshPresencePriority(guild.id);
+  if (setup) {
+    const duration = durationSeconds !== null
+      ? active ? "0 seconds (started)" : `${durationSeconds} seconds`
+      : "Unknown";
+    await auditBestEffort(guild, setup, {
+      action: active ? "Maintenance mode enabled" : "Maintenance mode disabled",
+      status: "success",
+      actorId,
+      fields: [
+        { name: "Reason", value: reason || "None" },
+        { name: "Duration", value: duration },
+      ],
+    });
+  }
+}
+
+async function handleMaintenanceConfirmation(interaction: ButtonInteraction): Promise<void> {
+  const [, id] = interaction.customId.split(/:(.+)/);
+  const pending = id ? maintenanceConfirmations.get(id) : undefined;
+  if (!pending || pending.expiresAt <= Date.now() || pending.userId !== interaction.user.id ||
+      pending.guildId !== interaction.guildId || !interaction.guild) {
+    throw new Error("This maintenance confirmation has expired or belongs to another administrator.");
+  }
+  maintenanceConfirmations.delete(id!);
+  if (interaction.customId.startsWith("maintenance-cancel:")) {
+    await interaction.update({ content: "Maintenance change cancelled.", components: [] });
+    return;
+  }
+  const setup = await getGuildSetup(pending.guildId);
+  await interaction.deferUpdate();
+  await completeMaintenanceChange(
+    interaction.guild,
+    interaction.user.id,
+    pending.active,
+    pending.revision,
+    pending.reason,
+    setup,
+  );
+  await pending.original.editReply({
+    content: pending.active
+      ? "Maintenance mode enabled. Normal commands are now unavailable."
+      : "Maintenance mode disabled. Normal command operation has been restored.",
+    components: [],
+  });
+}
+
 async function completeSecurityUnlock(
   guild: Guild,
   actorId: string,
@@ -1189,6 +1429,7 @@ async function completeSecurityUnlock(
   await mutateSecurityState(guild.id, (state) => {
     state.lockdown = { active: false, automatic: false, reason: "", startedAt: null, startedBy: null };
   });
+  await refreshPresencePriority(guild.id);
   await auditBestEffort(guild, setup, {
     action: "Security lockdown unlocked", status: "success", actorId,
     fields: [
@@ -1526,12 +1767,15 @@ export function handleBlacklist(
   setup?: GuildSetup,
   boundTarget?: { discordUserId: string; robloxUserId: number; robloxUsername: string },
 ): Promise<void> {
-  return withGuildBlacklistLifecycleLock(interaction.guild!.id, () =>
-    handleBlacklistUnlocked(interaction, setup, boundTarget),
-  );
+  return withGuildBlacklistLifecycleLock(interaction.guild!.id, async () => {
+    if (await maintenanceActive(interaction.guild!.id)) {
+      throw new Error("Bot maintenance mode is active. Commands are temporarily unavailable.");
+    }
+    return handleBlacklistUnlocked(interaction, setup, boundTarget);
+  });
 }
 
-async function handleGroupBlacklist(
+async function handleGroupBlacklistUnlocked(
   interaction: ChatInputCommandInteraction,
   setup: GuildSetup,
 ): Promise<void> {
@@ -1558,6 +1802,18 @@ async function handleGroupBlacklist(
   await interaction.editReply(
     `Blacklisted group ${groupUrl}. Created the Trello card: ${card.url}`,
   );
+}
+
+function handleGroupBlacklist(
+  interaction: ChatInputCommandInteraction,
+  setup: GuildSetup,
+): Promise<void> {
+  return withGuildBlacklistLifecycleLock(interaction.guild!.id, async () => {
+    if (await maintenanceActive(interaction.guild!.id)) {
+      throw new Error("Bot maintenance mode is active. Commands are temporarily unavailable.");
+    }
+    return handleGroupBlacklistUnlocked(interaction, setup);
+  });
 }
 
 async function handleRevokeUnlocked(
@@ -1666,9 +1922,12 @@ function handleRevoke(
   setup: GuildSetup,
   boundTarget?: { discordUserId: string; robloxUserId: number; robloxUsername: string; cardId?: string },
 ): Promise<void> {
-  return withGuildBlacklistLifecycleLock(interaction.guild!.id, () =>
-    handleRevokeUnlocked(interaction, setup, boundTarget),
-  );
+  return withGuildBlacklistLifecycleLock(interaction.guild!.id, async () => {
+    if (await maintenanceActive(interaction.guild!.id)) {
+      throw new Error("Bot maintenance mode is active. Commands are temporarily unavailable.");
+    }
+    return handleRevokeUnlocked(interaction, setup, boundTarget);
+  });
 }
 
 async function handleInteraction(
@@ -1687,6 +1946,91 @@ async function handleInteraction(
   }
 
   await interaction.deferReply({ ephemeral: true });
+
+  // This is intentionally the first command decision after acknowledging the
+  // interaction. It precedes setup reads, provider calls, audit writes, and
+  // destructive rate reservations, so a locked command cannot have side
+  // effects or consume a rate-limit slot.
+  let initialSecurityState: SecurityState;
+  try {
+    initialSecurityState = await getSecurityState(interaction.guild.id);
+  } catch (error) {
+    await interaction.editReply(
+      `Could not complete the command: ${error instanceof Error ? error.message : "Security state is unavailable."}`,
+    );
+    return;
+  }
+  if (
+    initialSecurityState.maintenance.active &&
+    !maintenanceAllowedCommands.has(interaction.commandName)
+  ) {
+    await interaction.editReply(maintenanceMessage);
+    return;
+  }
+
+  if (interaction.commandName === "maintenance") {
+    try {
+      const setup = await getGuildSetup(interaction.guild.id);
+      await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, "/maintenance");
+      const mode = interaction.options.getString("mode", true);
+      if (mode !== "enable" && mode !== "disable") throw new Error("Maintenance mode must be enable or disable.");
+      const rawReason = interaction.options.getString("reason")?.trim() ?? "";
+      if (mode === "enable" && !rawReason) {
+        throw new Error("A maintenance reason is required when enabling maintenance mode.");
+      }
+      const reason = rawReason ? cleanText(rawReason, "Reason") : "";
+      await createMaintenanceConfirmation(interaction, mode === "enable", reason);
+    } catch (error) {
+      await interaction.editReply(error instanceof Error ? error.message : "Could not prepare maintenance mode.");
+    }
+    return;
+  }
+
+  if (interaction.commandName === "security_status") {
+    try {
+      const setup = await getGuildSetup(interaction.guild.id);
+      await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, "/security_status");
+      const state = await getSecurityState(interaction.guild.id);
+      const settings = setup ? securitySettingsFor(setup) : defaultSecuritySettings();
+      const trello = getTrelloReadiness();
+      const presence = getEffectivePresence();
+      const recentActions = state.destructiveActions.filter(
+        (entry) => Date.parse(entry.at) >= Date.now() - settings.windowMinutes * 60_000,
+      ).length;
+      const operationalState = state.maintenance.active
+        ? `Maintenance: ENABLED${state.maintenance.reason ? ` — ${state.maintenance.reason}` : ""}`
+        : state.lockdown.active
+          ? `Security lockdown: LOCKED${state.lockdown.reason ? ` — ${state.lockdown.reason}` : ""}`
+          : !setup || !guildSetupComplete || !commandsRegistered
+            ? "Bot state: SETUP REQUIRED OR COMMANDS UNREGISTERED"
+            : !trello.ready
+              ? `Trello: UNAVAILABLE${trello.error ? ` — ${trello.error}` : ""}`
+              : "Bot state: ENABLED";
+      const blacklistCommandState = state.maintenance.active
+        ? "DISABLED — MAINTENANCE"
+        : state.lockdown.active
+          ? "DISABLED — SECURITY LOCKDOWN"
+          : !setup || !guildSetupComplete || !commandsRegistered
+            ? "DISABLED — SETUP/REGISTRATION"
+            : !trello.ready
+              ? "DISABLED — TRELLO UNAVAILABLE"
+              : "ENABLED";
+      await interaction.editReply([
+        operationalState,
+        `Security: ${state.lockdown.active ? "LOCKED" : "unlocked"}; ${recentActions}/${settings.globalLimit} destructive actions in the current ${settings.windowMinutes}-minute window.`,
+        state.maintenance.active
+          ? `Maintenance since: ${state.maintenance.startedAt ?? "Unknown"}; actor: ${state.maintenance.startedBy ? `<@${state.maintenance.startedBy}>` : "Unknown"}`
+          : "Maintenance: disabled",
+        `Blacklist commands: ${blacklistCommandState}`,
+        `Presence: ${presence.status} / Watching ${presence.activity ?? "nothing"} (${presence.mode})`,
+        `Trello readiness: ${trello.ready ? "READY" : `${trello.status.toUpperCase()}${trello.error ? ` — ${trello.error}` : ""}`}`,
+        "Security store: file-backed persistence readable",
+      ].join("\n"));
+    } catch (error) {
+      await interaction.editReply(error instanceof Error ? error.message : "Could not read security status.");
+    }
+    return;
+  }
 
   if (interaction.commandName === "setup") {
     try {
@@ -1773,6 +2117,7 @@ async function handleInteraction(
       await mutateSecurityState(interaction.guild.id, (state) => {
         state.lockdown = { active: true, automatic: false, reason, startedAt: new Date().toISOString(), startedBy: interaction.user.id };
       });
+      await refreshPresencePriority(interaction.guild.id);
       await auditBestEffort(interaction.guild, setup, { action: "Security lockdown enabled", status: "success", actorId: interaction.user.id, fields: [{ name: "Reason", value: reason }] });
       await interaction.editReply("Security lockdown enabled. Monitoring and enforcement of approved existing records continue.");
     } else if (interaction.commandName === "security_unlock") {
@@ -1959,7 +2304,7 @@ async function replyInteractionError(
   }
 }
 
-async function connectDiscord(): Promise<void> {
+async function connectDiscord(initialSecurity?: SecurityState): Promise<void> {
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
@@ -1967,6 +2312,13 @@ async function connectDiscord(): Promise<void> {
       GatewayIntentBits.DirectMessages,
     ],
     partials: [Partials.Channel],
+    // ClientReady still refreshes this from the durable store, but this avoids
+    // Discord's initial online/default-presence flash during a reconnect.
+    presence: initialSecurity?.lockdown.active
+      ? { status: "dnd", activities: [{ name: "Security Lockdown", type: ActivityType.Watching }] }
+      : initialSecurity?.maintenance.active
+        ? { status: "idle", activities: [{ name: "Maintenance", type: ActivityType.Watching }] }
+        : undefined,
   });
 
   discordClient = client;
@@ -1976,9 +2328,22 @@ async function connectDiscord(): Promise<void> {
 
   const ready = new Promise<void>((resolve, reject) => {
     client.once(Events.ClientReady, (readyClient) => {
-      void registerCommands(readyClient)
-        .then((moderationEnabled) => {
-          void (async () => {
+      void (async () => {
+        try {
+          // Priority must be established before command registration performs
+          // its network request. Startup is lower priority and is set together
+          // with persisted flags, so it cannot mask maintenance/lockdown.
+          const persistedSecurity = initialSecurity ?? (config.discordGuildId
+            ? await getSecurityState(config.discordGuildId)
+            : undefined);
+          if (canRenderPresence(readyClient)) {
+            setPresencePriority(readyClient, {
+              startup: true,
+              lockdown: persistedSecurity?.lockdown.active ?? false,
+              maintenance: persistedSecurity?.maintenance.active ?? false,
+            });
+          }
+          const moderationEnabled = await registerCommands(readyClient);
             try {
               const setup = config.discordGuildId
                 ? await getGuildSetup(config.discordGuildId)
@@ -1991,6 +2356,10 @@ async function connectDiscord(): Promise<void> {
               );
             } catch (error) {
               logger.warn({ err: error }, "Could not apply Discord presence settings");
+            } finally {
+              // Startup is a transient lower-priority status, including when
+              // setup remains incomplete.
+              if (canRenderPresence(readyClient)) setPresencePriority(readyClient, { startup: false });
             }
             if (moderationEnabled) {
               setRecoveryStatus("successful");
@@ -2011,9 +2380,10 @@ async function connectDiscord(): Promise<void> {
               "Discord blacklist bot is online",
             );
             resolve();
-          })().catch(reject);
-        })
-        .catch(reject);
+        } catch (error) {
+          reject(error);
+        }
+      })();
     });
   });
 
@@ -2021,14 +2391,49 @@ async function connectDiscord(): Promise<void> {
     if (interaction.isChatInputCommand()) {
       void handleInteraction(interaction);
     } else if (interaction.isButton()) {
-      void (interaction.customId.startsWith("confirm:") || interaction.customId.startsWith("cancel:")
-        ? handleConfirmation(interaction)
-        : handleSetupComponent(interaction)
-      ).catch((error) => replyInteractionError(interaction, error));
+      void (async () => {
+        if (interaction.customId.startsWith("maintenance-confirm:") ||
+            interaction.customId.startsWith("maintenance-cancel:")) {
+          await handleMaintenanceConfirmation(interaction);
+          return;
+        }
+        const [, confirmationId] = interaction.customId.split(/:(.+)/);
+        const existingConfirmation = confirmationId ? confirmations.get(confirmationId) : undefined;
+        // The command form of emergency unlock remains usable in maintenance;
+        // ordinary blacklist confirmations deliberately do not.
+        if (
+          existingConfirmation?.command === "security_unlock" &&
+          (interaction.customId.startsWith("confirm:") || interaction.customId.startsWith("cancel:"))
+        ) {
+          await handleConfirmation(interaction);
+          return;
+        }
+        if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
+          await interaction.reply({ content: maintenanceMessage, ephemeral: true });
+          return;
+        }
+        if (interaction.customId.startsWith("confirm:") || interaction.customId.startsWith("cancel:")) {
+          await handleConfirmation(interaction);
+        } else {
+          await handleSetupComponent(interaction);
+        }
+      })().catch((error) => replyInteractionError(interaction, error));
     } else if (interaction.isStringSelectMenu()) {
-      void handleSetupComponent(interaction).catch((error) => replyInteractionError(interaction, error));
+      void (async () => {
+        if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
+          await interaction.reply({ content: maintenanceMessage, ephemeral: true });
+          return;
+        }
+        await handleSetupComponent(interaction);
+      })().catch((error) => replyInteractionError(interaction, error));
     } else if (interaction.isModalSubmit()) {
-      void handleSetupModal(interaction).catch((error) => replyInteractionError(interaction, error));
+      void (async () => {
+        if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
+          await interaction.reply({ content: maintenanceMessage, ephemeral: true });
+          return;
+        }
+        await handleSetupModal(interaction);
+      })().catch((error) => replyInteractionError(interaction, error));
     }
   });
 
@@ -2124,6 +2529,9 @@ export async function refreshBot(
         persistedSetup ? trelloMappingsFor(persistedSetup) : defaultTrelloMappings(),
       );
       if (!trello.ready) {
+        if (canRenderPresence(discordClient)) {
+          setPresencePriority(discordClient, { serviceFailure: trello.status === "unavailable" });
+        }
         commandsRegistered = false;
         clearBlacklistSyncTimer();
         setRecoveryStatus("blocked", trello.error);
@@ -2147,6 +2555,9 @@ export async function refreshBot(
       }
 
       resetTrelloRetry();
+      if (canRenderPresence(discordClient)) {
+        setPresencePriority(discordClient, { serviceFailure: false });
+      }
       if (trigger === "automatic") {
         recovery.lastRetryOutcome = "successful";
       }
@@ -2181,7 +2592,10 @@ export async function refreshBot(
         return refreshResult();
       }
 
-      await connectDiscord();
+      const persistedSecurity = config.discordGuildId
+        ? await getSecurityState(config.discordGuildId)
+        : undefined;
+      await connectDiscord(persistedSecurity);
       return refreshResult();
     } catch (error) {
       const message =
