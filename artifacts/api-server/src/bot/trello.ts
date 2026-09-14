@@ -243,9 +243,7 @@ export async function requireTrelloReadiness(
 
 export async function findList(listName: string): Promise<TrelloList> {
   const lists = await getOpenLists();
-  const list = lists.find(
-    (candidate) => candidate.name.trim().toLowerCase() === listName.trim().toLowerCase(),
-  );
+  const list = findListInSnapshot(lists, listName);
 
   if (!list) {
     throw new Error(
@@ -254,6 +252,15 @@ export async function findList(listName: string): Promise<TrelloList> {
   }
 
   return list;
+}
+
+function findListInSnapshot(
+  lists: TrelloList[],
+  listName: string,
+): TrelloList | undefined {
+  return lists.find(
+    (candidate) => candidate.name.trim().toLowerCase() === listName.trim().toLowerCase(),
+  );
 }
 
 function assertMappings(mappings: TrelloMappings): void {
@@ -281,16 +288,19 @@ async function getLabels(): Promise<TrelloLabel[]> {
 async function ensureLabel(
   name: string,
   color: string,
+  knownLabels?: TrelloLabel[],
 ): Promise<TrelloLabel> {
-  const existing = (await getLabels()).find(
-    (label) => label.name.trim().toLowerCase() === name.toLowerCase(),
+  const normalizedName = normalizedLabelName(name);
+  const labels = knownLabels ?? (await getLabels());
+  const existing = labels.find(
+    (label) => normalizedLabelName(label.name) === normalizedName,
   );
   if (existing) return existing;
 
   const { boardId } = requireTrelloConfig();
   return request<TrelloLabel>(
     "/labels",
-    body({ idBoard: boardId, name, color }),
+    body({ idBoard: boardId, name: name.trim(), color }),
   );
 }
 
@@ -372,15 +382,26 @@ export async function findBlacklistCard(
   );
 }
 
-export async function findBlacklistCardByRobloxId(
+function robloxIdFromCardName(cardName: string): number | undefined {
+  const match = /^\s*[^|]+?\s*\|\s*(\d+)\s*$/.exec(cardName);
+  if (!match) return undefined;
+  const robloxId = Number(match[1]);
+  return Number.isSafeInteger(robloxId) && robloxId > 0 ? robloxId : undefined;
+}
+
+/**
+ * Return every open user blacklist card for an exact Roblox account id.
+ * Names are deliberately not part of this match: Roblox usernames can be
+ * renamed, and substring/name matching could select another account.
+ */
+export async function findBlacklistCardsByRobloxId(
   robloxId: number,
   mappings: TrelloMappings = defaultTrelloMappings(),
-): Promise<TrelloBlacklistCard | undefined> {
-  if (!Number.isSafeInteger(robloxId) || robloxId <= 0) return undefined;
-  const cards = (await fetchBlacklistCards(mappings)).filter((card) => {
-    const match = /^\s*[^|]+?\s*\|\s*(\d+)\s*$/.exec(card.name);
-    return match ? Number(match[1]) === robloxId : false;
-  });
+): Promise<TrelloBlacklistCard[]> {
+  if (!Number.isSafeInteger(robloxId) || robloxId <= 0) return [];
+  const cards = (await fetchBlacklistCards(mappings)).filter(
+    (card) => robloxIdFromCardName(card.name) === robloxId,
+  );
   cards.sort((left, right) => {
     const leftTimestamp = Date.parse(left.dateLastActivity);
     const rightTimestamp = Date.parse(right.dateLastActivity);
@@ -397,6 +418,14 @@ export async function findBlacklistCardByRobloxId(
     }
     return left.id.localeCompare(right.id);
   });
+  return cards;
+}
+
+export async function findBlacklistCardByRobloxId(
+  robloxId: number,
+  mappings: TrelloMappings = defaultTrelloMappings(),
+): Promise<TrelloBlacklistCard | undefined> {
+  const cards = await findBlacklistCardsByRobloxId(robloxId, mappings);
   return cards[0];
 }
 
@@ -411,6 +440,146 @@ async function removeLabel(cardId: string, labelId: string): Promise<void> {
     `/cards/${encodeURIComponent(cardId)}/idLabels/${encodeURIComponent(labelId)}`,
     { method: "DELETE" },
   );
+}
+
+async function updateCard(
+  cardId: string,
+  updates: Record<string, string>,
+): Promise<void> {
+  await request<TrelloCard>(`/cards/${encodeURIComponent(cardId)}`, {
+    method: "PUT",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(updates),
+  });
+}
+
+function normalizedLabelName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+/**
+ * Move one exact revoked card back into an active blacklist category. The
+ * card id is intentionally supplied by the caller and re-read here, so the
+ * operation preserves Trello history and cannot silently target a card whose
+ * identity changed between the account lookup and this update.
+ */
+export async function reactivateBlacklistCardById(
+  cardId: string,
+  input: {
+    robloxId: number;
+    robloxUsername: string;
+    reason: string;
+    type: BlacklistType;
+    mappings?: TrelloMappings;
+  },
+): Promise<TrelloCard> {
+  if (!Number.isSafeInteger(input.robloxId) || input.robloxId <= 0) {
+    throw new Error("The Roblox user id must be a positive safe integer.");
+  }
+  const mappings = input.mappings ?? defaultTrelloMappings();
+  const card = await request<TrelloCard>(
+    `/cards/${encodeURIComponent(cardId)}?fields=id,name,desc,idList,idLabels,url,dateLastActivity,closed`,
+  );
+  if (card.closed) {
+    throw new Error("The revoked Trello blacklist card is closed and cannot be reused.");
+  }
+  if (robloxIdFromCardName(card.name) !== input.robloxId) {
+    throw new Error(
+      "The selected revoked Trello card no longer matches the requested Roblox account.",
+    );
+  }
+
+  const lists = await getOpenLists();
+  const revokedList = findListInSnapshot(lists, mappings.lists.revoked);
+  const targetList = findListInSnapshot(lists, mappings.lists[input.type]);
+  if (!revokedList) {
+    throw new Error(
+      `Trello list "${mappings.lists.revoked}" was not found on the configured board.`,
+    );
+  }
+  if (!targetList) {
+    throw new Error(
+      `Trello list "${mappings.lists[input.type]}" was not found on the configured board.`,
+    );
+  }
+  if (card.idList !== revokedList.id) {
+    throw new Error(
+      "The selected Trello card is no longer in the configured revoked list.",
+    );
+  }
+
+  const nextName = `${input.robloxUsername} | ${input.robloxId}`;
+  const nextDescription = `- ${input.reason.trim()}`;
+  const labels = await getLabels();
+  const blacklistedLabel = await ensureLabel(
+    mappings.labels.blacklisted,
+    "red",
+    labels,
+  );
+  if (!labels.some((label) => label.id === blacklistedLabel.id)) {
+    labels.push(blacklistedLabel);
+  }
+  const typeLabel = await ensureLabel(
+    mappings.labels[input.type],
+    "orange",
+    labels,
+  );
+  if (!labels.some((label) => label.id === typeLabel.id)) {
+    labels.push(typeLabel);
+  }
+
+  // Only lifecycle labels are swapped. Any unrelated board labels remain
+  // attached to the historical card. Compute this complete label set before
+  // the single card update so a label preparation failure leaves the card in
+  // its original revoked state.
+  const lifecycleNames = new Set(
+    [
+      mappings.labels.appealable,
+      mappings.labels.conditional,
+      mappings.labels.permanent,
+      mappings.labels.group,
+      mappings.labels.revoked,
+    ].map(normalizedLabelName),
+  );
+  const labelById = new Map(labels.map((label) => [label.id, label]));
+  const desiredLabelIds = (card.idLabels ?? []).filter((labelId) => {
+    const label = labelById.get(labelId);
+    return !label || !lifecycleNames.has(normalizedLabelName(label.name));
+  });
+  if (!desiredLabelIds.includes(blacklistedLabel.id)) {
+    desiredLabelIds.push(blacklistedLabel.id);
+  }
+  if (!desiredLabelIds.includes(typeLabel.id)) {
+    desiredLabelIds.push(typeLabel.id);
+  }
+
+  await updateCard(card.id, {
+    idList: targetList.id,
+    name: nextName,
+    desc: nextDescription,
+    idLabels: desiredLabelIds.join(","),
+  });
+
+  return {
+    ...card,
+    name: nextName,
+    desc: nextDescription,
+    idList: targetList.id,
+    idLabels: desiredLabelIds,
+  };
+}
+
+export async function reactivateBlacklistCard(
+  card: TrelloCard,
+  input: {
+    robloxId: number;
+    robloxUsername: string;
+    reason: string;
+    type: BlacklistType;
+    mappings?: TrelloMappings;
+  },
+): Promise<TrelloCard> {
+  return reactivateBlacklistCardById(card.id, input);
 }
 
 export async function revokeBlacklistCard(

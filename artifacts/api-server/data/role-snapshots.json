@@ -6,19 +6,21 @@
       "discordUserId": "937942479980859412",
       "robloxUserId": 1231098394,
       "robloxUsername": "lumiivqs",
-      "roleIds": [],
-      "cardId": "6aa7b66c42a7d00bcd539797",
-      "cardUrl": "https://trello.com/c/qBKrzIQt/4-lumiivqs-1231098394",
+      "roleIds": [
+        "1548958021160411216"
+      ],
+      "cardId": "6aa7d3947600667ddabbc6cb",
+      "cardUrl": "https://trello.com/c/etpaNsCp/5-lumiivqs-1231098394",
       "blacklistType": "appealable",
-      "blacklistReason": "ee",
+      "blacklistReason": "trrdfvgr",
       "source": "command",
-      "blacklistNotificationAttemptedAt": "2026-09-14T08:55:09.760Z",
+      "blacklistNotificationAttemptedAt": "2026-09-14T10:59:34.637Z",
       "status": "revoked",
-      "createdAt": "2026-09-14T08:55:09.760Z",
-      "cardUpdatedAt": "2026-09-14T08:55:08.925Z",
-      "revocationCardMovedAt": "2026-09-14T08:56:01.324Z",
-      "revokedAt": "2026-09-14T08:56:01.325Z",
-      "revocationNotificationAttemptedAt": "2026-09-14T08:56:01.325Z"
+      "createdAt": "2026-09-14T10:59:34.638Z",
+      "cardUpdatedAt": "2026-09-14T10:59:33.695Z",
+      "revocationCardMovedAt": "2026-09-14T11:00:22.205Z",
+      "revokedAt": "2026-09-14T11:00:22.443Z",
+      "revocationNotificationAttemptedAt": "2026-09-14T11:00:22.443Z"
     }
   ],
   "notes": [

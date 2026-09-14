@@ -34,7 +34,14 @@ const { getGuildSetup, saveGuildSetup } =
   await import("../src/bot/setup-store.ts");
 const { requireAuditChannel, sendAuditEvent } =
   await import("../src/bot/audit.ts");
-const { checkTrelloReadiness, createBlacklistCard, validateTrelloMappings, revokeBlacklistCard } =
+const {
+  checkTrelloReadiness,
+  createBlacklistCard,
+  findBlacklistCardsByRobloxId,
+  reactivateBlacklistCardById,
+  validateTrelloMappings,
+  revokeBlacklistCard,
+} =
   await import("../src/bot/trello.ts");
 const {
   canUseModerationCommands,
@@ -536,6 +543,404 @@ test("moves a Trello blacklist card to revoked and updates its labels", async ()
     );
     assert.equal(requests[2]?.body?.get("idList"), "list-revoked");
     assert.equal(requests[6]?.body?.get("value"), "label-revoked");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reuses one exact revoked card for each configured blacklist type", async () => {
+  const mappings = {
+    lists: {
+      appealable: "Appeals",
+      conditional: "Conditions",
+      permanent: "Permanents",
+      group: "Groups",
+      revoked: "Revocations",
+    },
+    labels: {
+      blacklisted: "BLOCKED",
+      appealable: "APPEAL",
+      conditional: "CONDITION",
+      permanent: "PERMANENT",
+      group: "GROUP",
+      revoked: "REVOKED",
+    },
+  };
+  const listIds = {
+    appealable: "list-appealable",
+    conditional: "list-conditional",
+    permanent: "list-permanent",
+    group: "list-group",
+    revoked: "list-revoked",
+  };
+  const labelIds = {
+    blacklisted: "label-blacklisted",
+    appealable: "label-appealable",
+    conditional: "label-conditional",
+    permanent: "label-permanent",
+    group: "label-group",
+    revoked: "label-revoked",
+    unrelated: "label-unrelated",
+  };
+  const cards = new Map<string, {
+    id: string;
+    name: string;
+    desc: string;
+    idList: string;
+    idLabels: string[];
+    url: string;
+    dateLastActivity: string;
+    closed: boolean;
+  }>();
+  const requests: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const pathname = requestPath(input);
+    const method = init?.method ?? "GET";
+    requests.push(`${method} ${pathname}`);
+    if (pathname.endsWith("/lists")) {
+      return jsonResponse(Object.entries(mappings.lists).map(([type, name]) => ({
+        id: listIds[type as keyof typeof listIds],
+        name,
+      })));
+    }
+    if (pathname.endsWith("/labels")) {
+      return jsonResponse([
+        ...Object.entries(mappings.labels).map(([key, name]) => ({
+          id: labelIds[key as keyof typeof labelIds],
+          name,
+          color: "blue",
+        })),
+        { id: labelIds.unrelated, name: "case notes", color: "blue" },
+      ]);
+    }
+    const cardMatch = /^\/1\/cards\/([^/]+)$/.exec(pathname);
+    if (cardMatch && method === "GET") {
+      const card = cards.get(cardMatch[1]!);
+      if (!card) return jsonResponse({ error: "missing card" }, 404);
+      return jsonResponse(card);
+    }
+    if (cardMatch && method === "PUT") {
+      const card = cards.get(cardMatch[1]!);
+      assert.ok(card);
+      const body = init?.body as URLSearchParams;
+      card.idList = body.get("idList") ?? card.idList;
+      card.name = body.get("name") ?? card.name;
+      card.desc = body.get("desc") ?? card.desc;
+      card.idLabels = (body.get("idLabels") ?? "")
+        .split(",")
+        .filter(Boolean);
+      return jsonResponse(card);
+    }
+    throw new Error(`Unexpected reuse request: ${method} ${pathname}`);
+  };
+
+  try {
+    for (const [index, type] of (
+      ["appealable", "conditional", "permanent"] as const
+    ).entries()) {
+      const cardId = `revoked-${type}`;
+      cards.set(cardId, {
+        id: cardId,
+        name: `OldName${index} | ${100 + index}`,
+        desc: "- old reason",
+        idList: listIds.revoked,
+        idLabels: [labelIds.revoked, labelIds.permanent, labelIds.unrelated],
+        url: `https://trello.test/${cardId}`,
+        dateLastActivity: "2026-01-01T00:00:00.000Z",
+        closed: false,
+      });
+
+      const reactivated = await reactivateBlacklistCardById(cardId, {
+        robloxId: 100 + index,
+        robloxUsername: `CurrentName${index}`,
+        reason: `new reason ${index}`,
+        type,
+        mappings,
+      });
+      assert.equal(reactivated.id, cardId);
+      assert.equal(reactivated.idList, listIds[type]);
+      assert.equal(reactivated.name, `CurrentName${index} | ${100 + index}`);
+      assert.equal(reactivated.desc, `- new reason ${index}`);
+      assert.deepEqual(
+        new Set(reactivated.idLabels),
+        new Set([
+          labelIds.unrelated,
+          labelIds.blacklisted,
+          labelIds[type],
+        ]),
+      );
+      assert.equal(cards.get(cardId)?.id, cardId);
+    }
+    assert.equal(
+      requests.filter((request) => request === "POST /1/cards").length,
+      0,
+    );
+    assert.equal(
+      requests.filter((request) => request.includes("/idLabels")).length,
+      0,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("does not update a revoked card when required label preparation fails", async () => {
+  const requests: string[] = [];
+  const originalFetch = globalThis.fetch;
+  const card = {
+    id: "label-preparation-failure",
+    name: "Builder | 77",
+    desc: "- old reason",
+    idList: "list-revoked",
+    idLabels: ["label-revoked"],
+    url: "https://trello.test/label-preparation-failure",
+    dateLastActivity: "2026-01-01T00:00:00.000Z",
+    closed: false,
+  };
+  globalThis.fetch = async (input, init) => {
+    const pathname = requestPath(input);
+    const method = init?.method ?? "GET";
+    requests.push(`${method} ${pathname}`);
+    if (pathname.endsWith("/lists")) {
+      return jsonResponse([
+        { id: "list-appealable", name: config.trelloListNames.appealable },
+        { id: "list-conditional", name: config.trelloListNames.conditional },
+        { id: "list-permanent", name: config.trelloListNames.permanent },
+        { id: "list-revoked", name: config.trelloListNames.revoked },
+      ]);
+    }
+    if (pathname === "/1/cards/label-preparation-failure" && method === "GET") {
+      return jsonResponse(card);
+    }
+    if (pathname.endsWith("/labels") && method === "GET") {
+      return jsonResponse([
+        { id: "label-revoked", name: "revoked", color: "green" },
+      ]);
+    }
+    if (pathname === "/1/labels" && method === "POST") {
+      return jsonResponse({ error: "Trello unavailable" }, 503);
+    }
+    if (method === "PUT") {
+      assert.fail(`The card must not be updated: ${method} ${pathname}`);
+    }
+    throw new Error(`Unexpected label preparation request: ${method} ${pathname}`);
+  };
+
+  try {
+    await assert.rejects(
+      reactivateBlacklistCardById("label-preparation-failure", {
+        robloxId: 77,
+        robloxUsername: "Builder",
+        reason: "new reason",
+        type: "permanent",
+      }),
+      /Trello request failed \(503\)/,
+    );
+    assert.deepEqual(card, {
+      id: "label-preparation-failure",
+      name: "Builder | 77",
+      desc: "- old reason",
+      idList: "list-revoked",
+      idLabels: ["label-revoked"],
+      url: "https://trello.test/label-preparation-failure",
+      dateLastActivity: "2026-01-01T00:00:00.000Z",
+      closed: false,
+    });
+    assert.equal(
+      requests.some((request) => request === "PUT /1/cards/label-preparation-failure"),
+      false,
+    );
+    assert.equal(
+      requests.some((request) => request === "POST /1/cards"),
+      false,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("retries a failed revoked-card update without creating another card", async () => {
+  const roles = new Collection([
+    ["role-1", { id: "role-1", name: "Member", managed: false, position: 1 }],
+  ]);
+  const removed: string[][] = [];
+  const member = {
+    id: "retry-discord-member",
+    roles: {
+      cache: roles,
+      remove: async (roleIds: string[]) => {
+        removed.push([...roleIds]);
+      },
+    },
+    guild: undefined as never,
+    send: async () => undefined,
+  };
+  const guild = {
+    id: "retry-revoked-command",
+    roles: { cache: roles },
+    members: {
+      me: { roles: { highest: { position: 10 } } },
+      fetch: async () => member,
+    },
+  };
+  member.guild = guild as never;
+  const card = {
+    id: "retry-revoked-card",
+    name: "Builder | 78",
+    desc: "- old reason",
+    idList: "list-revoked",
+    idLabels: ["label-revoked", "label-unrelated"],
+    url: "https://trello.test/retry-revoked-card",
+    dateLastActivity: "2026-01-01T00:00:00.000Z",
+    closed: false,
+  };
+  let putFailures = 1;
+  let cardCreations = 0;
+  let cardUpdates = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const pathname = requestPath(input);
+    const method = init?.method ?? "GET";
+    if (pathname === "/v1/usernames/users") {
+      return jsonResponse({
+        data: [{ id: 78, name: "Builder", displayName: "Builder" }],
+      });
+    }
+    if (pathname.endsWith("/lists")) {
+      return jsonResponse([
+        { id: "list-appealable", name: config.trelloListNames.appealable },
+        { id: "list-conditional", name: config.trelloListNames.conditional },
+        { id: "list-permanent", name: config.trelloListNames.permanent },
+        { id: "list-revoked", name: config.trelloListNames.revoked },
+      ]);
+    }
+    if (pathname.endsWith("/cards") && method === "GET") {
+      return jsonResponse([card]);
+    }
+    if (pathname === "/1/cards/retry-revoked-card" && method === "GET") {
+      return jsonResponse(card);
+    }
+    if (pathname.endsWith("/labels") && method === "GET") {
+      return jsonResponse([
+        { id: "label-blacklisted", name: "blacklisted", color: "red" },
+        { id: "label-appealable", name: "appealable", color: "orange" },
+        { id: "label-conditional", name: "conditional", color: "orange" },
+        { id: "label-permanent", name: "permanent", color: "orange" },
+        { id: "label-group", name: "group blacklist", color: "orange" },
+        { id: "label-revoked", name: "revoked", color: "green" },
+        { id: "label-unrelated", name: "case notes", color: "blue" },
+      ]);
+    }
+    if (pathname === "/1/cards" && method === "POST") {
+      cardCreations += 1;
+      return jsonResponse({ error: "Unexpected card creation" }, 500);
+    }
+    if (pathname === "/1/cards/retry-revoked-card" && method === "PUT") {
+      cardUpdates += 1;
+      if (putFailures > 0) {
+        putFailures -= 1;
+        return jsonResponse({ error: "Trello unavailable" }, 503);
+      }
+      const body = init?.body as URLSearchParams;
+      card.idList = body.get("idList") ?? card.idList;
+      card.name = body.get("name") ?? card.name;
+      card.desc = body.get("desc") ?? card.desc;
+      card.idLabels = (body.get("idLabels") ?? "").split(",").filter(Boolean);
+      return jsonResponse(card);
+    }
+    throw new Error(`Unexpected retry request: ${method} ${pathname}`);
+  };
+
+  const interaction = {
+    guild,
+    options: {
+      getString: (name: string) => ({
+        user: "Builder",
+        type: "permanent",
+        reason: "new reason",
+      })[name],
+      getUser: () => ({ id: member.id }),
+    },
+    editReply: async () => undefined,
+  };
+
+  try {
+    await assert.rejects(
+      handleBlacklist(interaction as never),
+      /Trello request failed \(503\)/,
+    );
+    assert.deepEqual(removed, []);
+    assert.equal(card.idList, "list-revoked");
+
+    await handleBlacklist(interaction as never);
+    assert.equal(card.id, "retry-revoked-card");
+    assert.equal(card.idList, "list-permanent");
+    assert.equal(card.name, "Builder | 78");
+    assert.equal(cardCreations, 0);
+    assert.equal(cardUpdates, 2);
+    assert.deepEqual(removed, [["role-1"]]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("matches blacklist cards by exact numeric Roblox identity without substring matches", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const pathname = requestPath(input);
+    if (pathname.endsWith("/lists")) {
+      return jsonResponse([
+        { id: "list-appealable", name: config.trelloListNames.appealable },
+        { id: "list-conditional", name: config.trelloListNames.conditional },
+        { id: "list-permanent", name: config.trelloListNames.permanent },
+        { id: "list-revoked", name: config.trelloListNames.revoked },
+      ]);
+    }
+    if (pathname.endsWith("/cards") && !init?.method) {
+      return jsonResponse([
+        {
+          id: "wrong-substring",
+          name: "Builder | 4201",
+          desc: "- unrelated",
+          idList: "list-revoked",
+          idLabels: [],
+          url: "https://trello.test/wrong-substring",
+          dateLastActivity: "2026-01-01T00:00:00.000Z",
+          closed: false,
+        },
+        {
+          id: "revoked-one",
+          name: "Builder | 42",
+          desc: "- old",
+          idList: "list-revoked",
+          idLabels: [],
+          url: "https://trello.test/revoked-one",
+          dateLastActivity: "2026-01-02T00:00:00.000Z",
+          closed: false,
+        },
+        {
+          id: "revoked-two",
+          name: "Renamed | 42",
+          desc: "- duplicate",
+          idList: "list-revoked",
+          idLabels: [],
+          url: "https://trello.test/revoked-two",
+          dateLastActivity: "2026-01-03T00:00:00.000Z",
+          closed: false,
+        },
+      ]);
+    }
+    throw new Error(`Unexpected identity request: ${input.toString()}`);
+  };
+
+  try {
+    const matches = await findBlacklistCardsByRobloxId(42);
+    assert.deepEqual(matches.map((card) => card.id), ["revoked-two", "revoked-one"]);
+    assert.equal(
+      matches.some((card) => card.id === "wrong-substring"),
+      false,
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

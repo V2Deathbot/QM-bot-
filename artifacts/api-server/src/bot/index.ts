@@ -26,9 +26,11 @@ import {
   checkTrelloReadiness,
   createBlacklistCard,
   createGroupBlacklistCard,
+  findBlacklistCardsByRobloxId,
   findBlacklistCardByRobloxId,
   getTrelloReadiness,
   requireTrelloReadiness,
+  reactivateBlacklistCardById,
   revokeBlacklistCardById,
   validateTrelloMappings,
   type TrelloReadiness,
@@ -2009,17 +2011,43 @@ async function handleBlacklistUnlocked(
   const plannedRoleIds = getRemovableRoleIds(member).changed;
   const roleSummary = describeRoles(member, plannedRoleIds);
   const key = keyFor(interaction.guild!.id, robloxUser.id);
+  const mappings = setup ? trelloMappingsFor(setup) : undefined;
+  const matchingCards = await findBlacklistCardsByRobloxId(
+    robloxUser.id,
+    mappings,
+  );
+  const activeCards = matchingCards.filter((card) => card.listType !== "revoked");
+  if (activeCards.length > 0) {
+    throw new Error(
+      `${robloxUser.name} already has an active Trello blacklist card for Roblox account ${robloxUser.id}.`,
+    );
+  }
+  if (matchingCards.length > 1) {
+    throw new Error(
+      `Multiple revoked Trello blacklist cards match Roblox account ${robloxUser.id}; resolve the duplicate cards before blacklisting again.`,
+    );
+  }
+  const revokedCard = matchingCards[0];
   let createdCard:
     | Awaited<ReturnType<typeof createBlacklistCard>>
     | undefined;
+  const reusedRevokedCard = Boolean(revokedCard);
 
   try {
-    createdCard = await createBlacklistCard({
-      name: `${robloxUser.name} | ${robloxUser.id}`,
-      type,
-      reason,
-      mappings: setup ? trelloMappingsFor(setup) : undefined,
-    });
+    createdCard = revokedCard
+      ? await reactivateBlacklistCardById(revokedCard.id, {
+          robloxId: robloxUser.id,
+          robloxUsername: robloxUser.name,
+          type,
+          reason,
+          mappings,
+        })
+      : await createBlacklistCard({
+          name: `${robloxUser.name} | ${robloxUser.id}`,
+          type,
+          reason,
+          mappings,
+        });
     await saveRoleSnapshot({
       key,
       guildId: interaction.guild!.id,
@@ -2037,7 +2065,9 @@ async function handleBlacklistUnlocked(
     });
     if (setup) {
       await auditBestEffort(interaction.guild!, setup, {
-        action: "Trello blacklist card created",
+        action: reusedRevokedCard
+          ? "Revoked Trello blacklist card reactivated"
+          : "Trello blacklist card created",
         status: "success",
         actorId: interaction.user.id,
         target: `<@${member.id}> (${member.id})`,
@@ -2191,7 +2221,9 @@ async function handleBlacklistUnlocked(
           {
             name: "Result",
             value: createdCard
-              ? "The Trello card exists and synchronization will retry role enforcement."
+              ? reusedRevokedCard
+                ? "The existing Trello card was updated; synchronization will retry role enforcement."
+                : "The Trello card exists and synchronization will retry role enforcement."
               : "No Trello blacklist card was created and no roles were changed.",
           },
         ],

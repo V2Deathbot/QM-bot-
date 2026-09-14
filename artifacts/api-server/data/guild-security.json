@@ -11,18 +11,14 @@
       },
       "destructiveActions": [
         {
-          "actorId": "555727322695860234",
+          "actorId": "937942479980859412",
           "action": "blacklist",
-          "at": "2026-09-14T08:55:07.711Z"
-        },
-        {
-          "actorId": "555727322695860234",
-          "action": "revoke_blacklist",
-          "at": "2026-09-14T08:55:59.882Z"
+          "at": "2026-09-14T11:07:42.756Z"
         }
       ],
       "observedAdministrators": {
-        "555727322695860234": "1970-01-01T00:00:00.000Z"
+        "555727322695860234": "1970-01-01T00:00:00.000Z",
+        "937942479980859412": "1970-01-01T00:00:00.000Z"
       },
       "identityLedger": [
         {
@@ -40,6 +36,34 @@
         "revision": 0
       },
       "maintenanceAudit": []
+    },
+    {
+      "guildId": "retry-revoked-command",
+      "lockdown": {
+        "active": false,
+        "automatic": false,
+        "reason": "",
+        "startedAt": null,
+        "startedBy": null
+      },
+      "maintenance": {
+        "active": false,
+        "reason": "",
+        "startedAt": null,
+        "startedBy": null,
+        "revision": 0
+      },
+      "maintenanceAudit": [],
+      "destructiveActions": [],
+      "observedAdministrators": {},
+      "identityLedger": [
+        {
+          "discordUserId": "retry-discord-member",
+          "robloxUserId": 78,
+          "observedAt": "2026-09-14T11:07:34.523Z",
+          "source": "command"
+        }
+      ]
     }
   ]
 }
