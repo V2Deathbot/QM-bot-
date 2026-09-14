@@ -53,26 +53,6 @@
         "historicalAssociationWarnings": true,
         "autoPunishPossibleAlts": false
       },
-      "presence": {
-        "presenceConfigVersion": 2,
-        "enabled": true,
-        "activities": [
-          "Customers",
-          "Blacklist Records",
-          "Quartermaster Corps",
-          "Supply Operations",
-          "Trello Records",
-          "Security Logs",
-          "Personnel Records",
-          "{ACTIVE_BLACKLISTS} Active Blacklists",
-          "{SERVER_MEMBERS} Personnel"
-        ],
-        "rotationEnabled": false,
-        "minIntervalMinutes": 5,
-        "maxIntervalMinutes": 20,
-        "disabledActivities": [],
-        "dynamicActivitiesEnabled": false
-      },
       "updatedBy": "555727322695860234",
       "updatedAt": "2026-09-14T10:25:42.233Z"
     }

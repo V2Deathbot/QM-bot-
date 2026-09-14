@@ -380,7 +380,7 @@ test("validates audit channels and redacts credentials from audit messages", asy
 test("setup persists settings, audits the change, and enables moderation commands", async () => {
   const auditMessages: unknown[] = [];
   const registeredCommandNames: string[][] = [];
-  const replies: string[] = [];
+  const replies: unknown[] = [];
   const guild = {
     id: "guild-setup-command",
     ownerId: "owner-setup",
@@ -426,7 +426,7 @@ test("setup persists settings, audits the change, and enables moderation command
       getRole: () => role,
       getString: () => "12345678901234567",
     },
-    editReply: async (reply: string) => {
+    editReply: async (reply: unknown) => {
       replies.push(reply);
     },
   };
@@ -440,7 +440,24 @@ test("setup persists settings, audits the change, and enables moderation command
   assert.deepEqual(registeredCommandNames, [
     ["settings", "blacklist", "revoke_blacklist", "blacklist_lookup"],
   ]);
-  assert.match(replies[0] ?? "", /Setup complete/);
+  const setupReply = replies[0] as {
+    content?: string;
+    embeds?: Array<{
+      data?: {
+        title?: string;
+        description?: string;
+        fields?: Array<{ name: string; value: string }>;
+      };
+    }>;
+  };
+  assert.equal(setupReply.content, "");
+  assert.equal(setupReply.embeds?.length, 1);
+  assert.equal(setupReply.embeds?.[0]?.data?.title, "Quartermaster | Setup Complete");
+  assert.match(setupReply.embeds?.[0]?.data?.description ?? "", /Quartermaster is ready/);
+  assert.match(
+    setupReply.embeds?.[0]?.data?.fields?.find((field) => field.name === "Audit Channel")?.value ?? "",
+    /12345678901234567/,
+  );
 });
 
 test("moves a Trello blacklist card to revoked and updates its labels", async () => {

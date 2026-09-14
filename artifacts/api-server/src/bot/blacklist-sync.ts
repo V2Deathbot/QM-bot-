@@ -26,6 +26,11 @@ import {
 } from "./role-actions";
 import { trelloMappingsFor, type GuildSetup } from "./setup-store";
 import { revokeBlacklistCardById } from "./trello";
+import {
+  noMentions,
+  presentationEmbed,
+  safePresentationText,
+} from "./presentation";
 
 export type BlacklistSyncTrigger = "startup" | "manual" | "poll" | "setup";
 export type BlacklistSyncState =
@@ -159,7 +164,19 @@ async function notifyMember(
   content: string,
 ): Promise<void> {
   try {
-    await member.send({ content, embeds: [] });
+    const revoked = /revoked/i.test(content);
+    await member.send({
+      content: "",
+      embeds: [presentationEmbed(
+        revoked ? "Blacklist Revoked" : "Blacklist Notice",
+        safePresentationText(content, 4_096),
+        revoked ? "success" : "warning",
+        typeof member.guild.client?.user?.displayAvatarURL === "function"
+          ? member.guild.client.user.displayAvatarURL()
+          : undefined,
+      )],
+      allowedMentions: noMentions,
+    });
   } catch {
     // Closed DMs must not stop role enforcement or trigger repeated attempts.
   }

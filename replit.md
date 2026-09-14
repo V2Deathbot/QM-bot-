@@ -38,7 +38,7 @@ A Discord moderation bot that looks up Roblox users, manages blacklist records i
 - Duplicate cards are resolved by latest Trello activity; revoked wins exact timestamp ties. Closed and group-list cards are excluded from individual-member enforcement.
 - Full scans and member joins serialize changes per Discord member. Ambiguous identity matches are skipped and audited rather than risking incorrect removal or restoration.
 - Per-admin and global destructive-action windows, lockdown state, observed permission escalations, and identity associations are stored atomically in `BOT_SECURITY_FILE` (default `data/guild-security.json`). Defaults are 3/admin and 8/global in five minutes, confirmation and automatic lockdown enabled.
-- `/setup` uses administrator-bound, expiring Discord components for security, protected IDs/roles, audit channels, presence, Trello monitoring, identity warnings, and blacklist-role controls. Every saved change is audited without credentials.
+- `/setup` uses administrator-bound, expiring Discord components for security, protected IDs/roles, audit channels, Trello monitoring, identity warnings, and blacklist-role controls. Every saved change is audited without credentials.
 - The bot is deliberately not started when required configuration is missing; the API health endpoint remains available and the status route reports only missing names.
 
 ## Product

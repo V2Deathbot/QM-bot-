@@ -204,21 +204,6 @@ export async function listActiveSnapshots(
     }));
 }
 
-/** Command-approved records which still impose a Discord restriction. */
-export async function listActiveRestrictionSnapshots(
-  guildId: string,
-): Promise<RoleSnapshot[]> {
-  const current = await load();
-  return current.snapshots
-    .filter((snapshot) =>
-      snapshot.guildId === guildId &&
-      snapshot.source !== "sync" &&
-      (snapshot.status === "pending" || snapshot.status === "active" ||
-        (snapshot.status === "revocation_pending" && !snapshot.revocationCardMovedAt)),
-    )
-    .map(cloneSnapshot);
-}
-
 export async function listApprovedSnapshotsForMember(
   guildId: string,
   discordUserId: string,

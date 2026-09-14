@@ -1,13 +1,18 @@
 import {
   ChannelType,
-  Colors,
-  EmbedBuilder,
   PermissionFlagsBits,
   type Guild,
   type Role,
 } from "discord.js";
 import { config } from "./config";
 import { auditSettingsFor, type GuildSetup } from "./setup-store";
+import {
+  displayId,
+  noMentions,
+  presentationEmbed,
+  safePresentationText,
+  titleCaseHeading,
+} from "./presentation";
 
 export type AuditStatus = "started" | "success" | "failed";
 
@@ -25,14 +30,8 @@ export interface AuditEvent {
   fields?: AuditField[];
 }
 
-const statusColors = {
-  started: Colors.Yellow,
-  success: Colors.Green,
-  failed: Colors.Red,
-} as const;
-
 function clean(value: string): string {
-  let sanitized = value.replaceAll("`", "'");
+  let sanitized = value;
   for (const secret of [
     config.discordToken,
     config.trelloApiKey,
@@ -40,7 +39,7 @@ function clean(value: string): string {
   ]) {
     if (secret) sanitized = sanitized.replaceAll(secret, "[redacted]");
   }
-  return sanitized.slice(0, 1_000) || "None";
+  return safePresentationText(sanitized, 1_000) || "None";
 }
 
 export async function requireAuditChannel(
@@ -142,36 +141,41 @@ export async function sendAuditEvent(
     if (selectedChannelId === setup.auditChannelId) throw error;
     channel = await requireAuditChannel(guild, setup);
   }
-  const embed = new EmbedBuilder()
-    .setTitle(clean(event.action))
-    .setColor(statusColors[event.status])
-    .setTimestamp()
-    .addFields(
-      {
-        name: "Status",
-        value: event.status.toUpperCase(),
-        inline: true,
-      },
-      {
-        name: "Moderator",
-        value: `<@${event.actorId}> (${event.actorId})`,
-        inline: true,
-      },
-    );
-
-  if (event.target) {
-    embed.addFields({ name: "Target", value: clean(event.target) });
-  }
-  for (const field of event.fields ?? []) {
-    embed.addFields({
+  const tone: "success" | "error" | "warning" = event.status === "success"
+    ? "success"
+    : event.status === "failed"
+      ? "error"
+      : "warning";
+  const fields = [
+    {
+      name: "Status",
+      value: titleCaseHeading(event.status),
+      inline: true,
+    },
+    {
+      name: "Moderator ID",
+      value: displayId(event.actorId),
+      inline: true,
+    },
+    ...(event.target ? [{ name: "Target", value: clean(event.target) }] : []),
+    ...(event.fields ?? []).map((field) => ({
       name: clean(field.name).slice(0, 256),
       value: clean(field.value),
       inline: field.inline,
-    });
-  }
+    })),
+  ];
+  const embed = presentationEmbed(
+    clean(event.action),
+    `Audit event recorded with ${titleCaseHeading(event.status)} status.`,
+    tone,
+    typeof guild.client?.user?.displayAvatarURL === "function"
+      ? guild.client.user.displayAvatarURL()
+      : undefined,
+    fields,
+  ).setTimestamp();
 
   await channel.send({
     embeds: [embed],
-    allowedMentions: { parse: [] },
+    allowedMentions: noMentions,
   });
 }

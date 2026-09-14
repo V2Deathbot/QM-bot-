@@ -63,11 +63,44 @@ const auditEvents: unknown[] = [];
 const trelloWrites: string[] = [];
 const trelloCardCreations: string[] = [];
 const shownModals: Array<{ userId: string; customId: string }> = [];
-const presenceCalls: Array<{ status?: string; activities?: Array<{ name: string }> }> = [];
 let providerRequests = 0;
 let roleMutationCalls = 0;
 let trelloCards: Array<Record<string, unknown>> = [];
 let client: Client | undefined;
+
+function presentationReplyText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return "";
+  const payload = value as {
+    content?: unknown;
+    embeds?: Array<{
+      data?: {
+        title?: string;
+        description?: string;
+        fields?: Array<{ name: string; value: string }>;
+      };
+    }>;
+  };
+  const parts: string[] = [];
+  if (typeof payload.content === "string" && payload.content.trim()) {
+    parts.push(payload.content);
+  }
+  for (const embed of payload.embeds ?? []) {
+    const data = embed.data;
+    if (!data) continue;
+    if (data.title) parts.push(data.title);
+    if (data.description) parts.push(data.description);
+    for (const field of data.fields ?? []) {
+      parts.push(`${field.name}: ${field.value}`);
+    }
+  }
+  return parts.join("\n");
+}
+
+function recordReply(value: unknown): void {
+  const text = presentationReplyText(value);
+  if (text) replies.push(text);
+}
 
 function memberFor(id: string): Member {
   const record = members.get(id) ?? { administrator: false };
@@ -174,13 +207,11 @@ function command(
     deferReply: async () => undefined,
     editReply: async (value: unknown) => {
       localReplies.push(value);
-      if (typeof value === "string") replies.push(value);
-      else if (typeof value === "object" && value !== null && "content" in value &&
-        typeof value.content === "string") replies.push(value.content);
+      recordReply(value);
     },
-    reply: async (value: { content?: string }) => {
+    reply: async (value: unknown) => {
       localReplies.push(value);
-      if (value.content) replies.push(value.content);
+      recordReply(value);
     },
     localReplies,
   };
@@ -204,14 +235,14 @@ function button(userId: string, customId: string) {
     showModal: async (value: { data: { custom_id: string } }) => {
       shownModals.push({ userId, customId: value.data.custom_id });
     },
-    reply: async (value: { content?: string }) => {
+    reply: async (value: unknown) => {
       interaction.replied = true;
       localReplies.push(value);
-      if (value.content) replies.push(value.content);
+      recordReply(value);
     },
-    followUp: async (value: { content?: string }) => {
+    followUp: async (value: unknown) => {
       localReplies.push(value);
-      if (value.content) replies.push(value.content);
+      recordReply(value);
     },
     localReplies,
   };
@@ -238,14 +269,14 @@ function select(userId: string, customId: string, values: string[]) {
     showModal: async (value: { data: { custom_id: string } }) => {
       shownModals.push({ userId, customId: value.data.custom_id });
     },
-    reply: async (value: { content?: string }) => {
+    reply: async (value: unknown) => {
       interaction.replied = true;
       localReplies.push(value);
-      if (value.content) replies.push(value.content);
+      recordReply(value);
     },
-    followUp: async (value: { content?: string }) => {
+    followUp: async (value: unknown) => {
       localReplies.push(value);
-      if (value.content) replies.push(value.content);
+      recordReply(value);
     },
     localReplies,
   };
@@ -266,9 +297,9 @@ function modal(userId: string, customId: string, values: Record<string, string>)
     deferred: false,
     replied: false,
     fields: { getTextInputValue: (name: string) => values[name] ?? "" },
-    reply: async (value: { content?: string }) => {
+    reply: async (value: unknown) => {
       localReplies.push(value);
-      if (value.content) replies.push(value.content);
+      recordReply(value);
     },
     editReply: async (value: unknown) => { localReplies.push(value); },
     localReplies,
@@ -392,9 +423,6 @@ const originalFetch = globalThis.fetch;
       value: {
         id: "security-bot",
         tag: "security-bot#0000",
-        setPresence: async (value: { status?: string; activities?: Array<{ name: string }> }) => {
-          presenceCalls.push(value);
-        },
       },
     });
     queueMicrotask(() => this.emit(Events.ClientReady, this));
@@ -483,7 +511,7 @@ test("allows a current Administrator through an administrative handler", async (
   const before = trelloCardCreations.length;
   await dispatch(command("admin-a", "group_blacklist", { id: "123", reason: "authorized" }));
   assert.equal(trelloCardCreations.length, before + 1);
-  assert.match(replies.at(-1) ?? "", /Blacklisted group/);
+  assert.match(replies.at(-1) ?? "", /Quartermaster \| Group Blacklist Completed/);
 });
 
 test("enforces the per-Administrator destructive-action limit", async () => {
@@ -711,7 +739,7 @@ test("/settings exposes every consolidated action and opens nonce-bound paramete
       .replace(/:[a-f0-9]{32}$/, ""));
   for (const required of [
     "setup:blacklist", "setup:trello", "setup:security", "setup:audit",
-    "setup:discord", "setup:presence", "setup:identity", "setup:view",
+    "setup:discord", "setup:identity", "setup:view",
     "settings-action:group", "settings-action:note", "settings-action:sync",
     "settings-action:identity-lookup", "settings-action:status",
     "settings-action:maintenance-enable", "settings-action:maintenance-disable",
@@ -801,120 +829,60 @@ test("/settings performs first-time audit-channel setup through its modal", asyn
   await dispatchRaw(modal("admin-a", initial!.customId, { audit_channel_id: "12345678901234567" }));
   const persisted = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
   assert.equal(persisted?.auditChannelId, "12345678901234567");
-  assert.equal(persisted?.presence?.activities.length, 9);
+  assert.equal("presence" in (persisted ?? {}), false);
 });
 
-test("presence settings persist activity selections and reject unsafe custom templates", async () => {
-  const { presenceSettingsFor } = await import("../src/bot/setup-store.ts");
-  const { validatePresenceSettings, DEFAULT_PRESENCE_SETTINGS } = await import("../src/bot/presence.ts");
-  const presence = validatePresenceSettings({
-    ...DEFAULT_PRESENCE_SETTINGS,
-    activities: [...DEFAULT_PRESENCE_SETTINGS.activities, "Warehouse Operations"],
-    disabledActivities: ["Trello Records"],
-    minIntervalMinutes: 2,
-    maxIntervalMinutes: 15,
-  });
-  await saveGuildSetup({
-    guildId: "presence-settings-persistence", moderatorRoleId: "role", auditChannelId: "12345678901234567",
-    presence, updatedBy: "admin-a", updatedAt: new Date().toISOString(),
-  });
-  const saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup("presence-settings-persistence");
-  assert.deepEqual(saved?.presence, { ...presence, presenceConfigVersion: 2 });
-  // Existing one-minute records are migrated without discarding custom entries.
-  const migrated = presenceSettingsFor({ ...saved!, presence: { ...presence, minIntervalMinutes: 1 } });
-  assert.equal(migrated.minIntervalMinutes, 2);
-  assert.ok(migrated.activities.includes("Warehouse Operations"));
-  const legacy = presenceSettingsFor({
-    ...saved!,
-    presence: {
-      enabled: false, rotationEnabled: false, minIntervalMinutes: 5, maxIntervalMinutes: 20,
-      activities: ["Customers", "Quartermaster Corps", "Blacklist Records", "Supply Operations", "Active Blacklists", "Custom Legacy"],
-      disabledActivities: ["Active Blacklists", "Customers"],
-    },
-  });
-  assert.equal(legacy.activities.length, 10);
-  assert.ok(legacy.activities.includes("Custom Legacy"));
-  assert.ok(legacy.disabledActivities?.includes("{ACTIVE_BLACKLISTS} Active Blacklists"));
-  assert.equal(legacy.enabled, false);
-  assert.equal(legacy.rotationEnabled, false);
-  const v2 = presenceSettingsFor({
-    ...saved!,
-    presence: {
-      presenceConfigVersion: 2, enabled: true, rotationEnabled: true, minIntervalMinutes: 2, maxIntervalMinutes: 9,
-      activities: ["Customers", "Only My Activity"], disabledActivities: ["Only My Activity"],
-    },
-  });
-  assert.deepEqual(v2.activities, ["Customers", "Only My Activity"], "versioned settings are never overwritten");
-  await assert.rejects(
-    async () => validatePresenceSettings({ ...presence, activities: ["Unknown {CODE}"] }),
-    /Only \{ACTIVE_BLACKLISTS\} and \{SERVER_MEMBERS\}/,
-  );
-  await assert.rejects(
-    async () => validatePresenceSettings({ ...presence, activities: ["@everyone"] }),
-    /mentions are not allowed/i,
-  );
-});
-
-test("/settings presence controls nonce-bind 128-character custom add and remove", async () => {
+test("settings and the Discord client constructor have no custom presence controls", async () => {
   await setSecurity({});
-  const open = async () => {
-    const settings = command("admin-a", "settings");
-    await dispatch(settings);
-    const selectId = lastSettingsSelectId(settings);
-    const nonce = selectId.split(":").at(-1)!;
-    const category = select("admin-a", selectId, [`setup:presence:${nonce}`]);
-    await dispatchRaw(category);
-    return { nonce, category };
-  };
-  const customId = (repliesFor: unknown[], prefix: string) => {
-    const match = JSON.stringify(repliesFor).match(new RegExp(`"custom_id":"(${prefix}:[a-f0-9]{32})"`));
-    assert.ok(match?.[1], `expected ${prefix} custom ID`);
-    return match[1];
-  };
-  const first = await open();
-  const addId = customId(first.category.localReplies, "setup:presence-add");
-  await dispatchRaw(button("setup-other", addId));
-  assert.match(replies.at(-1) ?? "", /belongs to another administrator|settings session has expired/i);
-  await dispatchRaw(button("admin-a", addId));
-  const addModal = shownModals.at(-1);
-  const longActivity = "W".repeat(128);
-  assert.ok(addModal?.customId.startsWith("setup-modal:presence-add:"));
-  await dispatchRaw(modal("admin-a", addModal!.customId, { activity: longActivity }));
-  assert.ok((await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id))?.presence?.activities.includes(longActivity));
-
-  const second = await open();
-  const activitiesId = customId(second.category.localReplies, "setup:presence-activities");
-  const activitiesButton = button("admin-a", activitiesId);
-  await dispatchRaw(activitiesButton);
-  const removeId = customId(activitiesButton.localReplies, "setup:presence-remove-custom");
-  const removeButton = button("admin-a", removeId);
-  await dispatchRaw(removeButton);
-  const removeSelect = customId(removeButton.localReplies, "setup:presence-remove-select");
-  await dispatchRaw(select("admin-a", removeSelect, ["setup:presence-remove:0"]));
-  assert.ok(!(await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id))?.presence?.activities.includes(longActivity));
+  const settings = command("admin-a", "settings");
+  await dispatch(settings);
+  lastSettingsSelectId(settings);
+  const menu = settings.localReplies.find(
+    (reply): reply is { components: Array<{ components: Array<{ data: { options: Array<{ value: string }> } }> }> } =>
+      typeof reply === "object" && reply !== null && "components" in reply,
+  );
+  const selectData = menu?.components[0]?.components[0] as unknown as {
+    data?: { options?: Array<{ value: string }> };
+    options?: Array<{ value: string }>;
+  } | undefined;
+  const choices = (selectData?.data?.options ?? selectData?.options ?? [])
+    .map((choice) => (choice.value ?? (choice as unknown as { data?: { value?: string } }).data?.value ?? "")
+      .replace(/:[a-f0-9]{32}$/, ""));
+  assert.ok(!choices.some((choice) => /presence|activity/i.test(choice)));
+  const constructorPresence = (client as unknown as {
+    options?: { presence?: { status?: string; activities?: unknown } };
+  } | undefined)?.options?.presence;
+  // discord.js supplies its own neutral online default. The bot must not
+  // provide an activity or override that default in the Client constructor.
+  assert.equal(constructorPresence?.status, "online");
+  assert.equal(constructorPresence?.activities, undefined);
 });
 
-test("gateway disconnect stops rotation and resume reapplies persisted priority", async () => {
-  await mutateSecurityState(guild.id, (state) => {
-    state.maintenance = {
-      active: true, reason: "resume regression", startedAt: new Date().toISOString(), startedBy: "admin-a",
-      revision: state.maintenance.revision + 1,
-    };
-    state.lockdown = {
-      active: true, automatic: false, reason: "resume regression", startedAt: new Date().toISOString(), startedBy: "admin-a",
-    };
-  });
-  presenceCalls.splice(0);
-  client!.emit("shardDisconnect", new Event("close"), 0);
-  client!.emit("shardResume", 0, 0);
-  await settle();
-  assert.deepEqual(presenceCalls.at(-1), {
-    status: "dnd", activities: [{ name: "Security Lockdown", type: 3 }],
-  });
-  await mutateSecurityState(guild.id, (state) => {
-    state.maintenance = { active: false, reason: "", startedAt: null, startedBy: null, revision: state.maintenance.revision + 1 };
-    state.lockdown = { active: false, automatic: false, reason: "", startedAt: null, startedBy: null };
-  });
+test("setup migration removes only obsolete presence fields", async () => {
+  await writeFile(config.setupFile, JSON.stringify({
+    guilds: [{
+      guildId: "legacy-presence-guild",
+      moderatorRoleId: "role",
+      auditChannelId: "12345678901234567",
+      presence: {
+        enabled: true,
+        activities: ["Customers"],
+        rotationEnabled: false,
+        minIntervalMinutes: 5,
+        maxIntervalMinutes: 20,
+      },
+      security: { marker: "preserve" },
+      updatedBy: "admin-a",
+      updatedAt: new Date().toISOString(),
+    }],
+  }), "utf8");
+  const store = await import("../src/bot/setup-store.ts");
+  const migrated = await store.getGuildSetup("legacy-presence-guild");
+  assert.equal("presence" in (migrated ?? {}), false);
+  assert.deepEqual((migrated as unknown as { security: { marker: string } }).security, { marker: "preserve" });
+  const persisted = JSON.parse(await readFile(config.setupFile, "utf8")) as { guilds: Array<Record<string, unknown>> };
+  assert.equal("presence" in persisted.guilds[0]!, false);
+  assert.deepEqual(persisted.guilds[0]?.security, { marker: "preserve" });
 });
 
 test("persists lockdown and rate actions across a fresh security-store module instance", async () => {
@@ -970,9 +938,8 @@ test("fails closed for corrupt and structurally malformed persisted security sta
   assert.deepEqual(persisted.guilds, []);
 });
 
-test("maintenance enable is confirmed, persisted, audited, and changes presence", async () => {
+test("maintenance enable is confirmed, persisted, and audited", async () => {
   await setSecurity({ confirmationsRequired: false });
-  const beforePresence = presenceCalls.length;
   const pending = command("admin-a", "maintenance", {
     mode: "enable", reason: "Updating Trello integration",
   });
@@ -986,11 +953,6 @@ test("maintenance enable is confirmed, persisted, audited, and changes presence"
   assert.equal(state.maintenance.startedBy, "admin-a");
   assert.equal(state.maintenanceAudit.at(-1)?.active, true);
   assert.equal(state.maintenanceAudit.at(-1)?.reason, "Updating Trello integration");
-  assert.deepEqual(presenceCalls.at(-1), {
-    status: "idle", activities: [{ name: "Maintenance", type: 3 }],
-  });
-  assert.ok(presenceCalls.length > beforePresence);
-
   const restarted = await import(`../src/bot/security-store.ts?maintenance=${Date.now()}`);
   assert.equal((await restarted.getSecurityState(guild.id)).maintenance.active, true);
 });
@@ -1064,7 +1026,6 @@ test("maintenance blocks every normal command and old interactive work before pr
     await dispatch(command("admin-a", name));
   }
   await dispatchRaw(button("admin-a", oldBlacklistConfirmation));
-  await dispatchRaw(button("admin-a", "setup:presence"));
   await dispatchRaw(modal("admin-a", oldModal!.customId, { reason: "must not execute" }));
 
   assert.equal(providerRequests, beforeRequests);
@@ -1073,42 +1034,33 @@ test("maintenance blocks every normal command and old interactive work before pr
   assert.match(replies.at(-1) ?? "", /BOT UNDER MAINTENANCE/i);
 });
 
-test("maintenance allows status and emergency lockdown/unlock, then confirmed disable restores normal presence", async () => {
+test("maintenance allows status and emergency lockdown/unlock, then confirmed disable restores normal operation", async () => {
   if (!(await getSecurityState(guild.id)).maintenance.active) {
     await setSecurity({});
     await setMaintenance(true, "admin-a", "emergency command test");
   }
   await dispatch(command("admin-a", "security_status"));
   assert.match(replies.at(-1) ?? "", /Maintenance: ENABLED/);
-  assert.match(replies.at(-1) ?? "", /Blacklist commands: DISABLED — MAINTENANCE/);
+  assert.match(replies.at(-1) ?? "", /Blacklist Commands: DISABLED — MAINTENANCE/);
 
   await dispatch(command("admin-a", "security_lockdown", { reason: "incident during maintenance" }));
   assert.equal((await getSecurityState(guild.id)).lockdown.active, true);
   await dispatch(command("admin-a", "security_status"));
-  assert.match(replies.at(-1) ?? "", /^Maintenance: ENABLED/m, "maintenance takes precedence over lockdown in status");
-  assert.deepEqual(presenceCalls.at(-1), {
-    status: "dnd", activities: [{ name: "Security Lockdown", type: 3 }],
-  });
+  assert.match(replies.at(-1) ?? "", /Operational State: Maintenance: ENABLED/, "maintenance takes precedence over lockdown in status");
   const unlock = command("admin-a", "security_unlock", { reason: "resolved" });
   await dispatch(unlock);
   await dispatchRaw(button("admin-a", lastConfirmationId(unlock)));
   assert.equal((await getSecurityState(guild.id)).lockdown.active, false);
-  assert.deepEqual(presenceCalls.at(-1), {
-    status: "idle", activities: [{ name: "Maintenance", type: 3 }],
-  });
 
   await setMaintenance(false, "admin-a", "maintenance completed");
   const state = await getSecurityState(guild.id);
   assert.equal(state.maintenance.active, false);
   assert.equal(state.maintenanceAudit.at(-1)?.active, false);
   assert.equal(state.maintenanceAudit.at(-1)?.durationSeconds !== null, true);
-  assert.deepEqual(presenceCalls.at(-1), {
-    status: "online", activities: [{ name: "Customers", type: 3 }],
-  });
   await dispatch(command("admin-a", "security_lockdown", { reason: "post-maintenance incident" }));
   await dispatch(command("admin-a", "security_status"));
-  assert.match(replies.at(-1) ?? "", /^Security lockdown: LOCKED/m);
-  assert.match(replies.at(-1) ?? "", /Maintenance: disabled/);
+  assert.match(replies.at(-1) ?? "", /Operational State: Security lockdown: LOCKED/);
+  assert.match(replies.at(-1) ?? "", /Maintenance: Disabled/);
   const finalUnlock = command("admin-a", "security_unlock", { reason: "resolved" });
   await dispatch(finalUnlock);
   await dispatchRaw(button("admin-a", lastConfirmationId(finalUnlock)));
@@ -1122,7 +1074,7 @@ test("security status reports setup-required before setup and persisted maintena
     };
   });
   await dispatch(command("admin-a", "security_status"));
-  assert.match(replies.at(-1) ?? "", /^Bot state: SETUP REQUIRED OR COMMANDS UNREGISTERED/m);
+  assert.match(replies.at(-1) ?? "", /Operational State: Bot state: SETUP REQUIRED OR COMMANDS UNREGISTERED/);
 
   await setSecurity({});
   await mutateSecurityState(guild.id, (state) => {
@@ -1131,7 +1083,6 @@ test("security status reports setup-required before setup and persisted maintena
       revision: state.maintenance.revision + 1,
     };
   });
-  presenceCalls.splice(0);
   const originalSet = guild.commands.set;
   let releaseRegistration!: () => void;
   const registrationGate = new Promise<void>((resolve) => { releaseRegistration = resolve; });
@@ -1141,9 +1092,6 @@ test("security status reports setup-required before setup and persisted maintena
   try {
     const reconnect = refreshBot("manual");
     await settle();
-    assert.deepEqual(presenceCalls[0], {
-      status: "idle", activities: [{ name: "Maintenance", type: 3 }],
-    });
     releaseRegistration();
     await reconnect;
   } finally {

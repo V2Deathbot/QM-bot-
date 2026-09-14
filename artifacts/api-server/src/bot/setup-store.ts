@@ -1,7 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { config } from "./config";
-import { DEFAULT_PRESENCE_SETTINGS } from "./presence";
 
 export interface GuildSetup {
   guildId: string;
@@ -12,7 +11,6 @@ export interface GuildSetup {
   blacklistRoleId?: string;
   trello?: TrelloMappings;
   audit?: AuditSettings;
-  presence?: PresenceSettings;
   security?: SecuritySettings;
   monitoring?: TrelloMonitoringSettings;
   identity?: IdentitySettings;
@@ -75,20 +73,6 @@ export interface IdentitySettings {
   autoPunishPossibleAlts: false;
 }
 
-export interface PresenceSettings {
-  /** Schema marker used to migrate the original five-template default safely. */
-  presenceConfigVersion?: 2;
-  enabled: boolean;
-  activities: string[];
-  rotationEnabled: boolean;
-  minIntervalMinutes: number;
-  maxIntervalMinutes: number;
-  /** Activities disabled individually in the settings UI. */
-  disabledActivities?: string[];
-  /** False disables templates which require live values. */
-  dynamicActivitiesEnabled?: boolean;
-}
-
 export const defaultSecuritySettings = (): SecuritySettings => ({
   perAdminLimit: 3,
   globalLimit: 8,
@@ -137,58 +121,10 @@ export const defaultIdentitySettings = (): IdentitySettings => ({
   autoPunishPossibleAlts: false,
 });
 
-export const defaultPresenceSettings = (): PresenceSettings => ({
-  presenceConfigVersion: 2,
-  ...DEFAULT_PRESENCE_SETTINGS,
-  activities: [...DEFAULT_PRESENCE_SETTINGS.activities],
-  disabledActivities: [...(DEFAULT_PRESENCE_SETTINGS.disabledActivities ?? [])],
-});
-
 export function securitySettingsFor(setup: GuildSetup): SecuritySettings {
   return { ...defaultSecuritySettings(), ...setup.security,
     protectedUserIds: [...(setup.security?.protectedUserIds ?? [])],
     protectedRoleIds: [...(setup.security?.protectedRoleIds ?? [])] };
-}
-
-export function presenceSettingsFor(setup: GuildSetup): PresenceSettings {
-  const defaults = defaultPresenceSettings();
-  const persisted = setup.presence;
-  const legacyDefaults = new Set([
-    "Customers",
-    "Quartermaster Corps",
-    "Blacklist Records",
-    "Supply Operations",
-    "Active Blacklists",
-  ]);
-  // Only the original default marker identifies the five-template schema.
-  // A bespoke older activity list is left untouched; a legacy default gains
-  // the new templates while preserving every administrator-added activity.
-  const needsLegacyMigration = persisted?.presenceConfigVersion !== 2 &&
-    persisted?.activities.includes("Active Blacklists") === true;
-  const legacyDynamic = "{ACTIVE_BLACKLISTS} Active Blacklists";
-  const migratedActivities = needsLegacyMigration
-    ? [
-        ...defaults.activities,
-        ...persisted!.activities.filter((activity) => !legacyDefaults.has(activity)),
-      ]
-    : persisted?.activities ?? defaults.activities;
-  const migratedDisabled = (persisted?.disabledActivities ?? defaults.disabledActivities ?? [])
-    .map((activity) => activity === "Active Blacklists" && needsLegacyMigration ? legacyDynamic : activity)
-    .filter((activity, index, values) => migratedActivities.includes(activity) && values.indexOf(activity) === index);
-  return {
-    ...defaults,
-    ...persisted,
-    presenceConfigVersion: 2,
-    activities: [...migratedActivities],
-    disabledActivities: [...migratedDisabled],
-    // Older settings allowed a one-minute interval. Preserve the rest of a
-    // persisted custom configuration while safely migrating that value.
-    minIntervalMinutes: Math.max(2, persisted?.minIntervalMinutes ?? defaults.minIntervalMinutes),
-    maxIntervalMinutes: Math.max(
-      Math.max(2, persisted?.minIntervalMinutes ?? defaults.minIntervalMinutes),
-      persisted?.maxIntervalMinutes ?? defaults.maxIntervalMinutes,
-    ),
-  };
 }
 
 export function trelloMappingsFor(setup: GuildSetup): TrelloMappings {
@@ -245,19 +181,28 @@ async function writeStore(store: GuildSetupFile): Promise<void> {
   await rename(temporaryFile, config.setupFile);
 }
 
+function migrateObsoletePresence(store: GuildSetupFile): boolean {
+  let migrated = false;
+  store.guilds = store.guilds.map((setup) => {
+    if (!Object.prototype.hasOwnProperty.call(setup, "presence")) return setup;
+    // Presence was removed from the application. Remove only that obsolete
+    // field, preserving every other persisted setting.
+    const withoutPresence = { ...setup } as GuildSetup & { presence?: unknown };
+    delete withoutPresence.presence;
+    migrated = true;
+    return withoutPresence;
+  });
+  return migrated;
+}
+
 export async function getGuildSetup(
   guildId: string,
 ): Promise<GuildSetup | undefined> {
   const operation = mutationQueue.then(async () => {
     const store = await readStore();
+    const migrated = migrateObsoletePresence(store);
+    if (migrated) await writeStore(store);
     const index = store.guilds.findIndex((setup) => setup.guildId === guildId);
-    const setup = store.guilds[index];
-    if (!setup?.presence || setup.presence.presenceConfigVersion === 2) return setup;
-    const migratedPresence = presenceSettingsFor(setup);
-    // Persist only an identified legacy schema migration. Bespoke unversioned
-    // configurations receive a version marker without replacing activities.
-    store.guilds[index] = { ...setup, presence: migratedPresence };
-    await writeStore(store);
     return store.guilds[index];
   });
   mutationQueue = operation.then(() => undefined, () => undefined);
@@ -269,6 +214,7 @@ export async function saveGuildSetup(
 ): Promise<GuildSetup> {
   const operation = mutationQueue.then(async () => {
     const store = await readStore();
+    migrateObsoletePresence(store);
     const index = store.guilds.findIndex(
       (candidate) => candidate.guildId === setup.guildId,
     );
