@@ -1,6 +1,6 @@
 import { config, type BlacklistType } from "./config";
 
-interface TrelloList {
+export interface TrelloList {
   id: string;
   name: string;
 }
@@ -27,6 +27,14 @@ export interface TrelloCard {
   idList: string;
   idLabels: string[];
   url: string;
+  dateLastActivity: string;
+  closed: boolean;
+}
+
+export type TrelloBlacklistListType = BlacklistType | "revoked";
+
+export interface TrelloBlacklistCard extends TrelloCard {
+  listType: TrelloBlacklistListType;
 }
 
 interface TrelloLabel {
@@ -103,6 +111,45 @@ async function getOpenLists(): Promise<TrelloList[]> {
     `/boards/${encodeURIComponent(boardId)}/lists?filter=open`,
   );
 }
+
+/**
+ * Read the user blacklist cards in one snapshot.  The list lookup is kept
+ * separate from the card request so a group list can never accidentally be
+ * treated as a user blacklist list.
+ */
+export async function fetchBlacklistCards(): Promise<TrelloBlacklistCard[]> {
+  const lists = await getOpenLists();
+  const listTypes: Array<[TrelloBlacklistListType, string]> = [
+    ["appealable", config.trelloListNames.appealable],
+    ["conditional", config.trelloListNames.conditional],
+    ["permanent", config.trelloListNames.permanent],
+    ["revoked", config.trelloListNames.revoked],
+  ];
+  const listTypeById = new Map<string, TrelloBlacklistListType>();
+  for (const [type, name] of listTypes) {
+    const list = lists.find(
+      (candidate) =>
+        candidate.name.trim().toLowerCase() === name.trim().toLowerCase(),
+    );
+    if (list) listTypeById.set(list.id, type);
+  }
+
+  const { boardId } = requireTrelloConfig();
+  const cards = await request<TrelloCard[]>(
+    `/boards/${encodeURIComponent(boardId)}/cards?filter=all&fields=id,name,desc,idList,idLabels,url,dateLastActivity,closed`,
+  );
+
+  return cards
+    .filter((card) => !card.closed && listTypeById.has(card.idList))
+    .map((card) => ({
+      ...card,
+      idLabels: [...card.idLabels],
+      listType: listTypeById.get(card.idList)!,
+    }));
+}
+
+// This name is useful to callers that use "get" for provider reads.
+export const getBlacklistCards = fetchBlacklistCards;
 
 function configuredListNames(): string[] {
   return [...new Set(Object.values(config.trelloListNames))];
@@ -267,11 +314,38 @@ export async function findBlacklistCard(
 ): Promise<TrelloCard | undefined> {
   const { boardId } = requireTrelloConfig();
   const cards = await request<TrelloCard[]>(
-    `/boards/${encodeURIComponent(boardId)}/cards?filter=all&fields=name,desc,idList,idLabels,url`,
+    `/boards/${encodeURIComponent(boardId)}/cards?filter=all&fields=id,name,desc,idList,idLabels,url,dateLastActivity,closed`,
   );
   return cards.find(
     (card) => card.name.trim().toLowerCase() === cardName.trim().toLowerCase(),
   );
+}
+
+export async function findBlacklistCardByRobloxId(
+  robloxId: number,
+): Promise<TrelloBlacklistCard | undefined> {
+  if (!Number.isSafeInteger(robloxId) || robloxId <= 0) return undefined;
+  const cards = (await fetchBlacklistCards()).filter((card) => {
+    const match = /^\s*[^|]+?\s*\|\s*(\d+)\s*$/.exec(card.name);
+    return match ? Number(match[1]) === robloxId : false;
+  });
+  cards.sort((left, right) => {
+    const leftTimestamp = Date.parse(left.dateLastActivity);
+    const rightTimestamp = Date.parse(right.dateLastActivity);
+    const timestamp =
+      (Number.isFinite(rightTimestamp)
+        ? rightTimestamp
+        : Number.NEGATIVE_INFINITY) -
+      (Number.isFinite(leftTimestamp)
+        ? leftTimestamp
+        : Number.NEGATIVE_INFINITY);
+    if (timestamp !== 0) return timestamp;
+    if (left.listType !== right.listType) {
+      return left.listType === "revoked" ? -1 : 1;
+    }
+    return left.id.localeCompare(right.id);
+  });
+  return cards[0];
 }
 
 async function addLabel(cardId: string, label: TrelloLabel): Promise<void> {

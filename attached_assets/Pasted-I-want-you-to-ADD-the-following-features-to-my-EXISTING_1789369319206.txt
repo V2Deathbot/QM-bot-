@@ -1,0 +1,583 @@
+I want you to ADD the following features to my EXISTING Discord + Trello + Roblox blacklist bot.
+
+IMPORTANT:
+- Inspect the existing project first.
+- Do NOT rebuild the bot.
+- Do NOT remove or replace working features.
+- Reuse my existing database, setup command, configuration system, audit channel, Trello integration, and blacklist system.
+- Integrate these features cleanly into the current architecture.
+
+
+==================================================
+1. DISCORD BOT RICH PRESENCE / ACTIVITY
+==================================================
+
+Add a professional Discord presence/activity system for the bot.
+
+The bot should display:
+
+Bot status:
+Online
+
+Main activity text:
+Quartermaster
+
+Activity:
+Watching Customers
+
+I would like the presence to rotate occasionally so it feels alive.
+
+Examples:
+
+Watching Customers
+Watching the Quartermaster Corps
+Watching Blacklist Records
+Watching Trello
+Watching Supply Operations
+
+However, "Watching Customers" should be the main/default activity.
+
+Change the activity at a RANDOM interval, for example somewhere between 5 and 20 minutes.
+
+Do NOT create an extremely fast interval that could cause unnecessary Discord API requests.
+
+If possible within Discord's current bot presence limitations, include useful status information such as:
+
+Watching Customers
+Watching 14 Active Blacklists
+
+Do not try to implement unsupported Rich Presence functionality for normal Discord bots.
+
+I would also like to use this image/thumbnail where Discord actually supports it:
+
+https://cdn.discordapp.com/attachments/1548934464623747094/1548950055979982899/QM_INS.png?ex=6aa8eba7&is=6aa79a27&hm=a699b3f7d58a01c5037cb43b9fa4669c1c7ac224b271e570a8f4301c144e21a0&
+
+IMPORTANT:
+Discord CDN links can expire.
+
+Therefore:
+- Do not make the entire presence system dependent on this URL.
+- If Discord bot presence does not support a custom thumbnail/image in the way I am requesting, do NOT fake it or implement a broken workaround.
+- The image can instead be used in bot embeds such as /help, /bot_status, blacklist confirmations, etc.
+- Explain to me what Discord actually supports.
+
+
+==================================================
+2. BLACKLIST USERS WHO ARE NOT IN THE SERVER
+==================================================
+
+Currently blacklisting is primarily designed around selecting/pinging a Discord member.
+
+I need the ability to blacklist someone using their Discord USER ID even when they are NOT currently in the Discord server.
+
+Modify /blacklist so it can support either:
+
+discord_user: @User
+
+OR
+
+discord_id: 123456789012345678
+
+The moderator should NOT be required to provide both.
+
+At least one Discord identity must be supplied.
+
+Example:
+
+/blacklist
+discord_id: 123456789012345678
+roblox_username: ExampleUser
+type: Permanent
+reason: Unauthorized use of assets
+
+If the Discord user is not currently in the server:
+
+- Validate that the Discord ID has a valid snowflake format.
+- Store the Discord ID in the blacklist database.
+- Continue creating the Roblox/Trello blacklist.
+- Obviously do not attempt to remove roles because the member is not currently present.
+- Attempt to fetch the Discord user through the Discord API if possible.
+- If available, store/display their Discord username.
+- If they cannot be fetched, continue using the Discord ID.
+- Do not fail the blacklist merely because they aren't currently a guild member.
+
+
+==================================================
+3. BLACKLISTED USER JOINS SERVER
+==================================================
+
+THIS IS IMPORTANT.
+
+Add a guildMemberAdd listener.
+
+Whenever ANY user joins the server:
+
+Check their Discord User ID against the active blacklist database.
+
+If they are NOT blacklisted:
+Do nothing.
+
+If they ARE blacklisted:
+
+- Automatically apply the configured BLACKLISTED role.
+- Remove any other removable roles they somehow receive.
+- Prevent normal roles from being added while the blacklist remains active.
+- Send an audit log stating that a previously blacklisted user joined the server.
+- Include their Discord ID, Discord account, Roblox username, Roblox ID, blacklist type, reason and Trello card.
+- Do not create another Trello card.
+- Do not create another blacklist record.
+
+Example audit event:
+
+BLACKLISTED USER JOINED
+
+User: @Example
+Discord ID: 123456789012345678
+Roblox: ExampleRoblox
+Roblox ID: 987654321
+Type: Permanent
+Status: Blacklisted
+
+Action:
+Blacklist restrictions automatically applied.
+
+This makes Discord-ID blacklisting useful even when someone isn't currently in the server.
+
+
+==================================================
+4. TRELLO MANUAL CHANGE DETECTION
+==================================================
+
+Add a Trello audit/synchronization monitoring system.
+
+I want the bot to detect when somebody manually changes blacklist cards directly on Trello instead of using Discord commands.
+
+Examples:
+
+- Card moved between lists
+- Card moved to Revoked Blacklists
+- Card moved from Permanent to Appealable
+- Card moved from Conditional to Permanent
+- Card archived
+- Card renamed
+- Description changed
+- Labels added
+- Labels removed
+
+IMPORTANT:
+
+For now, MANUAL TRELLO CHANGES SHOULD NOT AUTOMATICALLY CHANGE DISCORD BLACKLIST STATUS.
+
+Example:
+
+If somebody manually drags:
+
+Permanent Blacklists
+→ Revoked Blacklists
+
+the bot should NOT automatically restore the Discord user's roles.
+
+Instead, send a warning to the configured Discord audit channel.
+
+Example:
+
+⚠️ MANUAL TRELLO CHANGE DETECTED
+
+Card:
+ExampleUser | 123456789
+
+Changed By:
+TrelloUser
+
+Change:
+Permanent Blacklists
+→ Revoked Blacklists
+
+Discord Blacklist Status:
+STILL ACTIVE
+
+Warning:
+This card was modified directly through Trello.
+Use /revoke_blacklist if the blacklist should actually be revoked.
+
+Card:
+[Trello Card Link]
+
+This prevents somebody from bypassing the Discord bot's blacklist/revocation process simply by moving cards.
+
+
+==================================================
+5. DO NOT AUDIT THE BOT'S OWN TRELLO CHANGES
+==================================================
+
+Very important:
+
+When the Discord bot itself:
+
+- creates a card
+- moves a card
+- changes labels
+- changes descriptions
+- changes names
+
+the Trello monitoring system should recognize that this was an expected bot action and should NOT spam the audit channel with:
+
+"MANUAL TRELLO CHANGE DETECTED"
+
+Implement a reliable method of distinguishing expected bot operations from external/manual changes.
+
+Do not simply ignore every Trello change for several minutes because that could hide legitimate manual changes.
+
+Use Trello action IDs, member IDs, operation tracking, timestamps/card IDs, or another reliable mechanism appropriate to the existing architecture.
+
+
+==================================================
+6. TRELLO AUDIT CHECKING METHOD
+==================================================
+
+Inspect the current Trello integration and choose the safest implementation.
+
+If Trello webhooks are practical for the current hosting setup, use them.
+
+If webhooks are not practical, implement controlled polling of Trello actions.
+
+Do NOT aggressively spam the Trello API.
+
+Store the last processed Trello action/event so restarting the bot does not cause hundreds of old events to suddenly be logged.
+
+Handle Trello outages gracefully.
+
+If Trello temporarily fails:
+- Do not crash the bot.
+- Log the error.
+- Retry later.
+- Do not change Discord blacklist state.
+
+
+==================================================
+7. TRELLO / DATABASE DESYNC DETECTION
+==================================================
+
+Add detection for situations where Trello and the bot's database disagree.
+
+Examples:
+
+DATABASE:
+Permanent / Active
+
+TRELLO:
+Revoked Blacklists
+
+or:
+
+DATABASE:
+Appealable
+
+TRELLO:
+Permanent Blacklists
+
+or:
+
+DATABASE:
+Active
+
+TRELLO CARD:
+Archived/deleted/missing
+
+Send an audit warning such as:
+
+⚠️ BLACKLIST DESYNC DETECTED
+
+User: ExampleUser
+Database Status: ACTIVE
+Database Type: PERMANENT
+Trello Location: REVOKED BLACKLISTS
+
+No automatic action was taken.
+
+Administrator intervention is required.
+
+Do NOT automatically restore/remove roles because of a Trello mismatch.
+
+
+==================================================
+8. ADD /blacklist_sync
+==================================================
+
+Add an administrator-only command:
+
+/blacklist_sync
+
+This should check active blacklist records against Trello and report inconsistencies.
+
+It should NOT automatically modify anything by default.
+
+Example response:
+
+Blacklist Synchronization Check
+
+Checked: 147
+Correct: 143
+Warnings: 4
+
+Issues:
+• Example1 - Trello card is in Revoked
+• Example2 - Trello card missing
+• Example3 - Incorrect label
+• Example4 - Incorrect blacklist list
+
+If there are many results, use pagination/buttons or another clean Discord-compatible presentation.
+
+Make sure Discord's message/embed limits are respected.
+
+
+==================================================
+9. ADD /blacklist_lookup
+==================================================
+
+Add a staff command that allows blacklist searches.
+
+Allow searching by:
+
+- Discord mention
+- Discord ID
+- Roblox username
+- Roblox ID
+
+Example:
+
+/blacklist_lookup discord_id:123456789012345678
+
+Response should display:
+
+Discord User
+Discord ID
+
+Roblox Username
+Roblox ID
+
+Status
+Blacklist Type
+Reason
+
+Blacklisted By
+Blacklisted At
+
+Trello Card
+
+If revoked:
+
+Revoked By
+Revoked At
+Revocation Reason
+
+Use a professional Discord embed.
+
+
+==================================================
+10. USERNAME CHANGES
+==================================================
+
+Roblox usernames can change.
+
+The Roblox User ID should be treated as the permanent Roblox identifier.
+
+Discord User ID should be treated as the permanent Discord identifier.
+
+Do NOT use usernames as database primary identifiers.
+
+When performing a lookup, if the stored Roblox username differs from the current username returned by Roblox:
+
+- Update the cached/current username where appropriate.
+- Keep historical identity information if the existing database supports it.
+- Do not accidentally create a second blacklist.
+
+
+==================================================
+11. DISCORD USERS LEAVING AND REJOINING
+==================================================
+
+A blacklist must NOT disappear because somebody leaves the Discord server.
+
+If a blacklisted member leaves:
+
+- Keep the blacklist active.
+- Keep the database record.
+- Keep their Trello card.
+- Keep their Discord User ID.
+
+Optionally audit:
+
+BLACKLISTED USER LEFT SERVER
+
+If they later rejoin:
+
+- Detect them automatically.
+- Reapply blacklist restrictions.
+
+
+==================================================
+12. ROLE SAFETY
+==================================================
+
+When automatically restricting a blacklisted user:
+
+Never attempt to remove:
+
+- @everyone
+- Discord managed roles
+- integration/bot roles that cannot be managed
+- roles above the bot
+- roles equal to the bot's highest role
+
+If an unauthorized role cannot be removed, send a HIGH PRIORITY audit warning.
+
+Example:
+
+🚨 BLACKLIST ROLE ENFORCEMENT FAILED
+
+User: @Example
+Role: Administrator
+Reason: Role is above the bot.
+
+Manual administrator action required.
+
+Do not silently ignore this.
+
+
+==================================================
+13. NICKNAME / VISUAL BLACKLIST INDICATOR
+==================================================
+
+OPTIONAL FEATURE:
+
+If the bot has Manage Nicknames permission and the server configuration enables this feature, allow the bot to prefix a blacklisted member's nickname with:
+
+[BL] Username
+
+However:
+
+- Make this OPTIONAL and disabled by default.
+- Do not repeatedly add [BL] prefixes.
+- Restore the previous nickname when revoked if it was changed by the bot.
+- Do not require Manage Nicknames for the rest of the bot to function.
+
+
+==================================================
+14. BLACKLIST NOTES
+==================================================
+
+Add an optional staff command:
+
+/blacklist_note
+
+Arguments:
+
+user
+note
+
+This should allow authorized staff to add internal notes to an existing blacklist.
+
+Example:
+
+/blacklist_note
+user: Example
+note: Attempted to rejoin using an alternate account.
+
+Store:
+
+Note
+Author
+Timestamp
+
+Do NOT overwrite the original blacklist reason.
+
+If appropriate, optionally append notes to the Trello card in a clearly separated section or use Trello comments if the current API implementation supports them cleanly.
+
+
+==================================================
+15. AUDIT LOG IMPROVEMENTS
+==================================================
+
+Make sure the existing audit system can clearly distinguish:
+
+BLACKLIST CREATED
+BLACKLIST REVOKED
+BLACKLISTED USER JOINED
+BLACKLISTED USER LEFT
+BLACKLIST ROLE BLOCKED
+BLACKLIST ROLE ENFORCEMENT FAILED
+MANUAL TRELLO CHANGE
+TRELLO/DATABASE DESYNC
+BLACKLIST NOTE ADDED
+BLACKLIST LOOKUP
+SYNC CHECK
+
+Use professional embeds.
+
+Where useful include:
+
+Discord account
+Discord ID
+Roblox username
+Roblox ID
+Blacklist type
+Moderator
+Reason
+Timestamp
+Trello card
+
+Do NOT expose tokens, API keys, database credentials or other secrets.
+
+
+==================================================
+16. IMPORTANT SAFETY / ARCHITECTURE RULES
+==================================================
+
+The hierarchy of authority should be:
+
+BOT DATABASE
+= authoritative blacklist status
+
+DISCORD
+= enforcement
+
+TRELLO
+= record keeping / staff-facing blacklist board
+
+Therefore:
+
+A Trello manual change should NEVER automatically unblacklist somebody.
+
+Only authorized Discord bot commands should change the authoritative blacklist status.
+
+Use IDs as permanent identifiers:
+
+Discord User ID
+Roblox User ID
+Trello Card ID
+
+Do not depend on usernames because usernames can change.
+
+
+==================================================
+17. IMPLEMENTATION
+==================================================
+
+Before making changes:
+
+1. Inspect the current project.
+2. Identify which of these systems already exist.
+3. Reuse existing functionality.
+4. Do not create duplicate databases/config systems/audit systems.
+5. Explain briefly what you intend to add.
+6. Implement the features.
+7. Check for syntax/runtime errors.
+8. Test the important flows.
+9. Tell me what was changed and whether I need to add any new environment variables, Discord permissions, Trello configuration or setup values.
+
+Do NOT reset my existing bot configuration.
+
+Do NOT delete existing blacklist records.
+
+Do NOT regenerate or expose my Discord/Trello credentials.

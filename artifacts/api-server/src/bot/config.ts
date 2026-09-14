@@ -14,6 +14,12 @@ export const config = {
     process.env["TRELLO_RETRY_MAX_DELAY_MS"],
     5 * 60_000,
   ),
+  trelloSyncIntervalMs: parseBoundedDelay(
+    process.env["TRELLO_SYNC_INTERVAL_MS"],
+    60_000,
+    15_000,
+    60 * 60_000,
+  ),
   trelloListNames: {
     appealable:
       process.env["TRELLO_LIST_APPEALABLE"] ?? "Appealable Blacklist",
@@ -33,6 +39,17 @@ export const config = {
 function parseDelay(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : fallback;
+}
+
+function parseBoundedDelay(
+  value: string | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(maximum, Math.max(minimum, Math.round(parsed)));
 }
 
 export function getMissingConfiguration(): string[] {

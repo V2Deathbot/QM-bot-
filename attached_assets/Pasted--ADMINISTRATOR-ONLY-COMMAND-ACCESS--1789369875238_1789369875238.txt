@@ -1,0 +1,875 @@
+==================================================
+ADMINISTRATOR-ONLY COMMAND ACCESS
+==================================================
+
+Simplify the bot's permission system.
+
+Only Discord members who currently have the Discord Administrator permission may use the bot's administrative blacklist-management commands.
+
+Do NOT use separate staff-role tiers for destructive commands.
+
+Administrative commands should include:
+
+/blacklist
+/group_blacklist
+/revoke_blacklist
+/blacklist_note
+/blacklist_sync
+/identity_lookup
+/security_status
+/security_lockdown
+/security_unlock
+and any future blacklist-management/configuration commands.
+
+Before EVERY administrative command executes:
+
+Check the invoking member's CURRENT Discord permissions.
+
+They must have:
+
+Administrator = true
+
+If they do not:
+
+Deny the command.
+
+Do not expose sensitive configuration or blacklist management information.
+
+IMPORTANT:
+
+Re-check Administrator permission AGAIN when the user presses any confirmation button.
+
+Example:
+
+Administrator starts /blacklist
+↓
+Confirmation appears
+↓
+Administrator permission is removed
+↓
+They press Confirm
+↓
+DENY THE ACTION
+
+Never trust stale permissions from when the command originally started.
+
+
+==================================================
+SERVER OWNER SAFETY
+==================================================
+
+The Discord Server Owner should always be recognized as authorized.
+
+However:
+
+Administrator access does NOT bypass:
+
+- blacklist rate limits
+- global blacklist limits
+- security lockdown
+- confirmation requirements
+- protected-user checks
+- audit logging
+- database safety checks
+- duplicate checks
+- Trello/database consistency checks
+
+Being an Administrator means they are allowed to use the bot.
+
+It does NOT mean they can bypass the bot's security systems.
+
+
+==================================================
+ANTI-ABUSE STILL APPLIES TO ADMINISTRATORS
+==================================================
+
+The bot must protect against a compromised Administrator account.
+
+Example scenario:
+
+Attacker gains access to an administrator account
+↓
+Starts mass-blacklisting members
+↓
+Bot detects abnormal volume
+↓
+Bot blocks additional blacklist actions
+↓
+Security Lockdown activates
+↓
+Audit channel receives HIGH PRIORITY warning
+
+Therefore retain all anti-abuse systems even though commands are Administrator-only.
+
+
+==================================================
+PER-ADMINISTRATOR RATE LIMIT
+==================================================
+
+Make the rate limit configurable through /setup.
+
+Suggested default:
+
+Maximum blacklist actions per administrator:
+3
+
+Time window:
+5 minutes
+
+Affected commands:
+
+/blacklist
+/group_blacklist
+/revoke_blacklist
+
+Allow these values to be changed through setup.
+
+Example configuration:
+
+Per-Admin Limit:
+3 actions
+
+Window:
+5 minutes
+
+If exceeded:
+
+- Block the operation.
+- Do NOT create/move Trello cards.
+- Do NOT modify Discord roles.
+- Log a security alert.
+
+Example:
+
+⚠️ BLACKLIST RATE LIMIT
+
+Administrator:
+@ExampleAdmin
+
+Attempted Action:
+BLACKLIST
+
+Recent Actions:
+3 / 3
+
+Window:
+5 minutes
+
+Action blocked.
+
+
+==================================================
+GLOBAL SERVER RATE LIMIT
+==================================================
+
+Also maintain a separate GLOBAL limit.
+
+This prevents several compromised administrators from bypassing the per-user limit.
+
+Suggested default:
+
+Maximum:
+8 destructive blacklist actions
+
+Window:
+5 minutes
+
+Make both configurable through /setup.
+
+Example:
+
+Admin A → 3 operations
+Admin B → 3 operations
+Admin C → 2 operations
+
+TOTAL = 8
+
+Further destructive operations:
+BLOCKED
+
+Optionally automatically activate:
+
+SECURITY LOCKDOWN
+
+
+==================================================
+AUTOMATIC SECURITY LOCKDOWN
+==================================================
+
+Add configurable automatic lockdown behavior.
+
+Setup option:
+
+Automatic Lockdown:
+ON / OFF
+
+Default:
+ON
+
+Trigger example:
+
+8 destructive blacklist operations
+within
+5 minutes
+
+When triggered:
+
+SECURITY LOCKDOWN = ENABLED
+
+Blocked commands:
+
+/blacklist
+/group_blacklist
+/revoke_blacklist
+
+Allowed commands:
+
+/blacklist_lookup
+/identity_lookup
+/security_status
+/help
+/setup if safe
+/security_unlock
+
+Send a HIGH PRIORITY audit message.
+
+
+==================================================
+MANUAL SECURITY LOCKDOWN
+==================================================
+
+Keep:
+
+/security_lockdown
+
+Administrator-only.
+
+Arguments:
+
+reason
+
+Example:
+
+/security_lockdown reason:Possible compromised administrator account
+
+When active:
+
+All destructive blacklist actions stop.
+
+Do not stop the bot entirely.
+
+The bot should continue:
+
+- monitoring Trello
+- detecting blacklisted users joining
+- enforcing existing active blacklist restrictions
+- logging audit events
+- running lookup commands
+
+
+==================================================
+SECURITY UNLOCK
+==================================================
+
+/security_unlock
+
+Administrator-only.
+
+Require:
+
+- confirmation button
+- current Administrator permission
+- optional reason
+
+Log:
+
+Who unlocked it
+When
+Reason
+Duration of lockdown
+
+
+==================================================
+SETUP SYSTEM
+==================================================
+
+Integrate ALL security settings into the existing /setup system.
+
+Do NOT create a separate configuration system if one already exists.
+
+The setup interface should use Discord:
+
+- embeds
+- buttons
+- select menus
+- modals
+
+rather than requiring configuration files where possible.
+
+The setup interface should be Administrator-only.
+
+
+==================================================
+SETUP MAIN MENU
+==================================================
+
+Create or extend /setup with categories similar to:
+
+⚙️ BOT SETUP
+
+[ Blacklist Settings ]
+[ Trello Settings ]
+[ Security Settings ]
+[ Audit Settings ]
+[ Discord Settings ]
+[ Presence Settings ]
+[ Identity / Alt Detection ]
+[ View Configuration ]
+
+
+==================================================
+SECURITY SETTINGS WINDOW
+==================================================
+
+Inside:
+
+/setup → Security Settings
+
+Allow configuration of:
+
+Per-Administrator Rate Limit
+Global Rate Limit
+Rate Limit Time Window
+Automatic Lockdown
+Automatic Lockdown Threshold
+Protected Users
+Protected Roles
+Confirmation Requirement
+Discord Alt Detection
+Roblox Alt Detection
+Recent Permission Escalation Protection
+Security Audit Alerts
+
+
+Example display:
+
+SECURITY SETTINGS
+
+Administrator Access:
+Administrator permission required
+
+Per-Admin Limit:
+3 actions / 5 minutes
+
+Global Limit:
+8 actions / 5 minutes
+
+Automatic Lockdown:
+Enabled
+
+Confirmation:
+Enabled
+
+Alt Detection:
+Enabled
+
+Protected Users:
+4
+
+[ Edit Rate Limits ]
+[ Lockdown Settings ]
+[ Protected Users ]
+[ Alt Detection ]
+[ Confirmation Settings ]
+[ Back ]
+
+
+==================================================
+RATE LIMIT SETUP WINDOW
+==================================================
+
+Example:
+
+/setup
+→ Security Settings
+→ Edit Rate Limits
+
+Show:
+
+PER ADMINISTRATOR
+
+Maximum Actions:
+3
+
+Window:
+5 minutes
+
+
+GLOBAL
+
+Maximum Actions:
+8
+
+Window:
+5 minutes
+
+
+Buttons:
+
+[ Edit Admin Limit ]
+[ Edit Global Limit ]
+[ Edit Window ]
+[ Reset Defaults ]
+[ Back ]
+
+Use a Discord modal for entering numerical values.
+
+Validate all values.
+
+Do NOT allow ridiculous values such as:
+
+0
+negative numbers
+1000000 operations/minute
+
+Set sensible minimums/maximums.
+
+
+==================================================
+LOCKDOWN SETTINGS WINDOW
+==================================================
+
+Show:
+
+AUTOMATIC SECURITY LOCKDOWN
+
+Status:
+Enabled
+
+Trigger:
+8 actions / 5 minutes
+
+Lockdown Mode:
+Automatic
+
+Current State:
+Not Locked
+
+Buttons:
+
+[ Enable / Disable ]
+[ Change Threshold ]
+[ Lock Down Now ]
+[ Unlock ]
+[ Back ]
+
+
+==================================================
+PROTECTED USERS SETUP
+==================================================
+
+Allow administrators to add permanent protected Discord IDs.
+
+Example:
+
+/setup
+→ Security
+→ Protected Users
+
+Protected users cannot normally be blacklisted.
+
+Always automatically protect:
+
+- Discord Server Owner
+- the bot itself
+
+Allow configured IDs such as:
+
+123456789012345678
+987654321098765432
+
+Buttons:
+
+[ Add User ]
+[ Remove User ]
+[ View Users ]
+[ Back ]
+
+Require Discord IDs or user selections.
+
+Store using Discord User IDs, never usernames.
+
+
+==================================================
+PROTECTED ROLES SETUP
+==================================================
+
+Allow configuring roles whose members cannot normally be blacklisted.
+
+Example:
+
+Protected Roles:
+
+@Owner
+@High Command
+
+If an administrator attempts to blacklist someone with a protected role:
+
+BLOCK the operation.
+
+Send an audit entry.
+
+Do not offer a normal bypass unless a future explicit override system is enabled.
+
+
+==================================================
+AUDIT SETTINGS WINDOW
+==================================================
+
+Integrate audit configuration into setup.
+
+Allow:
+
+Audit Channel
+Security Alerts Channel
+Trello Audit Alerts
+Blacklist Logs
+Role Enforcement Logs
+Join/Leave Blacklist Logs
+
+If only one audit channel is desired, allow everything to use the same channel.
+
+Example:
+
+AUDIT SETTINGS
+
+Main Audit:
+#audit-logs
+
+Security Alerts:
+#security-alerts
+
+Trello Alerts:
+#audit-logs
+
+[ Change Main Audit ]
+[ Change Security Channel ]
+[ Change Trello Channel ]
+[ Test Logging ]
+
+
+==================================================
+TRELLO MONITORING SETUP
+==================================================
+
+Add settings for:
+
+Manual Trello Change Detection:
+ON / OFF
+
+Trello Desync Detection:
+ON / OFF
+
+Polling Interval:
+if webhooks aren't used
+
+Alert Channel
+
+Example:
+
+TRELLO MONITORING
+
+Manual Changes:
+Enabled
+
+Database Sync Check:
+Enabled
+
+Polling:
+60 seconds
+
+Manual changes modify Discord state:
+NEVER
+
+This final option should NOT be user-configurable.
+
+Manual Trello changes must never automatically restore/remove Discord blacklist status.
+
+
+==================================================
+ALT DETECTION SETUP
+==================================================
+
+Add:
+
+/setup
+→ Identity / Alt Detection
+
+Options:
+
+Same Roblox → Different Discord:
+Enabled
+
+Same Discord → Different Roblox:
+Enabled
+
+Historical Association Warnings:
+Enabled
+
+Auto-Punish Possible Alts:
+DISABLED
+
+IMPORTANT:
+
+"Auto-Punish Possible Alts" should remain disabled and should NOT be enabled through normal setup.
+
+Possible alt matches should generate warnings only unless an exact active permanent-ID match exists.
+
+
+==================================================
+PRESENCE SETTINGS
+==================================================
+
+Add presence options to /setup.
+
+Example:
+
+PRESENCE SETTINGS
+
+Enabled:
+Yes
+
+Primary Presence:
+Watching Customers
+
+Rotation:
+Enabled
+
+Rotation Interval:
+Random 5–20 minutes
+
+Additional Activities:
+
+Watching Quartermaster Corps
+Watching Blacklist Records
+Watching Supply Operations
+Watching Active Blacklists
+
+Allow:
+
+[ Enable / Disable ]
+[ Edit Activities ]
+[ Change Interval ]
+[ Reset Defaults ]
+
+
+==================================================
+BLACKLIST SETTINGS
+==================================================
+
+Add a setup section displaying:
+
+Blacklisted Discord Role
+Trello Appealable List
+Trello Conditional List
+Trello Permanent List
+Trello Group List
+Trello Revoked List
+
+Labels:
+
+BLACKLISTED
+APPEALABLE
+CONDITIONAL
+PERMANENT
+GROUP BLACKLIST
+REVOKED
+
+Allow administrators to configure mappings cleanly.
+
+
+==================================================
+CONFIGURATION CHANGE AUDIT
+==================================================
+
+Every /setup change must be logged.
+
+Example:
+
+⚙️ BOT CONFIGURATION CHANGED
+
+Administrator:
+@Example
+
+Setting:
+Global Blacklist Rate Limit
+
+Old:
+8
+
+New:
+10
+
+Timestamp:
+...
+
+Never log secrets such as:
+
+Trello token
+Discord token
+API credentials.
+
+
+==================================================
+SETUP SECURITY
+==================================================
+
+/setup itself must:
+
+- require current Administrator permission
+- only function inside the configured guild/server
+- re-check permission on buttons/modals
+- expire old setup interactions
+- prevent another user from interacting with someone else's setup session
+- sanitize all inputs
+- validate role/channel IDs
+- audit all configuration changes
+
+
+==================================================
+IMPORTANT PERMISSION MODEL
+==================================================
+
+Final permission hierarchy:
+
+Discord Administrator
+↓
+Allowed to use administrative bot commands
+↓
+Still subject to bot security controls
+↓
+Rate limits
+↓
+Confirmation
+↓
+Protected targets
+↓
+Lockdown state
+↓
+Database validation
+↓
+Action executes
+
+
+NOT:
+
+Discord Administrator
+↓
+Unlimited unrestricted access
+
+
+==================================================
+DEFAULT SECURITY VALUES
+==================================================
+
+If no configuration exists, use safe defaults:
+
+Administrator Requirement:
+ON
+
+Per-Admin Destructive Limit:
+3
+
+Global Destructive Limit:
+8
+
+Window:
+5 minutes
+
+Automatic Lockdown:
+ON
+
+Confirmation:
+ON
+
+Protected Server Owner:
+ON
+
+Alt Detection:
+ON
+
+Manual Trello Monitoring:
+ON
+
+Trello automatic Discord state changes:
+OFF
+
+Security Audit Logging:
+ON
+
+
+==================================================
+MIGRATION
+==================================================
+
+If the current bot has old authorized-role/staff-role settings:
+
+Do not break the database.
+
+Migrate away from those permission checks cleanly.
+
+The bot should now use:
+
+member.permissions.has(Administrator)
+
+or the correct equivalent for the Discord.js version being used.
+
+Old role permission configuration may be removed from the active permission logic.
+
+Do not delete unrelated configuration.
+
+
+==================================================
+FINAL TESTS
+==================================================
+
+Test:
+
+1. Normal member runs /blacklist
+→ DENIED
+
+2. Moderator without Administrator runs /blacklist
+→ DENIED
+
+3. Administrator runs /blacklist
+→ ALLOWED
+
+4. Administrator exceeds personal rate limit
+→ BLOCKED
+
+5. Multiple admins exceed global threshold
+→ LOCKDOWN
+
+6. Administrator attempts command during lockdown
+→ BLOCKED
+
+7. Administrator opens confirmation then loses Administrator
+→ CONFIRMATION DENIED
+
+8. Server owner uses bot
+→ ALLOWED but still rate limited
+
+9. Administrator changes security setting
+→ CHANGE AUDITED
+
+10. Another user clicks administrator's setup button
+→ DENIED
+
+11. Old setup button is clicked after expiration
+→ DENIED
+
+12. Bot restarts during lockdown
+→ LOCKDOWN STATE PERSISTS
+
+13. Bot restarts after rate-limit activity
+→ handle stored security state appropriately without creating false mass-blacklist alerts

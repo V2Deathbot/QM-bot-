@@ -460,7 +460,7 @@ test("moves a Trello blacklist card to revoked and updates its labels", async ()
   }
 });
 
-test("restores removed roles when Trello blacklist card creation fails", async () => {
+test("does not change roles or leave a snapshot when Trello card creation fails", async () => {
   const removed: string[][] = [];
   const added: string[][] = [];
   const roles = new Collection([
@@ -525,12 +525,11 @@ test("restores removed roles when Trello blacklist card creation fails", async (
       handleBlacklist(interaction as never),
       /Trello request failed \(503\)/,
     );
-    assert.deepEqual(removed, [["role-1", "role-2"]]);
-    assert.deepEqual(added, [["role-1", "role-2"]]);
+    assert.deepEqual(removed, []);
+    assert.deepEqual(added, []);
 
     const snapshot = await findActiveSnapshot("guild-failure", 42);
-    assert.deepEqual(snapshot?.roleIds, ["role-1", "role-2"]);
-    assert.equal(snapshot?.status, "active");
+    assert.equal(snapshot, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }

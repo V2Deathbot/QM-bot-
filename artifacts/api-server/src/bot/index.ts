@@ -15,7 +15,7 @@ import {
   checkTrelloReadiness,
   createBlacklistCard,
   createGroupBlacklistCard,
-  findBlacklistCard,
+  findBlacklistCardByRobloxId,
   getTrelloReadiness,
   requireTrelloReadiness,
   revokeBlacklistCard,
@@ -23,9 +23,16 @@ import {
 } from "./trello";
 import {
   findActiveSnapshot,
+  findPendingOrActiveSnapshot,
   revokeRoleSnapshot,
   saveRoleSnapshot,
 } from "./role-store";
+import {
+  describeRoles,
+  getRemovableRoleIds,
+  removeAssignableRoles,
+  restoreAssignableRoles,
+} from "./role-actions";
 import { findRobloxUser, getRobloxGroupUrl } from "./roblox";
 import {
   requireAuditChannel,
@@ -39,6 +46,14 @@ import {
   saveGuildSetup,
   type GuildSetup,
 } from "./setup-store";
+import {
+  enforceBlacklistForJoinedMember,
+  getBlacklistSyncStatus,
+  reportBlacklistSyncUnavailable,
+  setNextBlacklistSyncAt,
+  synchronizeBlacklists,
+  type BlacklistSyncTrigger,
+} from "./blacklist-sync";
 
 const setupCommand = new SlashCommandBuilder()
   .setName("setup")
@@ -156,6 +171,54 @@ let setupCommandRegistered = false;
 let guildSetupComplete = false;
 let recoveryAttempt: Promise<BotRefreshResult> | null = null;
 let trelloRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let blacklistSyncTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearBlacklistSyncTimer(): void {
+  if (blacklistSyncTimer) {
+    clearTimeout(blacklistSyncTimer);
+    blacklistSyncTimer = null;
+  }
+  setNextBlacklistSyncAt(null);
+}
+
+function scheduleBlacklistSync(guild: Guild): void {
+  clearBlacklistSyncTimer();
+  const nextSyncAt = new Date(
+    Date.now() + config.trelloSyncIntervalMs,
+  ).toISOString();
+  setNextBlacklistSyncAt(nextSyncAt);
+  blacklistSyncTimer = setTimeout(() => {
+    blacklistSyncTimer = null;
+    setNextBlacklistSyncAt(null);
+    void runGuildBlacklistSync(guild, "poll").finally(() => {
+      if (discordClient?.isReady() && guildSetupComplete) {
+        scheduleBlacklistSync(guild);
+      }
+    });
+  }, config.trelloSyncIntervalMs);
+  blacklistSyncTimer.unref?.();
+}
+
+async function runGuildBlacklistSync(
+  guild: Guild,
+  trigger: BlacklistSyncTrigger,
+): Promise<void> {
+  const setup = await getGuildSetup(guild.id);
+  if (!setup) {
+    clearBlacklistSyncTimer();
+    return;
+  }
+
+  const readiness =
+    trigger === "poll" ? await checkTrelloReadiness() : getTrelloReadiness();
+  if (!readiness.ready) {
+    await reportBlacklistSyncUnavailable(guild, setup, trigger);
+    return;
+  }
+
+  await synchronizeBlacklists(guild, setup, trigger);
+  if (trigger !== "poll") scheduleBlacklistSync(guild);
+}
 
 function clearTrelloRetry(): void {
   if (trelloRetryTimer) {
@@ -192,17 +255,6 @@ function scheduleTrelloRetry(): void {
 
 function keyFor(guildId: string, robloxUserId: number): string {
   return `${guildId}:${robloxUserId}`;
-}
-
-function safeRoleList(member: GuildMember, roleIds: string[]): string {
-  if (roleIds.length === 0) return "None";
-  return roleIds
-    .map((roleId) => {
-      const role = member.guild.roles.cache.get(roleId);
-      return role ? `${role.name} (${role.id})` : roleId;
-    })
-    .join(", ")
-    .slice(0, 1_000);
 }
 
 async function auditBestEffort(
@@ -267,30 +319,6 @@ async function resolveMember(
   }
 
   return matches.first()!;
-}
-
-async function removeRoles(member: GuildMember): Promise<string[]> {
-  const roleIds = member.roles.cache
-    .filter((role) => role.id !== member.guild.id && !role.managed)
-    .map((role) => role.id);
-
-  if (roleIds.length > 0) {
-    await member.roles.remove(roleIds, "Roblox blacklist");
-  }
-
-  return roleIds;
-}
-
-async function restoreRoles(member: GuildMember, roleIds: string[]): Promise<void> {
-  const botMember = member.guild.members.me;
-  const restorable = roleIds.filter((roleId) => {
-    const role = member.guild.roles.cache.get(roleId);
-    return Boolean(role && !role.managed && botMember && role.position < botMember.roles.highest.position);
-  });
-
-  if (restorable.length > 0) {
-    await member.roles.add(restorable, "Roblox blacklist revoked");
-  }
 }
 
 export async function handleSetup(
@@ -364,6 +392,7 @@ export async function handleSetup(
   await interaction.editReply(
     `Setup complete. Members with **${role.name}** or a higher role can now use moderation commands. Audits will be sent to <#${auditChannelId}>.`,
   );
+  await runGuildBlacklistSync(guild, "setup");
 }
 
 export async function handleBlacklist(
@@ -375,45 +404,24 @@ export async function handleBlacklist(
   const reason = interaction.options.getString("reason", true).trim();
   const robloxUser = await findRobloxUser(username);
   const member = await resolveMember(interaction, robloxUser.name);
-  const existing = await findActiveSnapshot(interaction.guild!.id, robloxUser.id);
+  const existing = await findPendingOrActiveSnapshot(
+    interaction.guild!.id,
+    robloxUser.id,
+  );
 
   if (existing) {
     throw new Error(`${robloxUser.name} already has an active blacklist snapshot.`);
   }
 
-  const roleSummary = safeRoleList(
-    member,
-    member.roles.cache
-      .filter((role) => role.id !== member.guild.id && !role.managed)
-      .map((role) => role.id),
-  );
-  const roleIds = await removeRoles(member);
-  if (setup) {
-    await auditBestEffort(interaction.guild!, setup, {
-      action: "Discord roles removed",
-      status: "success",
-      actorId: interaction.user.id,
-      target: `<@${member.id}> (${member.id})`,
-      fields: [
-        { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
-        { name: "Roles removed", value: roleSummary },
-      ],
-    });
-  }
+  const plannedRoleIds = getRemovableRoleIds(member).changed;
+  const roleSummary = describeRoles(member, plannedRoleIds);
   const key = keyFor(interaction.guild!.id, robloxUser.id);
-  await saveRoleSnapshot({
-    key,
-    guildId: interaction.guild!.id,
-    discordUserId: member.id,
-    robloxUserId: robloxUser.id,
-    robloxUsername: robloxUser.name,
-    roleIds,
-    status: "active",
-    createdAt: new Date().toISOString(),
-  });
+  let createdCard:
+    | Awaited<ReturnType<typeof createBlacklistCard>>
+    | undefined;
 
   try {
-    const card = await createBlacklistCard({
+    createdCard = await createBlacklistCard({
       name: `${robloxUser.name} | ${robloxUser.id}`,
       type,
       reason,
@@ -424,10 +432,11 @@ export async function handleBlacklist(
       discordUserId: member.id,
       robloxUserId: robloxUser.id,
       robloxUsername: robloxUser.name,
-      roleIds,
-      cardId: card.id,
-      cardUrl: card.url,
-      status: "active",
+      roleIds: plannedRoleIds,
+      cardId: createdCard.id,
+      cardUrl: createdCard.url,
+      source: "command",
+      status: "pending",
       createdAt: new Date().toISOString(),
     });
     if (setup) {
@@ -440,14 +449,48 @@ export async function handleBlacklist(
           { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
           { name: "Blacklist type", value: type, inline: true },
           { name: "Reason", value: reason },
-          { name: "Trello card", value: `${card.id}\n${card.url}` },
+          {
+            name: "Trello card",
+            value: `${createdCard.id}\n${createdCard.url}`,
+          },
         ],
       });
     }
 
+    const roleIds = (await removeAssignableRoles(member)).changed;
+    if (setup) {
+      await auditBestEffort(interaction.guild!, setup, {
+        action: "Discord roles removed",
+        status: "success",
+        actorId: interaction.user.id,
+        target: `<@${member.id}> (${member.id})`,
+        fields: [
+          {
+            name: "Roblox user",
+            value: `${robloxUser.name} | ${robloxUser.id}`,
+          },
+          { name: "Roles removed", value: describeRoles(member, roleIds) },
+        ],
+      });
+    }
+    await saveRoleSnapshot({
+      key,
+      guildId: interaction.guild!.id,
+      discordUserId: member.id,
+      robloxUserId: robloxUser.id,
+      robloxUsername: robloxUser.name,
+      roleIds,
+      cardId: createdCard.id,
+      cardUrl: createdCard.url,
+      source: "command",
+      blacklistNotificationAttemptedAt: new Date().toISOString(),
+      status: "active",
+      createdAt: new Date().toISOString(),
+    });
+
     try {
       await member.send({
-        content: `You have been blacklisted from this server. Trello record: ${card.url}`,
+        content: `You have been blacklisted from this server. Trello record: ${createdCard.url}`,
         embeds: [],
       });
     } catch {
@@ -457,7 +500,12 @@ export async function handleBlacklist(
           status: "failed",
           actorId: interaction.user.id,
           target: `<@${member.id}> (${member.id})`,
-          fields: [{ name: "Trello card", value: `${card.id}\n${card.url}` }],
+          fields: [
+            {
+              name: "Trello card",
+              value: `${createdCard.id}\n${createdCard.url}`,
+            },
+          ],
         });
       }
     }
@@ -471,24 +519,31 @@ export async function handleBlacklist(
         fields: [
           { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
           { name: "Roles removed", value: roleSummary },
-          { name: "Trello card", value: `${card.id}\n${card.url}` },
+          {
+            name: "Trello card",
+            value: `${createdCard.id}\n${createdCard.url}`,
+          },
         ],
       });
     }
     await interaction.editReply(
-      `Blacklisted **${robloxUser.name}** (${robloxUser.id}). Removed ${roleIds.length} role(s) and created the Trello card: ${card.url}`,
+      `Blacklisted **${robloxUser.name}** (${robloxUser.id}). Removed ${roleIds.length} role(s) and created the Trello card: ${createdCard.url}`,
     );
   } catch (error) {
-    await restoreRoles(member, roleIds);
     if (setup) {
       await auditBestEffort(interaction.guild!, setup, {
-        action: "Blacklist failed and roles were restored",
+        action: "Blacklist command did not finish",
         status: "failed",
         actorId: interaction.user.id,
         target: `<@${member.id}> (${member.id})`,
         fields: [
           { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
-          { name: "Roles restored", value: roleSummary },
+          {
+            name: "Result",
+            value: createdCard
+              ? "The Trello card exists and synchronization will retry role enforcement."
+              : "No Trello blacklist card was created and no roles were changed.",
+          },
         ],
       });
     }
@@ -528,11 +583,11 @@ async function handleRevoke(
   const robloxUser = await findRobloxUser(username);
   const member = await resolveMember(interaction, robloxUser.name);
   const snapshot = await findActiveSnapshot(interaction.guild!.id, robloxUser.id);
-  const card = await findBlacklistCard(`${robloxUser.name} | ${robloxUser.id}`);
+  const card = await findBlacklistCardByRobloxId(robloxUser.id);
 
-  if (!card) {
+  if (!card || card.listType === "revoked") {
     throw new Error(
-      `No Trello blacklist card was found for ${robloxUser.name} (${robloxUser.id}).`,
+      `No active Trello blacklist card was found for ${robloxUser.name} (${robloxUser.id}).`,
     );
   }
 
@@ -548,7 +603,7 @@ async function handleRevoke(
     ],
   });
   if (snapshot) {
-    await restoreRoles(member, snapshot.roleIds);
+    await restoreAssignableRoles(member, snapshot.roleIds);
     await revokeRoleSnapshot(snapshot.key);
     await auditBestEffort(interaction.guild!, setup, {
       action: "Discord roles restored",
@@ -558,7 +613,7 @@ async function handleRevoke(
       fields: [
         {
           name: "Roles restored",
-          value: safeRoleList(member, snapshot.roleIds),
+          value: describeRoles(member, snapshot.roleIds),
         },
       ],
     });
@@ -588,7 +643,7 @@ async function handleRevoke(
       { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
       {
         name: "Roles restored",
-        value: snapshot ? safeRoleList(member, snapshot.roleIds) : "No saved roles",
+        value: snapshot ? describeRoles(member, snapshot.roleIds) : "No saved roles",
       },
       { name: "Trello card", value: `${card.id}\n${revokedCard.url}` },
     ],
@@ -723,6 +778,7 @@ export function getBotStatus() {
     recovery: {
       ...recovery,
     },
+    blacklistSync: getBlacklistSyncStatus(),
     trelloReady: trello.ready,
   };
 }
@@ -821,16 +877,26 @@ async function connectDiscord(): Promise<void> {
     client.once(Events.ClientReady, (readyClient) => {
       void registerCommands(readyClient)
         .then((moderationEnabled) => {
-          if (moderationEnabled) {
-            setRecoveryStatus("successful");
-          } else {
-            setRecoveryStatus(
-              "blocked",
-              "Discord setup is required. Run /setup in the configured server.",
+          void (async () => {
+            if (moderationEnabled) {
+              setRecoveryStatus("successful");
+              const guild = await readyClient.guilds.fetch(
+                config.discordGuildId!,
+              );
+              await runGuildBlacklistSync(guild, "startup");
+            } else {
+              clearBlacklistSyncTimer();
+              setRecoveryStatus(
+                "blocked",
+                "Discord setup is required. Run /setup in the configured server.",
+              );
+            }
+            logger.info(
+              { user: readyClient.user.tag },
+              "Discord blacklist bot is online",
             );
-          }
-          logger.info({ user: readyClient.user.tag }, "Discord blacklist bot is online");
-          resolve();
+            resolve();
+          })().catch(reject);
         })
         .catch(reject);
     });
@@ -840,6 +906,20 @@ async function connectDiscord(): Promise<void> {
     if (interaction.isChatInputCommand()) {
       void handleInteraction(interaction);
     }
+  });
+
+  client.on(Events.GuildMemberAdd, (member) => {
+    if (member.guild.id !== config.discordGuildId) return;
+    void getGuildSetup(member.guild.id)
+      .then((setup) =>
+        setup ? enforceBlacklistForJoinedMember(member, setup) : undefined,
+      )
+      .catch(() => {
+        logger.warn(
+          { guildId: member.guild.id, discordUserId: member.id },
+          "Joined member blacklist check failed",
+        );
+      });
   });
 
   client.on("error", (error) => {
@@ -853,6 +933,7 @@ async function connectDiscord(): Promise<void> {
     commandsRegistered = false;
     setupCommandRegistered = false;
     guildSetupComplete = false;
+    clearBlacklistSyncTimer();
     if (discordClient === client) {
       discordClient = null;
     }
@@ -870,6 +951,7 @@ export interface BotRefreshResult {
   discordConnected: boolean;
   recoveryStatus: BotRecoveryStatus;
   recovery: BotRecoveryState;
+  blacklistSync: ReturnType<typeof getBlacklistSyncStatus>;
   trelloReady: boolean;
   trello: TrelloReadiness;
   error: string | null;
@@ -898,6 +980,7 @@ export async function refreshBot(
       const trello = await checkTrelloReadiness();
       if (!trello.ready) {
         commandsRegistered = false;
+        clearBlacklistSyncTimer();
         setRecoveryStatus("blocked", trello.error);
         if (trigger === "automatic") {
           recovery.lastRetryOutcome = "blocked";
@@ -926,6 +1009,7 @@ export async function refreshBot(
       const missing = getMissingConfiguration();
       if (missing.length > 0) {
         commandsRegistered = false;
+        clearBlacklistSyncTimer();
         const error = `Bot configuration is incomplete: ${missing.join(", ")}.`;
         setRecoveryStatus("blocked", error);
         logger.warn({ missing }, "Blacklist bot is waiting for configuration");
@@ -938,7 +1022,12 @@ export async function refreshBot(
         );
         if (moderationEnabled) {
           setRecoveryStatus("successful");
+          const guild = await (
+            discordClient as Client<true>
+          ).guilds.fetch(config.discordGuildId!);
+          await runGuildBlacklistSync(guild, "manual");
         } else {
+          clearBlacklistSyncTimer();
           setRecoveryStatus(
             "blocked",
             "Discord setup is required. Run /setup in the configured server.",

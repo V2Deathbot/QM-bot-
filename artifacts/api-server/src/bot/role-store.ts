@@ -11,7 +11,11 @@ export interface RoleSnapshot {
   roleIds: string[];
   cardId?: string;
   cardUrl?: string;
-  status: "active" | "revoked";
+  cardUpdatedAt?: string;
+  source?: "command" | "sync";
+  blacklistNotificationAttemptedAt?: string;
+  revocationNotificationAttemptedAt?: string;
+  status: "pending" | "active" | "revocation_pending" | "revoked" | "failed";
   createdAt: string;
   revokedAt?: string;
 }
@@ -41,10 +45,11 @@ async function persist(): Promise<void> {
   const current = await load();
   const directory = path.dirname(config.snapshotFile);
   await mkdir(directory, { recursive: true });
-  writeQueue = writeQueue.then(() =>
+  const operation = writeQueue.catch(() => undefined).then(() =>
     writeFile(config.snapshotFile, JSON.stringify(current, null, 2), "utf8"),
   );
-  await writeQueue;
+  writeQueue = operation.catch(() => undefined);
+  await operation;
 }
 
 export async function saveRoleSnapshot(snapshot: RoleSnapshot): Promise<void> {
@@ -68,6 +73,66 @@ export async function findActiveSnapshot(
       snapshot.robloxUserId === robloxUserId &&
       snapshot.status === "active",
   );
+}
+
+export async function findRoleSnapshot(
+  guildId: string,
+  robloxUserId: number,
+): Promise<RoleSnapshot | undefined> {
+  const current = await load();
+  const snapshot = current.snapshots.find(
+    (candidate) =>
+      candidate.guildId === guildId &&
+      candidate.robloxUserId === robloxUserId,
+  );
+  return snapshot
+    ? {
+        ...snapshot,
+        roleIds: [...snapshot.roleIds],
+      }
+    : undefined;
+}
+
+export async function findPendingOrActiveSnapshot(
+  guildId: string,
+  robloxUserId: number,
+): Promise<RoleSnapshot | undefined> {
+  const snapshot = await findRoleSnapshot(guildId, robloxUserId);
+  return snapshot &&
+    ["pending", "active", "revocation_pending"].includes(snapshot.status)
+    ? snapshot
+    : undefined;
+}
+
+export async function listActiveSnapshots(
+  guildId: string,
+): Promise<RoleSnapshot[]> {
+  const current = await load();
+  return current.snapshots
+    .filter(
+      (snapshot) =>
+        snapshot.guildId === guildId && snapshot.status === "active",
+    )
+    .map((snapshot) => ({
+      ...snapshot,
+      roleIds: [...snapshot.roleIds],
+    }));
+}
+
+export async function listRestorableSnapshots(
+  guildId: string,
+): Promise<RoleSnapshot[]> {
+  const current = await load();
+  return current.snapshots
+    .filter(
+      (snapshot) =>
+        snapshot.guildId === guildId &&
+        ["pending", "active", "revocation_pending"].includes(snapshot.status),
+    )
+    .map((snapshot) => ({
+      ...snapshot,
+      roleIds: [...snapshot.roleIds],
+    }));
 }
 
 export async function revokeRoleSnapshot(

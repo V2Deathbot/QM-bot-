@@ -33,12 +33,15 @@ A Discord moderation bot that looks up Roblox users, manages blacklist records i
 - Moderation authorization is based on Discord role position, with the server owner and administrators always permitted.
 - Audit delivery is verified before moderation side effects begin, then role and Trello changes are recorded without provider credentials or raw error bodies.
 - Trello list names are configurable, while card names and descriptions follow the requested format exactly.
-- Role snapshots are stored before Trello creation so a failed Trello request can restore roles and a later revoke can restore them after a restart.
+- Trello is the blacklist source of truth. The bot indexes configured user lists at startup and on a bounded polling interval, reconciles manual card changes by immutable Roblox ID, and applies the selected latest card state to Discord.
+- A role snapshot is persisted after the Trello card exists but before roles are removed. Pending enforcement and revocation states survive restarts, and the original assignable roles are preserved until restoration succeeds.
+- Duplicate cards are resolved by latest Trello activity; revoked wins exact timestamp ties. Closed and group-list cards are excluded from individual-member enforcement.
+- Full scans and member joins serialize changes per Discord member. Ambiguous identity matches are skipped and audited rather than risking incorrect removal or restoration.
 - The bot is deliberately not started when required configuration is missing; the API health endpoint remains available and the status route reports only missing names.
 
 ## Product
 
-- `/blacklist user type reason` looks up the Roblox username, resolves or pings the Discord member, removes assignable roles, creates a categorized Trello card with `blacklisted` and type labels, and DMs the Trello link.
+- `/blacklist user type reason` looks up the Roblox username, resolves or pings the Discord member, creates a categorized Trello card with `blacklisted` and type labels, persists a role snapshot, removes assignable roles, and DMs the Trello link.
 - `/group_blacklist id reason` creates a group URL card in the group blacklist list with a `- ` reason prefix and no Discord link preview.
 - `/revoke_blacklist username` moves the user card to the revoked list, updates labels, restores saved roles, and DMs the revoked card link.
 - `/setup role audit_channel_id` lets the server owner or an administrator choose the minimum moderator role and the text channel used for audit records.
@@ -53,6 +56,7 @@ A Discord moderation bot that looks up Roblox users, manages blacklist records i
 - The bot's highest Discord role must be above the roles it is expected to remove and later restore.
 - The configured moderator role must be below the bot's highest role, and the bot needs View Channel, Send Messages, and Embed Links in the audit channel.
 - Trello list names must match the configured names exactly, ignoring case and surrounding whitespace.
+- `TRELLO_SYNC_INTERVAL_MS` controls polling and is clamped to a safe range of 15 seconds through 1 hour.
 
 ## Pointers
 
