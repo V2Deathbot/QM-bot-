@@ -54,7 +54,7 @@ export async function requireAuditChannel(
       channel.type !== ChannelType.GuildAnnouncement)
   ) {
     throw new Error(
-      "The configured audit channel is missing or is not a text channel. Run /setup again.",
+      "The configured audit channel is missing or is not a text channel. Run /settings again.",
     );
   }
 

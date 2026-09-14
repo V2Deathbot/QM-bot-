@@ -36,6 +36,7 @@ import {
 } from "./trello";
 import {
   findPendingOrActiveSnapshot,
+  listActiveRestrictionSnapshots,
   saveRoleSnapshot,
   saveBlacklistNote,
   withGuildBlacklistLifecycleLock,
@@ -79,6 +80,7 @@ import {
   DEFAULT_PRESENCE_SETTINGS,
   getEffectivePresence,
   setPresencePriority,
+  setPresenceStatsProvider,
   stopPresenceRotation,
   validatePresenceSettings,
   type PresenceSettings,
@@ -93,39 +95,10 @@ import {
   type BlacklistSyncTrigger,
 } from "./blacklist-sync";
 
-const setupCommand = new SlashCommandBuilder()
-  .setName("setup")
-  .setDescription("Configure blacklist, security, audit, and bot settings.")
-  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-  .addRoleOption((option) =>
-    option
-      .setName("role")
-      .setDescription("Legacy migration field; authorization uses Administrator.")
-      .setRequired(false),
-  )
-  .addStringOption((option) =>
-    option
-      .setName("audit_channel_id")
-      .setDescription("The ID of the text channel that receives audit logs.")
-      .setRequired(false),
-  );
-
-const maintenanceCommand = new SlashCommandBuilder()
-  .setName("maintenance")
-  .setDescription("Enable or disable planned maintenance command locking.")
-  .addStringOption((option) => option
-    .setName("mode")
-    .setDescription("Enable or disable maintenance mode.")
-    .setRequired(true)
-    .addChoices({ name: "Enable", value: "enable" }, { name: "Disable", value: "disable" }))
-  .addStringOption((option) => option
-    .setName("reason")
-    .setDescription("Required when enabling; optional when disabling.")
-    .setRequired(false));
-
-const securityStatusCommand = new SlashCommandBuilder()
-  .setName("security_status")
-  .setDescription("View current rate-limit, maintenance, and lockdown status.");
+const settingsCommand = new SlashCommandBuilder()
+  .setName("settings")
+  .setDescription("Quartermaster administration, setup, security, and records.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
 
 const moderationCommands = [
   new SlashCommandBuilder()
@@ -160,21 +133,6 @@ const moderationCommands = [
         .setDescription("Optional: ping the matching Discord member directly."),
     ),
   new SlashCommandBuilder()
-    .setName("group_blacklist")
-    .setDescription("Add a Roblox group to the group blacklist.")
-    .addStringOption((option) =>
-      option
-        .setName("id")
-        .setDescription("The Roblox group id.")
-        .setRequired(true),
-    )
-    .addStringOption((option) =>
-      option
-        .setName("reason")
-        .setDescription("Why the group is being blacklisted.")
-        .setRequired(true),
-    ),
-  new SlashCommandBuilder()
     .setName("revoke_blacklist")
     .setDescription("Move a user blacklist card to revoked and restore roles.")
     .addStringOption((option) =>
@@ -189,38 +147,15 @@ const moderationCommands = [
         .setDescription("Optional: ping the Discord member directly."),
     ),
   new SlashCommandBuilder()
-    .setName("blacklist_note")
-    .setDescription("Record an audit note against a blacklist lookup.")
-    .addStringOption((option) => option.setName("note").setDescription("Note text").setRequired(true))
-    .addStringOption((option) => option.setName("username").setDescription("Optional Roblox username")),
-  new SlashCommandBuilder()
     .setName("blacklist_lookup")
     .setDescription("Look up an active or revoked blacklist record.")
     .addStringOption((option) => option.setName("username").setDescription("Roblox username").setRequired(true)),
-  new SlashCommandBuilder()
-    .setName("blacklist_sync")
-    .setDescription("Report Trello monitoring status; does not change Discord state."),
-  new SlashCommandBuilder()
-    .setName("identity_lookup")
-    .setDescription("Look up recorded Discord and Roblox identity associations.")
-    .addUserOption((option) => option.setName("discord_user").setDescription("Discord user"))
-    .addStringOption((option) => option.setName("roblox_id").setDescription("Roblox numeric ID")),
-  securityStatusCommand,
-  maintenanceCommand,
-  new SlashCommandBuilder()
-    .setName("security_lockdown")
-    .setDescription("Immediately stop new destructive blacklist actions.")
-    .addStringOption((option) => option.setName("reason").setDescription("Reason").setRequired(true)),
-  new SlashCommandBuilder()
-    .setName("security_unlock")
-    .setDescription("Unlock destructive blacklist actions after confirmation.")
-    .addStringOption((option) => option.setName("reason").setDescription("Optional reason")),
 ];
 
 // These recovery controls must remain reachable before first-time setup. In
 // particular, maintenance must never make a partially configured guild stuck.
-const setupOnlyCommands = [setupCommand, maintenanceCommand, securityStatusCommand].map((command) => command.toJSON());
-const enabledCommands = [setupCommand, ...moderationCommands].map((command) =>
+const setupOnlyCommands = [settingsCommand].map((command) => command.toJSON());
+const enabledCommands = [settingsCommand, ...moderationCommands].map((command) =>
   command.toJSON(),
 );
 
@@ -256,6 +191,11 @@ let guildSetupComplete = false;
 let recoveryAttempt: Promise<BotRefreshResult> | null = null;
 let trelloRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let blacklistSyncTimer: ReturnType<typeof setTimeout> | null = null;
+let cachedPresenceStats: { activeBlacklists?: number; serverMembers?: number } = {};
+let trelloHealthFailureCount = 0;
+let trelloHealthFailureStartedAt: number | null = null;
+let presenceRestoreInFlight: Promise<void> | null = null;
+let shutdownHooksInstalled = false;
 const setupSessions = new Map<string, {
   userId: string;
   guildId: string;
@@ -263,6 +203,8 @@ const setupSessions = new Map<string, {
   nonce: string;
   /** The one ephemeral setup message this session is authorized to operate. */
   messageId?: string;
+  /** `/settings` controls always carry the session nonce in their custom ID. */
+  nonceRequired?: boolean;
 }>();
 const confirmations = new Map<string, {
   userId: string;
@@ -288,8 +230,10 @@ const permissionEscalationWindowMs = 10 * 60_000;
 
 const maintenanceMessage =
   "🛠️ **BOT UNDER MAINTENANCE**\n\nQuartermaster is currently undergoing maintenance.\nCommands are temporarily unavailable. Please try again later.";
+// Legacy command names are retained only as internal compatibility adapters;
+// command registration exposes `/settings` alone for these operations.
 const maintenanceAllowedCommands = new Set([
-  "maintenance", "security_status", "security_lockdown", "security_unlock",
+  "settings", "maintenance", "security_status", "security_lockdown", "security_unlock",
 ]);
 
 function canRenderPresence(client: Client | null | undefined): client is Client {
@@ -303,6 +247,46 @@ async function refreshPresencePriority(guildId: string): Promise<void> {
     lockdown: state.lockdown.active,
     maintenance: state.maintenance.active,
   });
+}
+
+async function restorePresenceAfterResume(client: Client): Promise<void> {
+  if (presenceRestoreInFlight) return presenceRestoreInFlight;
+  presenceRestoreInFlight = (async () => {
+    if (!config.discordGuildId || !canRenderPresence(client)) return;
+    const [setup, security] = await Promise.all([
+      getGuildSetup(config.discordGuildId),
+      getSecurityState(config.discordGuildId),
+    ]);
+    setPresencePriority(client, {
+      startup: false,
+      lockdown: security.lockdown.active,
+      maintenance: security.maintenance.active,
+    });
+    applyPresenceSettings(client, setup ? presenceSettingsFor(setup) : DEFAULT_PRESENCE_SETTINGS);
+  })().finally(() => {
+    presenceRestoreInFlight = null;
+  });
+  return presenceRestoreInFlight;
+}
+
+function recordTrelloHealthForPresence(unhealthy: boolean): void {
+  if (!unhealthy) {
+    trelloHealthFailureCount = 0;
+    trelloHealthFailureStartedAt = null;
+    if (canRenderPresence(discordClient)) {
+      setPresencePriority(discordClient, { serviceFailure: false });
+    }
+    return;
+  }
+  trelloHealthFailureCount += 1;
+  trelloHealthFailureStartedAt ??= Date.now();
+  // A single failed poll is not an outage. Require two independently observed
+  // monitoring failures spanning a full minute before changing public status.
+  const meaningfulOutage = trelloHealthFailureCount >= 2 &&
+    Date.now() - trelloHealthFailureStartedAt >= 60_000;
+  if (meaningfulOutage && canRenderPresence(discordClient)) {
+    setPresencePriority(discordClient, { serviceFailure: true });
+  }
 }
 
 async function maintenanceActive(guildId: string): Promise<boolean> {
@@ -368,12 +352,26 @@ async function runGuildBlacklistSync(
   }
 
   const result = await synchronizeBlacklists(guild, setup, trigger);
+  void refreshPresenceStats(guild);
   // A complete scan failure is a service outage; malformed cards and partial
   // reconciliation remain operator-visible but do not claim a major outage.
-  if (canRenderPresence(discordClient)) {
-    setPresencePriority(discordClient, { serviceFailure: result.state === "failed" });
-  }
+  recordTrelloHealthForPresence(result.state === "failed");
   if (trigger !== "poll") scheduleBlacklistSync(guild, setup);
+}
+
+async function refreshPresenceStats(guild: Guild): Promise<void> {
+  const next: { activeBlacklists?: number; serverMembers?: number } = {};
+  try {
+    // This is the command-approved, persisted restriction snapshot only. It
+    // intentionally does not inspect Trello cards or scan Discord members.
+    next.activeBlacklists = (await listActiveRestrictionSnapshots(guild.id)).length;
+  } catch {
+    // A partial statistic must never disable the rest of presence rotation.
+  }
+  if (Number.isSafeInteger(guild.memberCount) && guild.memberCount >= 0) {
+    next.serverMembers = guild.memberCount;
+  }
+  cachedPresenceStats = next;
 }
 
 function clearTrelloRetry(): void {
@@ -614,10 +612,92 @@ function setupSessionId(guildId: string, userId: string): string {
   return `setup:${guildId}:${userId}`;
 }
 
+function sealSettingsComponents(payload: unknown, nonce: string): unknown {
+  const seal = (component: unknown) => {
+    const candidate = component as {
+      data?: { custom_id?: string };
+      components?: unknown[];
+      setCustomId?: (id: string) => unknown;
+    };
+    const id = candidate.data?.custom_id;
+    if (id && !id.endsWith(`:${nonce}`) && typeof candidate.setCustomId === "function") {
+      candidate.setCustomId(`${id}:${nonce}`);
+    }
+    for (const nested of candidate.components ?? []) seal(nested);
+  };
+  seal(payload);
+  return payload;
+}
+
 function scopedSetupModalId(guildId: string, userId: string, id: string): string {
   const session = setupSessions.get(setupSessionId(guildId, userId));
-  if (!session) throw new Error("This setup session has expired. Run /setup again.");
+  if (!session) throw new Error("This settings session has expired. Run /settings again.");
   return `${id}:${session.nonce}`;
+}
+
+function botAvatarUrl(): string | undefined {
+  const user = discordClient?.user;
+  return typeof user?.displayAvatarURL === "function"
+    ? user.displayAvatarURL()
+    : undefined;
+}
+
+function brandedEmbed(title: string, description: string): EmbedBuilder {
+  const embed = new EmbedBuilder().setColor(0x2b6cb0).setTitle(`QUARTERMASTER • ${title}`).setDescription(description);
+  const avatar = botAvatarUrl();
+  if (avatar) embed.setThumbnail(avatar);
+  return embed;
+}
+
+function settingsMenu(nonce: string, configured: boolean, maintenance = false): {
+  embeds: EmbedBuilder[];
+  components: Array<ActionRowBuilder<StringSelectMenuBuilder>>;
+} {
+  const emergency = [
+    { label: "System Status", value: "settings-action:status", description: "View command, Trello, and security status" },
+    { label: "Enable Maintenance", value: "settings-action:maintenance-enable", description: "Temporarily lock normal administration" },
+    { label: "Disable Maintenance", value: "settings-action:maintenance-disable", description: "Restore normal administration" },
+    { label: "Security Lockdown", value: "settings-action:lockdown", description: "Immediately stop destructive actions" },
+    { label: "Security Unlock", value: "settings-action:unlock", description: "Unlock after a confirmation" },
+  ];
+  const configuredOptions = [
+    { label: "Blacklist Settings", value: "setup:blacklist", description: "Roles and Trello mapping" },
+    { label: "Trello Monitoring", value: "setup:trello", description: "Monitoring and polling configuration" },
+    { label: "Security Settings", value: "setup:security", description: "Limits, protections, and confirmations" },
+    { label: "Audit Settings", value: "setup:audit", description: "Audit channels and log categories" },
+    { label: "Discord Settings", value: "setup:discord", description: "View Discord configuration" },
+    { label: "Presence Settings", value: "setup:presence", description: "Status, activities, and rotation" },
+    { label: "Identity / Alt Detection", value: "setup:identity", description: "Warning-only association controls" },
+    { label: "View Configuration", value: "setup:view", description: "Review active configuration" },
+    { label: "Blacklist a Group", value: "settings-action:group", description: "Create a group blacklist record" },
+    { label: "Add Blacklist Note", value: "settings-action:note", description: "Record a durable audit note" },
+    { label: "Sync Monitoring Report", value: "settings-action:sync", description: "Run a monitoring-only Trello report" },
+    { label: "Identity Lookup", value: "settings-action:identity-lookup", description: "Search recorded associations" },
+  ];
+  const options = maintenance
+    ? emergency
+    : configured
+      ? [...configuredOptions, ...emergency]
+      : [
+          { label: "Complete First-time Setup", value: "settings-action:initial-audit", description: "Verify the audit channel before enabling commands" },
+          ...emergency,
+        ];
+  return {
+    embeds: [brandedEmbed(
+      maintenance ? "EMERGENCY SETTINGS" : "ADMINISTRATION",
+      maintenance
+        ? "Maintenance is active. Only status, maintenance, and security emergency controls are available."
+        : configured
+          ? "Select an administration action. Every control is private, expires after 10 minutes, and re-checks your current Administrator permission.\n\n**Configuration:** Blacklist, Trello Monitoring, Security, Audit, Discord, Presence, Identity / Alt Detection, View Configuration\n**Operations:** Blacklist a Group, Add Blacklist Note, Sync Monitoring Report, Identity Lookup\n**Emergency:** System Status, Enable / Disable Maintenance, Security Lockdown, Security Unlock\n**Standalone commands:** `/blacklist`, `/revoke_blacklist`, and `/blacklist_lookup`."
+          : "Initial setup is required. Start by supplying a verified audit-channel ID; emergency and status controls remain available.\n\n**Available here:** first-time audit setup, System Status, Enable / Disable Maintenance, Security Lockdown, and Security Unlock.",
+    )],
+    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`settings:select:${nonce}`)
+        .setPlaceholder("Choose a Quartermaster action")
+        .addOptions(options.map((option) => ({ ...option, value: `${option.value}:${nonce}` }))),
+    )],
+  };
 }
 
 function setupMenu(nonce: string): {
@@ -659,6 +739,46 @@ function setupMenu(nonce: string): {
   };
 }
 
+async function requireSettingsSession(
+  interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
+): Promise<{ session: NonNullable<(typeof setupSessions extends Map<string, infer T> ? T : never)>; setup?: GuildSetup }> {
+  if (!interaction.guild) throw new Error("Settings are only available in the configured server.");
+  const session = setupSessions.get(setupSessionId(interaction.guild.id, interaction.user.id));
+  if (!session || session.expiresAt <= Date.now() || session.guildId !== interaction.guild.id) {
+    throw new Error("This settings session has expired or belongs to another administrator. Run /settings again.");
+  }
+  const raw = interaction.isStringSelectMenu?.() ? interaction.values[0] : interaction.customId;
+  const nonce = raw.match(/:([a-f0-9]{32})$/)?.[1];
+  if (!nonce || nonce !== session.nonce) {
+    throw new Error("This settings control belongs to an expired session. Run /settings again.");
+  }
+  if ((interaction.isButton?.() || interaction.isStringSelectMenu?.()) &&
+      session.messageId && interaction.message?.id !== session.messageId) {
+    throw new Error("This settings control belongs to an older settings message. Run /settings again.");
+  }
+  if (config.discordGuildId && interaction.guild.id !== config.discordGuildId) {
+    throw new Error("Settings can only be used in the configured server.");
+  }
+  const setup = await getGuildSetup(interaction.guild.id);
+  await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, "settings interaction");
+  return { session, setup };
+}
+
+async function handleSettings(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  const guild = interaction.guild!;
+  const existing = await getGuildSetup(guild.id);
+  await requireCurrentAdministrator(guild, interaction.user.id, existing, "/settings");
+  const state = await getSecurityState(guild.id);
+  const nonce = crypto.randomUUID().replaceAll("-", "");
+  const response = await interaction.editReply(settingsMenu(nonce, Boolean(existing), state.maintenance.active));
+  setupSessions.set(setupSessionId(guild.id, interaction.user.id), {
+    userId: interaction.user.id, guildId: guild.id, expiresAt: Date.now() + setupSessionLifetimeMs,
+    messageId: response?.id, nonce, nonceRequired: true,
+  });
+}
+
 function securityEmbed(setup: GuildSetup, state: SecurityState): EmbedBuilder {
   const settings = securitySettingsFor(setup);
   return new EmbedBuilder().setTitle("SECURITY SETTINGS").setDescription([
@@ -697,14 +817,18 @@ async function requireSetupSession(
   if (!interaction.guild) throw new Error("Setup is only available in the configured server.");
   const session = setupSessions.get(setupSessionId(interaction.guild.id, interaction.user.id));
   if (!session || session.expiresAt <= Date.now()) {
-    throw new Error("This setup session has expired. Run /setup again.");
+    throw new Error("This settings session has expired. Run /settings again.");
+  }
+  const customNonce = interaction.customId.match(/:([a-f0-9]{32})$/)?.[1];
+  if (session.nonceRequired && customNonce !== session.nonce) {
+    throw new Error("This settings control belongs to an expired session. Run /settings again.");
   }
   if (
     interaction.isButton?.() || interaction.isStringSelectMenu?.()
   ) {
     const messageId = interaction.message?.id;
     if (session.messageId && messageId !== session.messageId) {
-      throw new Error("This setup control belongs to an older setup message. Run /setup again.");
+      throw new Error("This settings control belongs to an older settings message. Run /settings again.");
     }
   }
   if (session.guildId !== interaction.guild.id || session.userId !== interaction.user.id) {
@@ -724,15 +848,239 @@ function numberInput(id: string, label: string, value: number, min: number, max:
     .setRequired(true).setValue(String(value)).setMaxLength(String(max).length);
 }
 
+function settingsActionAdapter(
+  interaction: ModalSubmitInteraction,
+  commandName: string,
+  values: Record<string, string | undefined>,
+): ChatInputCommandInteraction {
+  const editReply = async (value: string | object) => {
+    if (!interaction.deferred && !interaction.replied) {
+      return interaction.reply(typeof value === "string"
+        ? { content: value, ephemeral: true }
+        : { ...value, ephemeral: true });
+    }
+    return interaction.editReply(value);
+  };
+  // This deliberately exposes only the small command-shaped contract consumed
+  // by established moderation handlers. Values are created from named modal
+  // fields here, rather than accepting a command name or arbitrary options
+  // from a component custom ID.
+  return {
+    guild: interaction.guild,
+    guildId: interaction.guildId,
+    user: interaction.user,
+    commandName,
+    options: {
+      getString: (name: string, required?: boolean) => {
+        const value = values[name];
+        if (required && !value) throw new Error(`Missing ${name}.`);
+        return value ?? null;
+      },
+      getUser: () => null,
+    },
+    editReply,
+  } as unknown as ChatInputCommandInteraction;
+}
+
+async function renderSecurityStatus(
+  interaction: { guild: Guild | null; user: { id: string }; editReply(value: string | object): Promise<unknown> },
+  setup?: GuildSetup,
+): Promise<void> {
+  const guild = interaction.guild;
+  if (!guild) throw new Error("Status is only available in a server.");
+  await requireCurrentAdministrator(guild, interaction.user.id, setup, "/settings status");
+  const state = await getSecurityState(guild.id);
+  const settings = setup ? securitySettingsFor(setup) : defaultSecuritySettings();
+  const trello = getTrelloReadiness();
+  const presence = getEffectivePresence();
+  const recentActions = state.destructiveActions.filter(
+    (entry) => Date.parse(entry.at) >= Date.now() - settings.windowMinutes * 60_000,
+  ).length;
+  const operationalState = state.maintenance.active
+    ? `Maintenance: ENABLED${state.maintenance.reason ? ` — ${state.maintenance.reason}` : ""}`
+    : state.lockdown.active
+      ? `Security lockdown: LOCKED${state.lockdown.reason ? ` — ${state.lockdown.reason}` : ""}`
+      : !setup || !guildSetupComplete || !commandsRegistered
+        ? "Bot state: SETUP REQUIRED OR COMMANDS UNREGISTERED"
+        : !trello.ready ? `Trello: UNAVAILABLE${trello.error ? ` — ${trello.error}` : ""}` : "Bot state: ENABLED";
+  const blacklistState = state.maintenance.active ? "DISABLED — MAINTENANCE"
+    : state.lockdown.active ? "DISABLED — SECURITY LOCKDOWN"
+      : !setup || !guildSetupComplete || !commandsRegistered ? "DISABLED — SETUP/REGISTRATION"
+        : !trello.ready ? "DISABLED — TRELLO UNAVAILABLE" : "ENABLED";
+  await interaction.editReply({
+    embeds: [brandedEmbed("SYSTEM STATUS", [
+      operationalState,
+      `Security: ${state.lockdown.active ? "LOCKED" : "unlocked"}; ${recentActions}/${settings.globalLimit} destructive actions in the current ${settings.windowMinutes}-minute window.`,
+      state.maintenance.active
+        ? `Maintenance since: ${state.maintenance.startedAt ?? "Unknown"}`
+        : "Maintenance: disabled",
+      `Blacklist commands: ${blacklistState}`,
+      `Presence: ${presence.status} / Watching ${presence.activity ?? "nothing"} (${presence.mode})`,
+      `Trello readiness: ${trello.ready ? "READY" : trello.status.toUpperCase()}`,
+    ].join("\n"))],
+  });
+}
+
+async function handleSettingsComponent(
+  interaction: ButtonInteraction | StringSelectMenuInteraction,
+): Promise<void> {
+  const { setup } = await requireSettingsSession(interaction);
+  const raw = interaction.isStringSelectMenu() ? interaction.values[0]! : interaction.customId;
+  const id = raw.replace(/:([a-f0-9]{32})$/, "");
+  const state = await getSecurityState(interaction.guild!.id);
+  const emergency = new Set([
+    "settings-action:status", "settings-action:maintenance-enable", "settings-action:maintenance-disable",
+    "settings-action:lockdown", "settings-action:unlock",
+  ]);
+  if (state.maintenance.active && !emergency.has(id)) {
+    throw new Error(maintenanceMessage);
+  }
+  if (id.startsWith("setup:")) {
+    if (!setup) throw new Error("Complete first-time setup before changing these settings.");
+    // Existing category handlers contain the durable validation and audit
+    // behavior. The selected, nonce-bound value is their sole input.
+    await handleSetupComponent(interaction);
+    return;
+  }
+  if (id === "settings-action:status") {
+    await renderSecurityStatus({
+      guild: interaction.guild,
+      user: interaction.user,
+      // A select must be acknowledged with update/deferUpdate, not editReply
+      // before its initial response.
+      editReply: async (payload) => interaction.update(payload),
+    }, setup);
+    return;
+  }
+  if (id === "settings-action:maintenance-disable") {
+    await interaction.deferUpdate();
+    await createMaintenanceConfirmation(interaction as unknown as ChatInputCommandInteraction, false, "Administrator requested maintenance completion");
+    return;
+  }
+  const modal = (name: string, title: string, fields: TextInputBuilder[]) =>
+    interaction.showModal(new ModalBuilder().setCustomId(scopedSetupModalId(
+      interaction.guild!.id, interaction.user.id, `settings-modal:${name}`,
+    )).setTitle(title).addComponents(...fields.map((field) =>
+      new ActionRowBuilder<TextInputBuilder>().addComponents(field),
+    )));
+  if (id === "settings-action:initial-audit") {
+    if (setup) throw new Error("Setup is already complete. Use Audit Settings to update the audit channel.");
+    await modal("initial-audit", "Complete Quartermaster setup", [
+      new TextInputBuilder().setCustomId("audit_channel_id").setLabel("Audit text-channel ID").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(25),
+    ]);
+    return;
+  }
+  if (id === "settings-action:group") {
+    await modal("group", "Blacklist a Roblox group", [
+      new TextInputBuilder().setCustomId("id").setLabel("Roblox group ID").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(20),
+      new TextInputBuilder().setCustomId("reason").setLabel("Reason").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500),
+    ]);
+    return;
+  }
+  if (id === "settings-action:note") {
+    await modal("note", "Record blacklist note", [
+      new TextInputBuilder().setCustomId("username").setLabel("Roblox username (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(50),
+      new TextInputBuilder().setCustomId("note").setLabel("Note").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500),
+    ]);
+    return;
+  }
+  if (id === "settings-action:identity-lookup") {
+    await modal("identity-lookup", "Identity association lookup", [
+      new TextInputBuilder().setCustomId("discord_id").setLabel("Discord user ID (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(25),
+      new TextInputBuilder().setCustomId("roblox_id").setLabel("Roblox numeric ID (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(20),
+    ]);
+    return;
+  }
+  if (id === "settings-action:lockdown" || id === "settings-action:maintenance-enable") {
+    await modal(
+      id.endsWith("lockdown") ? "lockdown" : "maintenance-enable",
+      id.endsWith("lockdown") ? "Enable security lockdown" : "Enable maintenance mode",
+      [new TextInputBuilder().setCustomId("reason").setLabel("Reason").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500)],
+    );
+    return;
+  }
+  if (id === "settings-action:unlock") {
+    await modal("unlock", "Unlock security lockdown", [
+      new TextInputBuilder().setCustomId("reason").setLabel("Reason (optional)").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500),
+    ]);
+    return;
+  }
+  if (id === "settings-action:sync") {
+    if (!setup) throw new Error("Complete first-time setup before requesting monitoring reports.");
+    await interaction.deferUpdate();
+    await runGuildBlacklistSync(interaction.guild!, "manual");
+    const sync = getBlacklistSyncStatus();
+    await interaction.editReply({
+      embeds: [brandedEmbed("TRELLO MONITORING", `Report-only sync complete: ${sync.state}; indexed ${sync.counts.indexed}, issues ${sync.counts.issues}. Manual Trello changes never modify Discord state.`)],
+      components: [],
+    });
+    await auditBestEffort(interaction.guild!, setup, {
+      action: "Blacklist sync report requested", status: "success", actorId: interaction.user.id,
+      fields: [{ name: "Mode", value: "Monitoring-only" }],
+    });
+  }
+}
+
 async function handleSetupComponent(interaction: ButtonInteraction | StringSelectMenuInteraction): Promise<void> {
   const setup = await requireSetupSession(interaction);
   const guild = interaction.guild!;
+  const activeSession = setupSessions.get(setupSessionId(guild.id, interaction.user.id));
+  if (activeSession?.nonceRequired) {
+    // The legacy category renderer is reused by `/settings`. Seal every
+    // generated child button/select centrally so no future category control
+    // can accidentally omit the user/guild-bound nonce.
+    const update = interaction.update.bind(interaction);
+    const showModal = interaction.showModal.bind(interaction);
+    Object.defineProperties(interaction, {
+      update: {
+        value: (payload: unknown) => update(sealSettingsComponents(payload, activeSession.nonce) as never),
+      },
+      showModal: {
+        value: (modal: unknown) => showModal(sealSettingsComponents(modal, activeSession.nonce) as ModalBuilder),
+      },
+    });
+  }
+  const componentId = interaction.customId.replace(/:([a-f0-9]{32})$/, "");
+  if (interaction.isStringSelectMenu() && componentId === "setup:presence-activity-select") {
+    const current = presenceSettingsFor(setup);
+    const selected = new Set(interaction.values.map((value) => Number(value.split(":").at(-1))));
+    if ([...selected].some((value) => !Number.isInteger(value) || value < 0 || value >= current.activities.length)) {
+      throw new Error("Invalid activity selection.");
+    }
+    const presence = validatePresenceSettings({
+      ...current,
+      disabledActivities: current.activities.filter((_, index) => !selected.has(index)),
+    });
+    await saveSetupChange(guild, { ...setup, presence }, interaction.user.id, "Enabled presence activities",
+      JSON.stringify(current.disabledActivities ?? []), JSON.stringify(presence.disabledActivities ?? []));
+    await interaction.update({ embeds: [brandedEmbed("PRESENCE ACTIVITIES", `${selected.size} activity${selected.size === 1 ? "" : "ies"} enabled and saved.`)], components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId("setup:presence").setLabel("Back").setStyle(ButtonStyle.Secondary)),
+    ] });
+    return;
+  }
+  if (interaction.isStringSelectMenu() && componentId === "setup:presence-remove-select") {
+    const current = presenceSettingsFor(setup);
+    const defaults = new Set(DEFAULT_PRESENCE_SETTINGS.activities);
+    const custom = current.activities.filter((activity) => !defaults.has(activity));
+    const index = Number(interaction.values[0]?.split(":").at(-1));
+    const activity = custom[index];
+    if (!activity) throw new Error("Invalid custom activity selection.");
+    const presence = validatePresenceSettings({
+      ...current,
+      activities: current.activities.filter((value) => value !== activity),
+      disabledActivities: (current.disabledActivities ?? []).filter((value) => value !== activity),
+    });
+    await saveSetupChange(guild, { ...setup, presence }, interaction.user.id, "Presence activity removed", activity, "Removed");
+    await interaction.update({ embeds: [brandedEmbed("PRESENCE ACTIVITIES", `Removed Watching ${activity}.`)], components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId("setup:presence").setLabel("Back").setStyle(ButtonStyle.Secondary)),
+    ] });
+    return;
+  }
   const rawId = interaction.isStringSelectMenu() ? interaction.values[0]! : interaction.customId;
   const id = rawId.replace(/:([a-f0-9]{32})$/, "");
   const nonce = rawId.match(/:([a-f0-9]{32})$/)?.[1];
-  const session = setupSessions.get(setupSessionId(guild.id, interaction.user.id));
-  if (nonce && session?.nonce !== nonce) {
-    throw new Error("This setup control belongs to an expired setup session. Run /setup again.");
+  if (nonce && activeSession?.nonce !== nonce) {
+    throw new Error("This settings control belongs to an expired settings session. Run /settings again.");
   }
   const lockdown = await getSecurityState(guild.id);
   if (
@@ -906,32 +1254,91 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
   }
   if (id === "setup:presence") {
     const presence = presenceSettingsFor(setup);
-    await interaction.update({ embeds: [new EmbedBuilder().setTitle("PRESENCE SETTINGS").setDescription(
-      `Enabled: ${presence.enabled ? "Yes" : "No"}\nRotation: ${presence.rotationEnabled ? "Enabled" : "Disabled"}\nInterval: ${presence.minIntervalMinutes}–${presence.maxIntervalMinutes} minutes\nActivities:\n${presence.activities.map((x) => `Watching ${x}`).join("\n")}`,
+    const enabled = presence.activities.filter((activity) =>
+      !(presence.disabledActivities ?? []).includes(activity) &&
+      (presence.dynamicActivitiesEnabled !== false || !activity.includes("{")),
+    );
+    await interaction.update({ embeds: [brandedEmbed("PRESENCE SETTINGS",
+      `Status: ${presence.enabled ? "Enabled" : "Disabled"}\nRotation: ${presence.rotationEnabled ? "Enabled" : "Disabled"} • ${presence.minIntervalMinutes}–${presence.maxIntervalMinutes} minutes\nDynamic Activities: ${presence.dynamicActivitiesEnabled !== false ? "Enabled" : "Disabled"}\nActivities: ${enabled.length}/${presence.activities.length} enabled\nPrimary: Watching Customers`,
     )], components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("setup:presence-toggle").setLabel("Enable / Disable").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("setup:presence-rotation").setLabel("Toggle Rotation").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("setup:presence-edit").setLabel("Edit Activities").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("setup:presence-dynamic").setLabel("Dynamic Status").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("setup:presence-activities").setLabel("Activities").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("setup:presence-add").setLabel("Add Activity").setStyle(ButtonStyle.Success),
+    ), new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("setup:presence-rotation-settings").setLabel("Rotation Range").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("setup:presence-preview").setLabel("Preview").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("setup:presence-reset").setLabel("Reset Defaults").setStyle(ButtonStyle.Secondary),
     )] });
     return;
   }
-  if (id === "setup:presence-edit") {
+  if (id === "setup:presence-activities") {
     const presence = presenceSettingsFor(setup);
-    await interaction.showModal(new ModalBuilder().setCustomId(scopedSetupModalId(guild.id, interaction.user.id, "setup-modal:presence")).setTitle("Presence settings").addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("activities").setLabel("Activities, one per line").setStyle(TextInputStyle.Paragraph).setValue(presence.activities.join("\n")).setRequired(true)),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(numberInput("min", "Minimum minutes", presence.minIntervalMinutes, 1, 1440)),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(numberInput("max", "Maximum minutes", presence.maxIntervalMinutes, 1, 1440)),
+    await interaction.update({
+      embeds: [brandedEmbed("PRESENCE ACTIVITIES", "Select activities to toggle them. Disabled activities remain saved and can be enabled later.")],
+      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder().setCustomId("setup:presence-activity-select").setMinValues(0).setMaxValues(presence.activities.length)
+          .setPlaceholder("Enabled watching activities")
+          .addOptions(presence.activities.map((activity, index) => ({
+            label: activity.slice(0, 100), value: `setup:presence-activity:${index}`,
+            default: !(presence.disabledActivities ?? []).includes(activity),
+          }))),
+      ), new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("setup:presence-remove-custom").setLabel("Remove Custom").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("setup:presence").setLabel("Back").setStyle(ButtonStyle.Secondary),
+      )],
+    });
+    return;
+  }
+  if (id === "setup:presence-add" || id === "setup:presence-rotation-settings") {
+    const presence = presenceSettingsFor(setup);
+    await interaction.showModal(new ModalBuilder().setCustomId(scopedSetupModalId(guild.id, interaction.user.id,
+      id === "setup:presence-add" ? "setup-modal:presence-add" : "setup-modal:presence-rotation",
+    )).setTitle(id === "setup:presence-add" ? "Add watching activity" : "Presence rotation range").addComponents(
+      ...(id === "setup:presence-add"
+        ? [new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("activity").setLabel("Watching activity").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(128))]
+        : [
+          new ActionRowBuilder<TextInputBuilder>().addComponents(numberInput("min", "Minimum minutes", presence.minIntervalMinutes, 2, 1440)),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(numberInput("max", "Maximum minutes", presence.maxIntervalMinutes, 2, 1440)),
+        ]),
     ));
     return;
   }
-  if (id === "setup:presence-toggle" || id === "setup:presence-rotation" || id === "setup:presence-reset") {
+  if (id === "setup:presence-preview") {
+    const preview = (await import("./presence")).getPresenceActivityPreview(presenceSettingsFor(setup), cachedPresenceStats);
+    await interaction.update({
+      embeds: [brandedEmbed("PRESENCE PREVIEW", preview.map((entry) =>
+        `${entry.enabled ? "✅" : "⏸️"} Watching ${entry.activity ?? `${entry.template} (waiting for data)`} • weight ${entry.weight}`,
+      ).join("\n"))],
+      components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("setup:presence").setLabel("Back").setStyle(ButtonStyle.Secondary),
+      )],
+    });
+    return;
+  }
+  if (id === "setup:presence-remove-custom") {
+    const defaults = new Set(DEFAULT_PRESENCE_SETTINGS.activities);
+    const custom = presenceSettingsFor(setup).activities.filter((activity) => !defaults.has(activity));
+    if (!custom.length) throw new Error("No custom activities are configured.");
+    await interaction.update({
+      embeds: [brandedEmbed("REMOVE CUSTOM ACTIVITY", "Select one custom activity to remove.")],
+      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder().setCustomId("setup:presence-remove-select").setPlaceholder("Choose a custom activity")
+          .addOptions(custom.map((activity, index) => ({ label: activity.slice(0, 100), value: `setup:presence-remove:${index}` }))),
+      )],
+    });
+    return;
+  }
+  if (id === "setup:presence-toggle" || id === "setup:presence-rotation" || id === "setup:presence-reset" || id === "setup:presence-dynamic") {
     const current = presenceSettingsFor(setup);
     const presence = id === "setup:presence-reset"
       ? { ...DEFAULT_PRESENCE_SETTINGS, activities: [...DEFAULT_PRESENCE_SETTINGS.activities] }
       : id === "setup:presence-toggle"
         ? { ...current, enabled: !current.enabled }
-        : { ...current, rotationEnabled: !current.rotationEnabled };
+        : id === "setup:presence-dynamic"
+          ? { ...current, dynamicActivitiesEnabled: current.dynamicActivitiesEnabled === false }
+          : { ...current, rotationEnabled: !current.rotationEnabled };
     const updated = await saveSetupChange(guild, { ...setup, presence }, interaction.user.id, "Presence settings", JSON.stringify(current), JSON.stringify(presence));
     await interaction.update({ embeds: [new EmbedBuilder().setTitle("PRESENCE SETTINGS").setDescription(`Saved. ${updated.presence?.enabled ? "Enabled" : "Disabled"}.`)], components: [] });
     return;
@@ -1117,7 +1524,7 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
   const nonce = rawId.match(/:([a-f0-9]{32})$/)?.[1];
   const session = setupSessions.get(setupSessionId(guild.id, interaction.user.id));
   if (!nonce || session?.nonce !== nonce) {
-    throw new Error("This setup modal belongs to an expired setup session. Run /setup again.");
+    throw new Error("This settings modal belongs to an expired session. Run /settings again.");
   }
   if (id === "setup-modal:maintenance-reason") {
     const reason = cleanText(interaction.fields.getTextInputValue("reason"), "Maintenance reason");
@@ -1156,6 +1563,30 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
     if (security.globalLimit < security.perAdminLimit) throw new Error("Global limit must be at least the per-administrator limit.");
     await saveSetupChange(guild, { ...setup, security }, interaction.user.id, "Blacklist rate limits", JSON.stringify(current), JSON.stringify(security));
     await interaction.reply({ content: "Rate limits saved and audited.", ephemeral: true });
+    return;
+  }
+  if (id === "setup-modal:presence-add") {
+    const current = presenceSettingsFor(setup);
+    if (current.activities.length >= 20) throw new Error("A maximum of 20 watching activities may be configured.");
+    const activity = cleanText(interaction.fields.getTextInputValue("activity"), "Activity", 128);
+    const presence = validatePresenceSettings({
+      ...current,
+      activities: [...current.activities, activity],
+    });
+    await saveSetupChange(guild, { ...setup, presence }, interaction.user.id, "Presence activity added", "None", activity);
+    await interaction.reply({ embeds: [brandedEmbed("PRESENCE SETTINGS", `Added Watching ${activity}.`)], ephemeral: true });
+    return;
+  }
+  if (id === "setup-modal:presence-rotation") {
+    const current = presenceSettingsFor(setup);
+    const presence = validatePresenceSettings({
+      ...current,
+      minIntervalMinutes: Number(interaction.fields.getTextInputValue("min")),
+      maxIntervalMinutes: Number(interaction.fields.getTextInputValue("max")),
+    });
+    await saveSetupChange(guild, { ...setup, presence }, interaction.user.id, "Presence rotation range",
+      `${current.minIntervalMinutes}–${current.maxIntervalMinutes}`, `${presence.minIntervalMinutes}–${presence.maxIntervalMinutes}`);
+    await interaction.reply({ embeds: [brandedEmbed("PRESENCE SETTINGS", "Rotation range saved and applied.")], ephemeral: true });
     return;
   }
   if (id === "setup-modal:presence") {
@@ -1244,6 +1675,127 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
   }
 }
 
+async function handleSettingsModal(interaction: ModalSubmitInteraction): Promise<void> {
+  const { setup } = await requireSettingsSession(interaction);
+  const guild = interaction.guild!;
+  const id = interaction.customId.replace(/:([a-f0-9]{32})$/, "");
+  const state = await getSecurityState(guild.id);
+  const emergency = new Set([
+    "settings-modal:maintenance-enable",
+    "settings-modal:lockdown", "settings-modal:unlock",
+  ]);
+  if (state.maintenance.active && !emergency.has(id)) throw new Error(maintenanceMessage);
+
+  if (id === "settings-modal:initial-audit") {
+    if (setup) throw new Error("Setup is already complete.");
+    const auditChannelId = interaction.fields.getTextInputValue("audit_channel_id").trim();
+    if (!/^\d{5,25}$/.test(auditChannelId)) throw new Error("The audit channel ID must contain only numbers.");
+    const initial: GuildSetup = {
+      guildId: guild.id, moderatorRoleId: guild.id, auditChannelId,
+      security: defaultSecuritySettings(), monitoring: defaultMonitoringSettings(),
+      trello: defaultTrelloMappings(), audit: defaultAuditSettings(),
+      identity: defaultIdentitySettings(),
+      presence: { ...DEFAULT_PRESENCE_SETTINGS, activities: [...DEFAULT_PRESENCE_SETTINGS.activities] },
+      updatedBy: interaction.user.id, updatedAt: new Date().toISOString(),
+    };
+    await requireAuditChannel(guild, initial);
+    await saveGuildSetup(initial);
+    await sendAuditEvent(guild, initial, {
+      action: "Bot setup completed", status: "success", actorId: interaction.user.id,
+      fields: [{ name: "Audit channel", value: `<#${auditChannelId}> (${auditChannelId})` }],
+    });
+    await registerGuildCommands(guild, true);
+    commandsRegistered = true;
+    setupCommandRegistered = true;
+    guildSetupComplete = true;
+    setRecoveryStatus("successful");
+    await interaction.reply({
+      embeds: [brandedEmbed("SETUP COMPLETE", `Audit logging is verified for <#${auditChannelId}>. /settings now contains all Quartermaster administration controls.`)],
+      ephemeral: true,
+    });
+    await runGuildBlacklistSync(guild, "setup");
+    return;
+  }
+  if (id === "settings-modal:maintenance-enable") {
+    await createMaintenanceConfirmation(
+      interaction,
+      true,
+      cleanText(interaction.fields.getTextInputValue("reason"), "Maintenance reason"),
+    );
+    return;
+  }
+  if (id === "settings-modal:lockdown") {
+    const reason = cleanText(interaction.fields.getTextInputValue("reason"), "Reason");
+    await requireCurrentAdministrator(guild, interaction.user.id, setup, "/settings lockdown");
+    await mutateSecurityState(guild.id, (current) => {
+      current.lockdown = { active: true, automatic: false, reason, startedAt: new Date().toISOString(), startedBy: interaction.user.id };
+    });
+    await refreshPresencePriority(guild.id);
+    if (setup) await auditBestEffort(guild, setup, {
+      action: "Security lockdown enabled", status: "success", actorId: interaction.user.id,
+      fields: [{ name: "Reason", value: reason }],
+    });
+    await interaction.reply({ embeds: [brandedEmbed("SECURITY LOCKDOWN", "Security lockdown enabled. Monitoring and enforcement of existing records continue.")], ephemeral: true });
+    return;
+  }
+  if (id === "settings-modal:unlock") {
+    const adapter = settingsActionAdapter(interaction, "security_unlock", {
+      reason: interaction.fields.getTextInputValue("reason").trim() || "None",
+    });
+    await createConfirmation(adapter, "security_unlock");
+    return;
+  }
+  if (!setup) throw new Error("Complete first-time setup before using this action.");
+  if (id === "settings-modal:group") {
+    const adapter = settingsActionAdapter(interaction, "group_blacklist", {
+      id: cleanText(interaction.fields.getTextInputValue("id"), "Roblox group ID", 20),
+      reason: cleanText(interaction.fields.getTextInputValue("reason"), "Reason"),
+    });
+    const security = securitySettingsFor(setup);
+    if (security.confirmationsRequired) {
+      await createConfirmation(adapter, "group_blacklist");
+    } else {
+      await reserveDestructiveAction(guild, interaction.user.id, setup, "group_blacklist");
+      await requireTrelloReadiness(trelloMappingsFor(setup));
+      await handleGroupBlacklist(adapter, setup);
+    }
+    return;
+  }
+  if (id === "settings-modal:note") {
+    const note = cleanText(interaction.fields.getTextInputValue("note"), "Note");
+    const username = interaction.fields.getTextInputValue("username").trim();
+    const robloxUser = username ? await findRobloxUser(username) : undefined;
+    await saveBlacklistNote({
+      id: `${guild.id}:${interaction.user.id}:${Date.now()}`, guildId: guild.id,
+      robloxUserId: robloxUser?.id, robloxUsername: robloxUser?.name,
+      actorId: interaction.user.id, text: note, createdAt: new Date().toISOString(),
+    });
+    await auditBestEffort(guild, setup, {
+      action: "Blacklist note recorded", status: "success", actorId: interaction.user.id,
+      fields: [{ name: "Note", value: note }, { name: "Roblox username", value: robloxUser ? `${robloxUser.name} | ${robloxUser.id}` : "Not specified" }],
+    });
+    await interaction.reply({ embeds: [brandedEmbed("BLACKLIST NOTE", "Blacklist note durably recorded.")], ephemeral: true });
+    return;
+  }
+  if (id === "settings-modal:identity-lookup") {
+    const discordId = interaction.fields.getTextInputValue("discord_id").trim();
+    const rawRoblox = interaction.fields.getTextInputValue("roblox_id").trim();
+    const robloxId = rawRoblox ? Number(rawRoblox) : undefined;
+    if (!discordId && !rawRoblox) throw new Error("Provide a Discord user ID or Roblox ID.");
+    if (discordId && !/^\d{5,25}$/.test(discordId)) throw new Error("Discord user ID must contain only digits.");
+    if (rawRoblox && (!Number.isSafeInteger(robloxId) || robloxId! <= 0)) throw new Error("Roblox ID must be a positive whole number.");
+    const ledger = (await getSecurityState(guild.id)).identityLedger;
+    const matches = ledger.filter((entry) => (!discordId || entry.discordUserId === discordId) &&
+      (!robloxId || entry.robloxUserId === robloxId));
+    await interaction.reply({
+      embeds: [brandedEmbed("IDENTITY LOOKUP", matches.length
+        ? matches.map((entry) => `Discord ${entry.discordUserId} ↔ Roblox ${entry.robloxUserId} (${entry.observedAt})`).join("\n")
+        : "No recorded identity associations found.")],
+      ephemeral: true,
+    });
+  }
+}
+
 async function createConfirmation(
   interaction: ChatInputCommandInteraction,
   command: "blacklist" | "group_blacklist" | "revoke_blacklist" | "security_unlock",
@@ -1275,10 +1827,11 @@ async function createConfirmation(
       }
     }
   }
-  const id = `${interaction.guild!.id}:${interaction.user.id}:${command}:${Date.now()}`;
+  const id = crypto.randomUUID().replaceAll("-", "");
   confirmations.set(id, { userId: interaction.user.id, guildId: interaction.guild!.id, command, original: interaction, target, expiresAt: Date.now() + setupSessionLifetimeMs });
   await interaction.editReply({
     content: `Confirm /${command}. Your current Administrator permission will be checked again before execution.`,
+    embeds: [brandedEmbed("CONFIRM ACTION", `Confirm /${command}. Your current Administrator permission will be checked again before execution.`)],
     components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`confirm:${id}`).setLabel("Confirm").setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId(`cancel:${id}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
@@ -1301,7 +1854,7 @@ async function createMaintenanceConfirmation(
   }
   // Discord custom IDs are limited to 100 characters; compact the internal
   // token while retaining a cryptographically random, user/guild-bound nonce.
-  const id = `${guild.id}:${interaction.user.id}:m:${crypto.randomUUID().replaceAll("-", "")}`;
+  const id = crypto.randomUUID().replaceAll("-", "");
   maintenanceConfirmations.set(id, {
     userId: interaction.user.id,
     guildId: guild.id,
@@ -1315,6 +1868,12 @@ async function createMaintenanceConfirmation(
     content: `🛠️ **${active ? "ENABLE" : "DISABLE"} MAINTENANCE MODE?**\nReason: ${reason || "None"}\n\n${active
       ? "Normal commands will be disabled while background blacklist protection continues."
       : "Normal command operation will be restored."}\nYour current Administrator permission will be checked again.`,
+    embeds: [brandedEmbed(
+      active ? "ENABLE MAINTENANCE" : "DISABLE MAINTENANCE",
+      `Reason: ${reason || "None"}\n\n${active
+        ? "Normal commands will be disabled while background blacklist protection continues."
+        : "Normal command operation will be restored."}\nYour current Administrator permission will be checked again.`,
+    )],
     ephemeral: true,
     components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`maintenance-confirm:${id}`).setLabel(
@@ -1421,7 +1980,7 @@ async function handleMaintenanceConfirmation(interaction: ButtonInteraction): Pr
 async function completeSecurityUnlock(
   guild: Guild,
   actorId: string,
-  setup: GuildSetup,
+  setup: GuildSetup | undefined,
   reason: string,
 ): Promise<void> {
   await requireCurrentAdministrator(guild, actorId, setup, "/security_unlock confirmation");
@@ -1430,7 +1989,7 @@ async function completeSecurityUnlock(
     state.lockdown = { active: false, automatic: false, reason: "", startedAt: null, startedBy: null };
   });
   await refreshPresencePriority(guild.id);
-  await auditBestEffort(guild, setup, {
+  if (setup) await auditBestEffort(guild, setup, {
     action: "Security lockdown unlocked", status: "success", actorId,
     fields: [
       { name: "Duration", value: prior.lockdown.startedAt ? `${Math.max(0, Math.round((Date.now() - Date.parse(prior.lockdown.startedAt)) / 1000))} seconds` : "Unknown" },
@@ -1451,7 +2010,7 @@ async function handleConfirmation(interaction: ButtonInteraction): Promise<void>
     return;
   }
   const setup = await getGuildSetup(pending.guildId);
-  if (!setup || !interaction.guild) throw new Error("Bot setup is unavailable.");
+  if (!interaction.guild) throw new Error("Bot setup is unavailable.");
   await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, `/${pending.command} confirmation`);
   await interaction.deferUpdate();
   if (pending.command === "security_unlock") {
@@ -1464,6 +2023,7 @@ async function handleConfirmation(interaction: ButtonInteraction): Promise<void>
     await pending.original.editReply({ content: "Security lockdown has been unlocked.", components: [] });
     return;
   }
+  if (!setup) throw new Error("Complete first-time setup before this moderation action.");
   await reserveDestructiveAction(interaction.guild, interaction.user.id, setup, pending.command);
   await requireTrelloReadiness(trelloMappingsFor(setup));
   if (pending.command === "blacklist") await handleBlacklist(pending.original, setup, pending.target);
@@ -1481,7 +2041,7 @@ export async function handleSetup(
     !member.permissions.has(PermissionFlagsBits.Administrator)
   ) {
     throw new Error(
-      "Only the server owner or an administrator can run /setup.",
+      "Only the server owner or an administrator can run /settings.",
     );
   }
 
@@ -1737,6 +2297,7 @@ async function handleBlacklistUnlocked(
         ],
       });
     }
+    void refreshPresenceStats(interaction.guild!);
     await interaction.editReply(
       `Blacklisted **${robloxUser.name}** (${robloxUser.id}). Removed ${roleIds.length} role(s) and created the Trello card: ${createdCard.url}`,
     );
@@ -1908,6 +2469,7 @@ async function handleRevokeUnlocked(
       { name: "Trello card", value: pending.cardId },
     ],
   });
+  void refreshPresenceStats(guild);
   await interaction.editReply(
     result.completed
       ? `Revoked the blacklist for **${robloxUser.name}** and restored ${result.restored.length} saved role(s).`
@@ -1965,6 +2527,15 @@ async function handleInteraction(
     !maintenanceAllowedCommands.has(interaction.commandName)
   ) {
     await interaction.editReply(maintenanceMessage);
+    return;
+  }
+
+  if (interaction.commandName === "settings") {
+    try {
+      await handleSettings(interaction);
+    } catch (error) {
+      await interaction.editReply(error instanceof Error ? error.message : "Could not open settings.");
+    }
     return;
   }
 
@@ -2068,7 +2639,7 @@ async function handleInteraction(
   const setup = await getGuildSetup(interaction.guild.id).catch(() => undefined);
   if (!setup) {
     await interaction.editReply(
-      "This server has not completed bot setup. Ask the server owner or an administrator to run /setup first.",
+      "This server has not completed bot setup. Ask the server owner or an administrator to run /settings first.",
     );
     return;
   }
@@ -2149,9 +2720,12 @@ async function handleInteraction(
       const mappings = trelloMappingsFor(setup);
       await requireTrelloReadiness(mappings);
       const card = await findBlacklistCardByRobloxId(user.id, mappings);
-      await interaction.editReply(card
-        ? `Blacklist record for **${user.name}** (${user.id}): ${card.listType} — ${card.url}`
-        : `No Trello blacklist record was found for **${user.name}** (${user.id}).`);
+      await interaction.editReply({
+        embeds: [brandedEmbed("BLACKLIST LOOKUP", card
+          ? `Blacklist record for **${user.name}** (${user.id}): ${card.listType} — ${card.url}`
+          : `No Trello blacklist record was found for **${user.name}** (${user.id}).`,
+        )],
+      });
     } else if (interaction.commandName === "identity_lookup") {
       const state = await getSecurityState(interaction.guild.id);
       const discordId = interaction.options.getUser("discord_user")?.id;
@@ -2318,10 +2892,14 @@ async function connectDiscord(initialSecurity?: SecurityState): Promise<void> {
       ? { status: "dnd", activities: [{ name: "Security Lockdown", type: ActivityType.Watching }] }
       : initialSecurity?.maintenance.active
         ? { status: "idle", activities: [{ name: "Maintenance", type: ActivityType.Watching }] }
-        : undefined,
+        : { status: "idle", activities: [{ name: "Systems Initialize", type: ActivityType.Watching }] },
   });
 
   discordClient = client;
+  // The presence engine may ask on each rotation; keep that provider purely
+  // in-memory so rotations never trigger member scans, Trello requests, or
+  // persisted-store reads.
+  setPresenceStatsProvider(async () => ({ ...cachedPresenceStats }));
   commandsRegistered = false;
   setupCommandRegistered = false;
   guildSetupComplete = false;
@@ -2343,6 +2921,10 @@ async function connectDiscord(initialSecurity?: SecurityState): Promise<void> {
               maintenance: persistedSecurity?.maintenance.active ?? false,
             });
           }
+            if (config.discordGuildId) {
+              const cachedGuild = readyClient.guilds.cache.get(config.discordGuildId);
+              if (cachedGuild) void refreshPresenceStats(cachedGuild);
+            }
           const moderationEnabled = await registerCommands(readyClient);
             try {
               const setup = config.discordGuildId
@@ -2372,7 +2954,7 @@ async function connectDiscord(initialSecurity?: SecurityState): Promise<void> {
               clearBlacklistSyncTimer();
               setRecoveryStatus(
                 "blocked",
-                "Discord setup is required. Run /setup in the configured server.",
+                "Discord setup is required. Run /settings in the configured server.",
               );
             }
             logger.info(
@@ -2408,6 +2990,10 @@ async function connectDiscord(initialSecurity?: SecurityState): Promise<void> {
           await handleConfirmation(interaction);
           return;
         }
+        if (interaction.customId.startsWith("settings:")) {
+          await handleSettingsComponent(interaction);
+          return;
+        }
         if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
           await interaction.reply({ content: maintenanceMessage, ephemeral: true });
           return;
@@ -2420,6 +3006,10 @@ async function connectDiscord(initialSecurity?: SecurityState): Promise<void> {
       })().catch((error) => replyInteractionError(interaction, error));
     } else if (interaction.isStringSelectMenu()) {
       void (async () => {
+        if (interaction.customId.startsWith("settings:")) {
+          await handleSettingsComponent(interaction);
+          return;
+        }
         if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
           await interaction.reply({ content: maintenanceMessage, ephemeral: true });
           return;
@@ -2428,6 +3018,10 @@ async function connectDiscord(initialSecurity?: SecurityState): Promise<void> {
       })().catch((error) => replyInteractionError(interaction, error));
     } else if (interaction.isModalSubmit()) {
       void (async () => {
+        if (interaction.customId.startsWith("settings-modal:")) {
+          await handleSettingsModal(interaction);
+          return;
+        }
         if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
           await interaction.reply({ content: maintenanceMessage, ephemeral: true });
           return;
@@ -2454,6 +3048,7 @@ async function connectDiscord(initialSecurity?: SecurityState): Promise<void> {
 
   client.on(Events.GuildMemberAdd, (member) => {
     if (member.guild.id !== config.discordGuildId) return;
+    void refreshPresenceStats(member.guild);
     void getGuildSetup(member.guild.id)
       .then((setup) =>
         setup ? enforceBlacklistForJoinedMember(member, setup) : undefined,
@@ -2464,6 +3059,31 @@ async function connectDiscord(initialSecurity?: SecurityState): Promise<void> {
           "Joined member blacklist check failed",
         );
       });
+  });
+
+  client.on(Events.GuildMemberRemove, (member) => {
+    if (member.guild.id !== config.discordGuildId) return;
+    void refreshPresenceStats(member.guild);
+  });
+
+  // Gateway resume does not emit ClientReady again. Re-applying settings is
+  // idempotent in the presence engine and replaces, rather than duplicates,
+  // any pending rotation timer.
+  client.on("shardResume", () => {
+    void (async () => {
+      if (config.discordGuildId) {
+        const resumedGuild = client.guilds.cache.get(config.discordGuildId);
+        if (resumedGuild) await refreshPresenceStats(resumedGuild);
+      }
+      await restorePresenceAfterResume(client);
+    })().catch((error) => {
+      logger.warn({ err: error }, "Could not restore Discord presence after gateway resume");
+    });
+  });
+  client.on("shardDisconnect", () => {
+    // Invalidate a possibly pending statistics read and the old timer. Resume
+    // will apply the persisted state and start exactly one fresh rotation.
+    stopPresenceRotation();
   });
 
   client.on("error", (error) => {
@@ -2529,9 +3149,7 @@ export async function refreshBot(
         persistedSetup ? trelloMappingsFor(persistedSetup) : defaultTrelloMappings(),
       );
       if (!trello.ready) {
-        if (canRenderPresence(discordClient)) {
-          setPresencePriority(discordClient, { serviceFailure: trello.status === "unavailable" });
-        }
+        recordTrelloHealthForPresence(trello.status === "unavailable");
         commandsRegistered = false;
         clearBlacklistSyncTimer();
         setRecoveryStatus("blocked", trello.error);
@@ -2555,9 +3173,7 @@ export async function refreshBot(
       }
 
       resetTrelloRetry();
-      if (canRenderPresence(discordClient)) {
-        setPresencePriority(discordClient, { serviceFailure: false });
-      }
+      recordTrelloHealthForPresence(false);
       if (trigger === "automatic") {
         recovery.lastRetryOutcome = "successful";
       }
@@ -2586,7 +3202,7 @@ export async function refreshBot(
           clearBlacklistSyncTimer();
           setRecoveryStatus(
             "blocked",
-            "Discord setup is required. Run /setup in the configured server.",
+            "Discord setup is required. Run /settings in the configured server.",
           );
         }
         return refreshResult();
@@ -2617,6 +3233,18 @@ export async function refreshBot(
 }
 
 export async function startBot(): Promise<void> {
+  if (!shutdownHooksInstalled) {
+    shutdownHooksInstalled = true;
+    const shutdown = () => {
+      clearTrelloRetry();
+      clearBlacklistSyncTimer();
+      stopPresenceRotation();
+      discordClient?.destroy();
+      discordClient = null;
+    };
+    process.once("SIGTERM", shutdown);
+    process.once("SIGINT", shutdown);
+  }
   const result = await refreshBot();
   if (!result.commandsEnabled) {
     logger.warn(

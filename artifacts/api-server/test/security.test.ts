@@ -187,7 +187,8 @@ function command(
 }
 
 function button(userId: string, customId: string) {
-  return {
+  const localReplies: unknown[] = [];
+  const interaction = {
     isChatInputCommand: () => false,
     isButton: () => true,
     isStringSelectMenu: () => false,
@@ -198,18 +199,57 @@ function button(userId: string, customId: string) {
     user: { id: userId },
     deferred: false,
     replied: false,
-    deferUpdate: async () => undefined,
-    update: async () => undefined,
+    deferUpdate: async () => { interaction.deferred = true; },
+    update: async (value: unknown) => { interaction.replied = true; localReplies.push(value); },
     showModal: async (value: { data: { custom_id: string } }) => {
       shownModals.push({ userId, customId: value.data.custom_id });
     },
     reply: async (value: { content?: string }) => {
+      interaction.replied = true;
+      localReplies.push(value);
       if (value.content) replies.push(value.content);
     },
     followUp: async (value: { content?: string }) => {
+      localReplies.push(value);
       if (value.content) replies.push(value.content);
     },
+    localReplies,
   };
+  return interaction;
+}
+
+function select(userId: string, customId: string, values: string[]) {
+  const localReplies: unknown[] = [];
+  const interaction = {
+    isChatInputCommand: () => false,
+    isButton: () => false,
+    isStringSelectMenu: () => true,
+    isModalSubmit: () => false,
+    customId,
+    values,
+    guild,
+    guildId: guild.id,
+    user: { id: userId },
+    deferred: false,
+    replied: false,
+    deferUpdate: async () => { interaction.deferred = true; },
+    update: async (value: unknown) => { interaction.replied = true; localReplies.push(value); },
+    editReply: async (value: unknown) => { localReplies.push(value); },
+    showModal: async (value: { data: { custom_id: string } }) => {
+      shownModals.push({ userId, customId: value.data.custom_id });
+    },
+    reply: async (value: { content?: string }) => {
+      interaction.replied = true;
+      localReplies.push(value);
+      if (value.content) replies.push(value.content);
+    },
+    followUp: async (value: { content?: string }) => {
+      localReplies.push(value);
+      if (value.content) replies.push(value.content);
+    },
+    localReplies,
+  };
+  return interaction;
 }
 
 function modal(userId: string, customId: string, values: Record<string, string>) {
@@ -307,13 +347,34 @@ function lastMaintenanceConfirmationId(interaction: { localReplies: unknown[] })
   return id;
 }
 
+function lastSettingsSelectId(interaction: { localReplies: unknown[] }): string {
+  const payload = interaction.localReplies.find(
+    (reply): reply is { components: Array<{ components: Array<{ data: { custom_id: string } }> }> } =>
+      typeof reply === "object" && reply !== null && "components" in reply,
+  );
+  const id = payload?.components[0]?.components[0]?.data.custom_id;
+  assert.ok(id?.startsWith("settings:select:"), "settings should render its action dropdown");
+  return id;
+}
+
 async function setMaintenance(active: boolean, actor = "admin-a", reason = "maintenance test"): Promise<void> {
-  const pending = command(actor, "maintenance", {
-    mode: active ? "enable" : "disable",
-    ...(active ? { reason } : {}),
-  });
-  await dispatch(pending);
-  await dispatchRaw(button(actor, lastMaintenanceConfirmationId(pending)));
+  const settings = command(actor, "settings");
+  await dispatch(settings);
+  const selectId = lastSettingsSelectId(settings);
+  const nonce = selectId.split(":").at(-1)!;
+  const action = active ? "settings-action:maintenance-enable" : "settings-action:maintenance-disable";
+  const menu = select(actor, selectId, [`${action}:${nonce}`]);
+  await dispatchRaw(menu);
+  if (active) {
+    const maintenanceModal = shownModals.at(-1);
+    assert.ok(maintenanceModal?.customId.startsWith("settings-modal:maintenance-enable:"));
+    const pending = modal(actor, maintenanceModal!.customId, { reason });
+    await dispatchRaw(pending);
+    await dispatchRaw(button(actor, lastMaintenanceConfirmationId(pending)));
+    return;
+  }
+  // Disable is intentionally confirmation-only; no extra parameter modal.
+  await dispatchRaw(button(actor, lastMaintenanceConfirmationId(menu)));
 }
 
 const originalLogin = Client.prototype.login;
@@ -478,9 +539,12 @@ test("server owner is authorized but remains subject to the same limit", async (
 test("audits an Administrator security-setting change through the setup interaction handler", async () => {
   await setSecurity({ confirmationsRequired: true });
   const beforeAudits = auditEvents.length;
-  await dispatch(command("setup-owner", "setup"));
-  client!.emit("interactionCreate", button("setup-owner", "setup:confirmation"));
-  await settle();
+  const settings = command("setup-owner", "settings");
+  await dispatch(settings);
+  const selectId = lastSettingsSelectId(settings);
+  const nonce = selectId.split(":").at(-1)!;
+  await dispatchRaw(select("setup-owner", selectId, [`setup:security:${nonce}`]));
+  await dispatchRaw(button("setup-owner", `setup:confirmation:${nonce}`));
   const saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
   assert.equal(saved?.security?.confirmationsRequired, false);
   assert.ok(auditEvents.length > beforeAudits, "configuration change must emit an audit event");
@@ -530,16 +594,20 @@ test("setup unlock always presents and requires a confirmation, even if normal c
       startedBy: "admin-a",
     };
   });
-  await dispatch(command("setup-owner", "setup"));
-  client!.emit("interactionCreate", button("setup-owner", "setup:unlock-now"));
-  await settle();
+  const settings = command("setup-owner", "settings");
+  await dispatch(settings);
+  const selectId = lastSettingsSelectId(settings);
+  const nonce = selectId.split(":").at(-1)!;
+  await dispatchRaw(select("setup-owner", selectId, [`setup:security:${nonce}`]));
+  await dispatchRaw(button("setup-owner", `setup:lockdown:${nonce}`));
+  await dispatchRaw(button("setup-owner", `setup:unlock-now:${nonce}`));
   assert.equal(
     (await getSecurityState(guild.id)).lockdown.active,
     true,
     "opening setup unlock must not unlock the server",
   );
 
-  client!.emit("interactionCreate", button("setup-owner", "setup:confirm-unlock"));
+  client!.emit("interactionCreate", button("setup-owner", `setup:confirm-unlock:${nonce}`));
   await settle();
   assert.equal((await getSecurityState(guild.id)).lockdown.active, false);
 });
@@ -606,21 +674,247 @@ test("a target holding a configured protected role is denied before any Trello w
 
 test("rejects setup controls clicked by another administrator and expired setup controls", async () => {
   await setSecurity({});
-  const setup = command("setup-owner", "setup");
+  const setup = command("setup-owner", "settings");
   await dispatch(setup);
-  client!.emit("interactionCreate", button("setup-other", "setup:security"));
-  await settle();
+  const selectId = lastSettingsSelectId(setup);
+  const nonce = selectId.split(":").at(-1)!;
+  await dispatchRaw(select("setup-other", selectId, [`setup:security:${nonce}`]));
   assert.match(replies.at(-1) ?? "", /setup session has expired|belongs to another administrator/i);
 
   const realNow = Date.now;
   Date.now = () => realNow() + 11 * 60_000;
   try {
-    client!.emit("interactionCreate", button("setup-owner", "setup:security"));
-    await settle();
-    assert.match(replies.at(-1) ?? "", /setup session has expired/i);
+    await dispatchRaw(select("setup-owner", selectId, [`setup:security:${nonce}`]));
+    assert.match(replies.at(-1) ?? "", /settings session has expired/i);
   } finally {
     Date.now = realNow;
   }
+});
+
+test("/settings exposes every consolidated action and opens nonce-bound parameter modals", async () => {
+  await setSecurity({ confirmationsRequired: true });
+  shownModals.splice(0);
+  const settings = command("admin-a", "settings");
+  await dispatch(settings);
+  const selectId = lastSettingsSelectId(settings);
+  const nonce = selectId.split(":").at(-1)!;
+  const menu = settings.localReplies.find(
+    (reply): reply is { components: Array<{ components: Array<{ data: { options: Array<{ value: string }> } }> }> } =>
+      typeof reply === "object" && reply !== null && "components" in reply,
+  );
+  const selectData = menu?.components[0]?.components[0] as unknown as {
+    data?: { options?: Array<{ value: string }> };
+    options?: Array<{ value: string }>;
+  } | undefined;
+  const choices = (selectData?.data?.options ?? selectData?.options ?? [])
+    .map((choice) => (choice.value ?? (choice as unknown as { data?: { value?: string } }).data?.value ?? "")
+      .replace(/:[a-f0-9]{32}$/, ""));
+  for (const required of [
+    "setup:blacklist", "setup:trello", "setup:security", "setup:audit",
+    "setup:discord", "setup:presence", "setup:identity", "setup:view",
+    "settings-action:group", "settings-action:note", "settings-action:sync",
+    "settings-action:identity-lookup", "settings-action:status",
+    "settings-action:maintenance-enable", "settings-action:maintenance-disable",
+    "settings-action:lockdown", "settings-action:unlock",
+  ]) assert.ok(choices.includes(required), `missing consolidated action ${required}`);
+
+  for (const [action, expectedModal] of [
+    ["settings-action:group", "settings-modal:group:"],
+    ["settings-action:note", "settings-modal:note:"],
+    ["settings-action:identity-lookup", "settings-modal:identity-lookup:"],
+    ["settings-action:maintenance-enable", "settings-modal:maintenance-enable:"],
+    ["settings-action:lockdown", "settings-modal:lockdown:"],
+    ["settings-action:unlock", "settings-modal:unlock:"],
+  ] as const) {
+    await dispatchRaw(select("admin-a", selectId, [`${action}:${nonce}`]));
+    assert.ok(shownModals.at(-1)?.customId.startsWith(expectedModal), `${action} should open its modal`);
+  }
+});
+
+test("a /settings group-blacklist modal preserves confirmation binding and executes real moderation", async () => {
+  await setSecurity({ confirmationsRequired: true, perAdminLimit: 20, globalLimit: 20 });
+  const before = trelloCardCreations.length;
+  const settings = command("admin-a", "settings");
+  await dispatch(settings);
+  const selectId = lastSettingsSelectId(settings);
+  const nonce = selectId.split(":").at(-1)!;
+  await dispatchRaw(select("admin-a", selectId, [`settings-action:group:${nonce}`]));
+  const groupModal = shownModals.at(-1);
+  assert.ok(groupModal?.customId.startsWith("settings-modal:group:"));
+  const submitted = modal("admin-a", groupModal!.customId, { id: "777001", reason: "settings modal regression" });
+  await dispatchRaw(submitted);
+  const confirmation = lastConfirmationId(submitted);
+  await dispatchRaw(button("setup-other", confirmation));
+  assert.equal(trelloCardCreations.length, before, "a foreign administrator cannot use the modal confirmation");
+  await dispatchRaw(button("admin-a", confirmation));
+  assert.equal(trelloCardCreations.length, before + 1);
+});
+
+test("/settings restricts the maintenance menu while allowing emergency status", async () => {
+  await setSecurity({});
+  await setMaintenance(true, "admin-a", "settings emergency restriction");
+  const settings = command("admin-a", "settings");
+  await dispatch(settings);
+  const selectId = lastSettingsSelectId(settings);
+  const nonce = selectId.split(":").at(-1)!;
+  const menu = settings.localReplies.find(
+    (reply): reply is { components: Array<{ components: Array<{ data: { options: Array<{ value: string }> } }> }> } =>
+      typeof reply === "object" && reply !== null && "components" in reply,
+  );
+  const selectData = menu?.components[0]?.components[0] as unknown as {
+    data?: { options?: Array<{ value: string }> };
+    options?: Array<{ value: string }>;
+  } | undefined;
+  const choices = (selectData?.data?.options ?? selectData?.options ?? [])
+    .map((choice) => (choice.value ?? (choice as unknown as { data?: { value?: string } }).data?.value ?? "")
+      .replace(/:[a-f0-9]{32}$/, ""));
+  assert.deepEqual(choices.sort(), [
+    "settings-action:status", "settings-action:maintenance-enable",
+    "settings-action:maintenance-disable", "settings-action:lockdown",
+    "settings-action:unlock",
+  ].sort());
+  const status = select("admin-a", selectId, [`settings-action:status:${nonce}`]);
+  await dispatchRaw(status);
+  assert.ok(status.replied, "status selection must acknowledge with update");
+  const beforeRequests = providerRequests;
+  await dispatchRaw(select("admin-a", selectId, [`settings-action:group:${nonce}`]));
+  assert.equal(providerRequests, beforeRequests, "maintenance must block forged normal actions before providers");
+  assert.match(replies.at(-1) ?? "", /BOT UNDER MAINTENANCE/i);
+  await setMaintenance(false, "admin-a", "restriction test complete");
+});
+
+test("/settings performs first-time audit-channel setup through its modal", async () => {
+  await writeFile(config.setupFile, JSON.stringify({ guilds: [] }), "utf8");
+  await mutateSecurityState(guild.id, (state) => {
+    state.maintenance = {
+      active: false, reason: "", startedAt: null, startedBy: null,
+      revision: state.maintenance.revision + 1,
+    };
+  });
+  const settings = command("admin-a", "settings");
+  await dispatch(settings);
+  const selectId = lastSettingsSelectId(settings);
+  const nonce = selectId.split(":").at(-1)!;
+  await dispatchRaw(select("admin-a", selectId, [`settings-action:initial-audit:${nonce}`]));
+  const initial = shownModals.at(-1);
+  assert.ok(initial?.customId.startsWith("settings-modal:initial-audit:"));
+  await dispatchRaw(modal("admin-a", initial!.customId, { audit_channel_id: "12345678901234567" }));
+  const persisted = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  assert.equal(persisted?.auditChannelId, "12345678901234567");
+  assert.equal(persisted?.presence?.activities.length, 9);
+});
+
+test("presence settings persist activity selections and reject unsafe custom templates", async () => {
+  const { presenceSettingsFor } = await import("../src/bot/setup-store.ts");
+  const { validatePresenceSettings, DEFAULT_PRESENCE_SETTINGS } = await import("../src/bot/presence.ts");
+  const presence = validatePresenceSettings({
+    ...DEFAULT_PRESENCE_SETTINGS,
+    activities: [...DEFAULT_PRESENCE_SETTINGS.activities, "Warehouse Operations"],
+    disabledActivities: ["Trello Records"],
+    minIntervalMinutes: 2,
+    maxIntervalMinutes: 15,
+  });
+  await saveGuildSetup({
+    guildId: "presence-settings-persistence", moderatorRoleId: "role", auditChannelId: "12345678901234567",
+    presence, updatedBy: "admin-a", updatedAt: new Date().toISOString(),
+  });
+  const saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup("presence-settings-persistence");
+  assert.deepEqual(saved?.presence, { ...presence, presenceConfigVersion: 2 });
+  // Existing one-minute records are migrated without discarding custom entries.
+  const migrated = presenceSettingsFor({ ...saved!, presence: { ...presence, minIntervalMinutes: 1 } });
+  assert.equal(migrated.minIntervalMinutes, 2);
+  assert.ok(migrated.activities.includes("Warehouse Operations"));
+  const legacy = presenceSettingsFor({
+    ...saved!,
+    presence: {
+      enabled: false, rotationEnabled: false, minIntervalMinutes: 5, maxIntervalMinutes: 20,
+      activities: ["Customers", "Quartermaster Corps", "Blacklist Records", "Supply Operations", "Active Blacklists", "Custom Legacy"],
+      disabledActivities: ["Active Blacklists", "Customers"],
+    },
+  });
+  assert.equal(legacy.activities.length, 10);
+  assert.ok(legacy.activities.includes("Custom Legacy"));
+  assert.ok(legacy.disabledActivities?.includes("{ACTIVE_BLACKLISTS} Active Blacklists"));
+  assert.equal(legacy.enabled, false);
+  assert.equal(legacy.rotationEnabled, false);
+  const v2 = presenceSettingsFor({
+    ...saved!,
+    presence: {
+      presenceConfigVersion: 2, enabled: true, rotationEnabled: true, minIntervalMinutes: 2, maxIntervalMinutes: 9,
+      activities: ["Customers", "Only My Activity"], disabledActivities: ["Only My Activity"],
+    },
+  });
+  assert.deepEqual(v2.activities, ["Customers", "Only My Activity"], "versioned settings are never overwritten");
+  await assert.rejects(
+    async () => validatePresenceSettings({ ...presence, activities: ["Unknown {CODE}"] }),
+    /Only \{ACTIVE_BLACKLISTS\} and \{SERVER_MEMBERS\}/,
+  );
+  await assert.rejects(
+    async () => validatePresenceSettings({ ...presence, activities: ["@everyone"] }),
+    /mentions are not allowed/i,
+  );
+});
+
+test("/settings presence controls nonce-bind 128-character custom add and remove", async () => {
+  await setSecurity({});
+  const open = async () => {
+    const settings = command("admin-a", "settings");
+    await dispatch(settings);
+    const selectId = lastSettingsSelectId(settings);
+    const nonce = selectId.split(":").at(-1)!;
+    const category = select("admin-a", selectId, [`setup:presence:${nonce}`]);
+    await dispatchRaw(category);
+    return { nonce, category };
+  };
+  const customId = (repliesFor: unknown[], prefix: string) => {
+    const match = JSON.stringify(repliesFor).match(new RegExp(`"custom_id":"(${prefix}:[a-f0-9]{32})"`));
+    assert.ok(match?.[1], `expected ${prefix} custom ID`);
+    return match[1];
+  };
+  const first = await open();
+  const addId = customId(first.category.localReplies, "setup:presence-add");
+  await dispatchRaw(button("setup-other", addId));
+  assert.match(replies.at(-1) ?? "", /belongs to another administrator|settings session has expired/i);
+  await dispatchRaw(button("admin-a", addId));
+  const addModal = shownModals.at(-1);
+  const longActivity = "W".repeat(128);
+  assert.ok(addModal?.customId.startsWith("setup-modal:presence-add:"));
+  await dispatchRaw(modal("admin-a", addModal!.customId, { activity: longActivity }));
+  assert.ok((await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id))?.presence?.activities.includes(longActivity));
+
+  const second = await open();
+  const activitiesId = customId(second.category.localReplies, "setup:presence-activities");
+  const activitiesButton = button("admin-a", activitiesId);
+  await dispatchRaw(activitiesButton);
+  const removeId = customId(activitiesButton.localReplies, "setup:presence-remove-custom");
+  const removeButton = button("admin-a", removeId);
+  await dispatchRaw(removeButton);
+  const removeSelect = customId(removeButton.localReplies, "setup:presence-remove-select");
+  await dispatchRaw(select("admin-a", removeSelect, ["setup:presence-remove:0"]));
+  assert.ok(!(await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id))?.presence?.activities.includes(longActivity));
+});
+
+test("gateway disconnect stops rotation and resume reapplies persisted priority", async () => {
+  await mutateSecurityState(guild.id, (state) => {
+    state.maintenance = {
+      active: true, reason: "resume regression", startedAt: new Date().toISOString(), startedBy: "admin-a",
+      revision: state.maintenance.revision + 1,
+    };
+    state.lockdown = {
+      active: true, automatic: false, reason: "resume regression", startedAt: new Date().toISOString(), startedBy: "admin-a",
+    };
+  });
+  presenceCalls.splice(0);
+  client!.emit("shardDisconnect", new Event("close"), 0);
+  client!.emit("shardResume", 0, 0);
+  await settle();
+  assert.deepEqual(presenceCalls.at(-1), {
+    status: "dnd", activities: [{ name: "Security Lockdown", type: 3 }],
+  });
+  await mutateSecurityState(guild.id, (state) => {
+    state.maintenance = { active: false, reason: "", startedAt: null, startedBy: null, revision: state.maintenance.revision + 1 };
+    state.lockdown = { active: false, automatic: false, reason: "", startedAt: null, startedBy: null };
+  });
 });
 
 test("persists lockdown and rate actions across a fresh security-store module instance", async () => {

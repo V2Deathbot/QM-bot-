@@ -1,0 +1,519 @@
+Add a polished Discord Presence system to my existing Quartermaster bot.
+
+IMPORTANT:
+- Do not rebuild or modify unrelated bot systems.
+- Reuse the existing Presence Settings in /setup.
+- Do not implement fake Discord Rich Presence features that normal bot accounts do not support.
+- Use the capabilities supported by the current discord.js version.
+- The presence system must survive/reinitialize correctly after reconnects.
+
+==================================================
+DEFAULT PRESENCE
+==================================================
+
+The primary/default presence should be:
+
+Status:
+Online
+
+Activity Type:
+WATCHING
+
+Activity:
+Customers
+
+So Discord should display approximately:
+
+Quartermaster
+Watching Customers
+
+"Customers" should be the main/default activity.
+
+
+==================================================
+ROTATING ACTIVITIES
+==================================================
+
+Add several Quartermaster-themed activities.
+
+DEFAULT ACTIVITIES:
+
+Watching Customers
+Watching Blacklist Records
+Watching Quartermaster Corps
+Watching Supply Operations
+Watching Trello Records
+Watching Security Logs
+Watching Personnel Records
+
+Also add dynamic activities:
+
+Watching {ACTIVE_BLACKLISTS} Active Blacklists
+Watching {SERVER_MEMBERS} Personnel
+
+For example:
+
+Watching 14 Active Blacklists
+
+or:
+
+Watching 1,284 Personnel
+
+Only use dynamic values when the required data is available.
+
+If database/stat retrieval fails, simply skip that dynamic activity instead of breaking presence rotation.
+
+
+==================================================
+RANDOM ROTATION
+==================================================
+
+Do NOT rotate at a fixed interval.
+
+Choose a new random interval after every presence change.
+
+DEFAULT:
+
+Minimum:
+5 minutes
+
+Maximum:
+20 minutes
+
+Example:
+
+Watching Customers
+↓
+wait 13 minutes
+
+Watching Security Logs
+↓
+wait 7 minutes
+
+Watching 14 Active Blacklists
+↓
+wait 19 minutes
+
+Watching Supply Operations
+
+The next delay must be randomly selected after each rotation.
+
+Avoid unnecessary Discord presence API updates.
+
+
+==================================================
+WEIGHTED ACTIVITIES
+==================================================
+
+"Watching Customers" should be the MAIN presence.
+
+Make activity selection weighted.
+
+Suggested weighting:
+
+Customers:
+30%
+
+Blacklist Records:
+15%
+
+Quartermaster Corps:
+15%
+
+Supply Operations:
+10%
+
+Security Logs:
+10%
+
+Trello Records:
+5%
+
+Personnel Records:
+5%
+
+Active Blacklists:
+5%
+
+Personnel:
+5%
+
+Do not immediately repeat the exact same activity twice in a row.
+
+
+==================================================
+SPECIAL SECURITY PRESENCE
+==================================================
+
+Allow temporary presence overrides for important bot states.
+
+SECURITY LOCKDOWN ACTIVE:
+
+Change presence to:
+
+DND
+
+Watching Security Lockdown
+
+This should override normal rotation.
+
+Once lockdown ends:
+
+Return to Online status
+and resume normal presence rotation.
+
+
+==================================================
+TRELLO OUTAGE
+==================================================
+
+If Trello becomes unavailable for a meaningful amount of time, optionally display:
+
+Watching Trello Connection
+
+Status:
+Idle
+
+Do NOT change presence because of one failed Trello request.
+
+Only trigger this after the existing health monitoring determines Trello is genuinely unavailable.
+
+When Trello recovers:
+return to normal rotation.
+
+
+==================================================
+STARTUP PRESENCE
+==================================================
+
+While the bot is initializing:
+
+Status:
+Idle
+
+Activity:
+
+Watching Systems Initialize
+
+After Discord, database and configuration initialization completes:
+
+Status:
+Online
+
+Activity:
+
+Watching Customers
+
+Then begin normal randomized rotation.
+
+
+==================================================
+PRESENCE PRIORITY
+==================================================
+
+Presence priority should be:
+
+1. SECURITY LOCKDOWN
+2. MAJOR SERVICE FAILURE
+3. STARTUP
+4. NORMAL ROTATION
+
+Higher priority states always override lower priority states.
+
+Example:
+
+Normal:
+Watching Customers
+
+Trello outage:
+Watching Trello Connection
+
+Security lockdown occurs:
+Watching Security Lockdown
+
+Lockdown ends but Trello is still unavailable:
+Watching Trello Connection
+
+Trello recovers:
+Watching Customers
+
+
+==================================================
+/SETUP INTEGRATION
+==================================================
+
+Integrate everything into the EXISTING:
+
+/setup
+→ Presence Settings
+
+Do not create another configuration system.
+
+Display something similar to:
+
+QUARTERMASTER PRESENCE
+
+Status:
+Enabled
+
+Primary Activity:
+Watching Customers
+
+Rotation:
+Enabled
+
+Interval:
+5–20 minutes
+
+Dynamic Activities:
+Enabled
+
+Lockdown Override:
+Enabled
+
+Activities:
+9 configured
+
+[ Enable / Disable ]
+[ Activities ]
+[ Rotation ]
+[ Dynamic Status ]
+[ Preview ]
+[ Reset Defaults ]
+[ Back ]
+
+
+==================================================
+ACTIVITY CONFIGURATION
+==================================================
+
+Under:
+
+Presence Settings
+→ Activities
+
+Allow administrators to enable/disable individual activities.
+
+Example:
+
+✅ Customers
+✅ Blacklist Records
+✅ Quartermaster Corps
+✅ Supply Operations
+✅ Trello Records
+✅ Security Logs
+✅ Personnel Records
+✅ Active Blacklists
+✅ Personnel
+
+Do NOT require administrators to edit source code.
+
+
+==================================================
+CUSTOM ACTIVITIES
+==================================================
+
+Allow administrators to add custom WATCHING activities through a Discord modal.
+
+Example:
+
+"Warehouse Operations"
+
+would display:
+
+Watching Warehouse Operations
+
+Validate the text.
+
+Maximum length must respect Discord's current presence limitations.
+
+Prevent:
+
+@everyone
+@here
+Discord mention abuse
+empty activities
+control characters
+
+Store custom activities persistently.
+
+
+==================================================
+ROTATION CONFIGURATION
+==================================================
+
+Presence Settings
+→ Rotation
+
+Allow:
+
+Rotation:
+ON/OFF
+
+Minimum Interval:
+5 minutes
+
+Maximum Interval:
+20 minutes
+
+Validate:
+
+Minimum cannot exceed maximum.
+
+Do not allow extremely short intervals.
+
+Hard minimum:
+2 minutes
+
+Recommended default:
+5–20 minutes.
+
+
+==================================================
+DYNAMIC PLACEHOLDERS
+==================================================
+
+Internally support placeholders such as:
+
+{ACTIVE_BLACKLISTS}
+{SERVER_MEMBERS}
+
+Example configured activity:
+
+{ACTIVE_BLACKLISTS} Active Blacklists
+
+becomes:
+
+Watching 17 Active Blacklists
+
+Do not allow arbitrary code/template execution through placeholders.
+
+Only explicitly supported placeholders should work.
+
+
+==================================================
+BOT IMAGE / BRANDING
+==================================================
+
+Use the Quartermaster image already provided/configured for the bot where Discord actually supports images, such as:
+
+/help
+/setup
+/security_status
+/blacklist_lookup
+confirmation embeds
+
+Do NOT attempt to force an image into normal Discord bot presence if Discord does not support it.
+
+If the current image is an expiring Discord CDN URL, do not depend permanently on the URL.
+
+Prefer an existing permanent/local asset if the project already has one.
+
+
+==================================================
+RECONNECT HANDLING
+==================================================
+
+Discord may disconnect/reconnect.
+
+After reconnect:
+
+- Do not create multiple presence timers.
+- Cancel/replace stale timers.
+- Restore the appropriate current presence.
+- Respect security lockdown state.
+- Respect service-health state.
+- Resume rotation safely.
+
+There must NEVER be multiple presence rotation loops running simultaneously.
+
+
+==================================================
+SHUTDOWN
+==================================================
+
+Cleanly stop the presence rotation timer during graceful shutdown.
+
+Do not leave unnecessary intervals/timeouts.
+
+
+==================================================
+AUDIT
+==================================================
+
+Normal automatic presence rotations should NOT generate audit messages.
+
+Otherwise the audit channel would be spammed every 5–20 minutes.
+
+Only audit administrator configuration changes such as:
+
+Presence Enabled
+Presence Disabled
+Activity Added
+Activity Removed
+Rotation Changed
+
+Do not audit ordinary automatic rotations.
+
+
+==================================================
+EXPECTED EXPERIENCE
+==================================================
+
+Most of the time somebody looking at the bot should see:
+
+🟢 Quartermaster
+Watching Customers
+
+Occasionally:
+
+🟢 Quartermaster
+Watching Blacklist Records
+
+🟢 Quartermaster
+Watching Quartermaster Corps
+
+🟢 Quartermaster
+Watching 14 Active Blacklists
+
+🟢 Quartermaster
+Watching Security Logs
+
+During startup:
+
+🟡 Quartermaster
+Watching Systems Initialize
+
+During Trello outage:
+
+🟡 Quartermaster
+Watching Trello Connection
+
+During security lockdown:
+
+🔴 Quartermaster
+Watching Security Lockdown
+
+
+==================================================
+IMPLEMENTATION REQUIREMENTS
+==================================================
+
+Before implementing:
+
+1. Inspect the existing presence implementation.
+2. Inspect existing /setup Presence Settings.
+3. Reuse existing configuration/database systems.
+4. Do not create duplicate timers.
+5. Do not modify unrelated blacklist functionality.
+6. Use the discord.js version currently installed by the project.
+7. Verify which Discord presence capabilities normal bot accounts actually support.
+8. Implement only supported functionality.
+9. Test reconnect behavior.
+10. Test lockdown override.
+11. Test randomized rotation.
+12. Test dynamic blacklist count.
+13. Test setup changes persisting after restart.
+14. Report what was changed.
+
+Do not change Discord tokens, Trello credentials, existing blacklist records, or unrelated configuration.
