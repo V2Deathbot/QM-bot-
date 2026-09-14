@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Collection } from "discord.js";
+import { Client, Collection, GuildManager } from "discord.js";
 
 const snapshotDirectory = await mkdtemp(
   path.join(os.tmpdir(), "blacklist-bot-tests-"),
@@ -28,6 +28,7 @@ const { getBotStatus, handleBlacklist, refreshBot } =
 const { default: app } = await import("../src/app.ts");
 
 type MutableTrelloConfig = {
+  discordGuildId: string | undefined;
   discordToken: string | undefined;
   trelloApiKey: string | undefined;
   trelloToken: string | undefined;
@@ -49,7 +50,10 @@ function requestPath(input: RequestInfo | URL): string {
   return new URL(input.toString()).pathname;
 }
 
-async function requestBotStatus(): Promise<{
+async function requestBotEndpoint(
+  method: "GET" | "POST",
+  path: string,
+): Promise<{
   statusCode: number;
   body: Record<string, unknown>;
   raw: string;
@@ -73,8 +77,8 @@ async function requestBotStatus(): Promise<{
           {
             hostname: "127.0.0.1",
             port: address.port,
-            path: "/api/bot/status",
-            method: "GET",
+            path,
+            method,
           },
           (response) => {
             const chunks: Buffer[] = [];
@@ -101,6 +105,14 @@ async function requestBotStatus(): Promise<{
       server.close((error) => (error ? reject(error) : resolve()));
     });
   }
+}
+
+async function requestBotStatus() {
+  return requestBotEndpoint("GET", "/api/bot/status");
+}
+
+async function requestBotRefresh() {
+  return requestBotEndpoint("POST", "/api/bot/refresh");
 }
 
 function restoreTrelloConfig(previous: MutableTrelloConfig): void {
@@ -422,6 +434,95 @@ test("keeps moderation commands disabled while Trello setup is incomplete", asyn
     assert.equal(result.recoveryStatus, "blocked");
     assert.match(result.error ?? "", /Create or rename them, then refresh the bot/);
   } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("keeps commands disabled after registration failure and enables them on retry", async () => {
+  const previousConfig = { ...mutableTrelloConfig };
+  const originalFetch = globalThis.fetch;
+  const originalLogin = Client.prototype.login;
+  const originalGuildFetch = GuildManager.prototype.fetch;
+  const configuredListNames = [...new Set(Object.values(config.trelloListNames))];
+  let trelloReady = false;
+  let registrationAttempts = 0;
+
+  Object.assign(mutableTrelloConfig, {
+    discordGuildId: "test-guild",
+    discordToken: "test-discord-token",
+  });
+  globalThis.fetch = async () =>
+    jsonResponse(
+      trelloReady
+        ? configuredListNames.map((name, index) => ({
+            id: `list-${index}`,
+            name,
+          }))
+        : [{ id: "list-present", name: configuredListNames[0] }],
+    );
+  (Client.prototype as unknown as {
+    login: (token?: string) => Promise<string>;
+  }).login = async function (this: Client) {
+    (this as unknown as { user: { tag: string } }).user = {
+      tag: "test-bot#0000",
+    };
+    this.emit("ready", this);
+    return "test-discord-token";
+  };
+  (GuildManager.prototype as unknown as {
+    fetch: () => Promise<{ commands: { set: () => Promise<void> } }>;
+  }).fetch = async () => ({
+    commands: {
+      set: async () => {
+        registrationAttempts += 1;
+        if (registrationAttempts === 1) {
+          throw new Error("Discord command registration failed");
+        }
+      },
+    },
+  });
+
+  try {
+    const blocked = await refreshBot();
+    assert.equal(blocked.trelloReady, false);
+    assert.equal(blocked.commandsEnabled, false);
+    assert.equal(blocked.recoveryStatus, "blocked");
+
+    trelloReady = true;
+    const failedRefresh = await requestBotRefresh();
+    const failedBody = failedRefresh.body as {
+      commandsEnabled: boolean;
+      recoveryStatus: string;
+      error: string | null;
+    };
+    assert.equal(failedRefresh.statusCode, 503);
+    assert.equal(failedBody.commandsEnabled, false);
+    assert.equal(failedBody.recoveryStatus, "blocked");
+    assert.match(failedBody.error ?? "", /Discord command registration failed/);
+    assert.equal(getBotStatus().commandsEnabled, false);
+
+    const successfulRefresh = await requestBotRefresh();
+    const successfulBody = successfulRefresh.body as {
+      commandsEnabled: boolean;
+      recoveryStatus: string;
+      trelloReady: boolean;
+    };
+    assert.equal(successfulRefresh.statusCode, 200);
+    assert.equal(successfulBody.commandsEnabled, true);
+    assert.equal(successfulBody.recoveryStatus, "successful");
+    assert.equal(successfulBody.trelloReady, true);
+    assert.equal(getBotStatus().commandsEnabled, true);
+    assert.equal(registrationAttempts, 2);
+  } finally {
+    await refreshBot();
+    (Client.prototype as unknown as { login: typeof originalLogin }).login =
+      originalLogin;
+    (
+      GuildManager.prototype as unknown as {
+        fetch: typeof originalGuildFetch;
+      }
+    ).fetch = originalGuildFetch;
+    restoreTrelloConfig(previousConfig);
     globalThis.fetch = originalFetch;
   }
 });
