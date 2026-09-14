@@ -1,1 +1,2 @@
 - [Discord privileged intents](discord-privileged-intents.md) — Gateway “Used disallowed intents” errors require enabling the exact app’s privileged intent in Discord, not a code-side workaround.
+- [Role snapshot runtime state](role-snapshot-runtime-state.md) — File cleanup requires a bot restart because snapshots are cached in memory.
