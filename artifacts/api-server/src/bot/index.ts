@@ -150,7 +150,7 @@ async function restoreRoles(member: GuildMember, roleIds: string[]): Promise<voi
   }
 }
 
-async function handleBlacklist(
+export async function handleBlacklist(
   interaction: ChatInputCommandInteraction,
 ): Promise<void> {
   const username = interaction.options.getString("user", true);
