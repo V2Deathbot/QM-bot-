@@ -1978,20 +1978,25 @@ async function connectDiscord(): Promise<void> {
       void registerCommands(readyClient)
         .then((moderationEnabled) => {
           void (async () => {
+            try {
+              const setup = config.discordGuildId
+                ? await getGuildSetup(config.discordGuildId)
+                : undefined;
+              const presence = setup ? presenceSettingsFor(setup) : DEFAULT_PRESENCE_SETTINGS;
+              applyPresenceSettings(readyClient, presence);
+              logger.info(
+                { enabled: presence.enabled, activity: presence.enabled ? presence.activities[0] : null },
+                "Discord presence applied",
+              );
+            } catch (error) {
+              logger.warn({ err: error }, "Could not apply Discord presence settings");
+            }
             if (moderationEnabled) {
               setRecoveryStatus("successful");
               const guild = await readyClient.guilds.fetch(
                 config.discordGuildId!,
               );
               await observeExistingAdministrators(guild);
-              const setup = await getGuildSetup(guild.id);
-              if (setup) {
-                try {
-                  applyPresenceSettings(readyClient, presenceSettingsFor(setup));
-                } catch (error) {
-                  logger.warn({ err: error }, "Could not apply Discord presence settings");
-                }
-              }
               await runGuildBlacklistSync(guild, "startup");
             } else {
               clearBlacklistSyncTimer();
