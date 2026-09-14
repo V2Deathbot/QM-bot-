@@ -23,13 +23,17 @@ const { findActiveSnapshot, revokeRoleSnapshot, saveRoleSnapshot } =
   await import("../src/bot/role-store.ts");
 const { checkTrelloReadiness, revokeBlacklistCard } =
   await import("../src/bot/trello.ts");
-const { handleBlacklist, refreshBot } = await import("../src/bot/index.ts");
+const { getBotStatus, handleBlacklist, refreshBot } =
+  await import("../src/bot/index.ts");
 const { default: app } = await import("../src/app.ts");
 
 type MutableTrelloConfig = {
+  discordToken: string | undefined;
   trelloApiKey: string | undefined;
   trelloToken: string | undefined;
   trelloBoardId: string | undefined;
+  trelloRetryBaseDelayMs: number;
+  trelloRetryMaxDelayMs: number;
 };
 
 const mutableTrelloConfig = config as unknown as MutableTrelloConfig;
@@ -418,6 +422,79 @@ test("keeps moderation commands disabled while Trello setup is incomplete", asyn
     assert.equal(result.recoveryStatus, "blocked");
     assert.match(result.error ?? "", /Create or rename them, then refresh the bot/);
   } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("shows the next automatic Trello retry in bot status", async () => {
+  const previousConfig = { ...mutableTrelloConfig };
+  const originalFetch = globalThis.fetch;
+  Object.assign(mutableTrelloConfig, {
+    trelloRetryBaseDelayMs: 60_000,
+    trelloRetryMaxDelayMs: 120_000,
+  });
+  globalThis.fetch = async () =>
+    jsonResponse({ error: "Trello temporarily unavailable" }, 503);
+
+  try {
+    const result = await refreshBot();
+    const response = await requestBotStatus();
+    const recovery = response.body.recovery as {
+      retryCount: number;
+      nextRetryAt: string | null;
+      lastRetryAt: string | null;
+      lastRetryOutcome: string | null;
+    };
+    const retryScheduledFor = Date.parse(recovery.nextRetryAt ?? "");
+
+    assert.equal(result.trello.status, "unavailable");
+    assert.equal(response.statusCode, 200);
+    assert.equal(recovery.retryCount, 1);
+    assert.equal(recovery.lastRetryAt, null);
+    assert.equal(recovery.lastRetryOutcome, null);
+    assert.ok(retryScheduledFor > Date.now());
+    assert.ok(retryScheduledFor <= Date.now() + 120_000);
+  } finally {
+    Object.assign(mutableTrelloConfig, { trelloApiKey: undefined });
+    await refreshBot();
+    restoreTrelloConfig(previousConfig);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("automatically retries Trello readiness and resets backoff after recovery", async () => {
+  const previousConfig = { ...mutableTrelloConfig };
+  const originalFetch = globalThis.fetch;
+  const configuredListNames = [...new Set(Object.values(config.trelloListNames))];
+  let requestCount = 0;
+  Object.assign(mutableTrelloConfig, {
+    discordToken: undefined,
+    trelloRetryBaseDelayMs: 5,
+    trelloRetryMaxDelayMs: 5,
+  });
+  globalThis.fetch = async () => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return jsonResponse({ error: "Trello temporarily unavailable" }, 503);
+    }
+    return jsonResponse(
+      configuredListNames.map((name, index) => ({ id: `list-${index}`, name })),
+    );
+  };
+
+  try {
+    await refreshBot();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const status = getBotStatus();
+    assert.equal(requestCount, 2);
+    assert.equal(status.recovery.retryCount, 0);
+    assert.equal(status.recovery.nextRetryAt, null);
+    assert.equal(status.recovery.lastRetryOutcome, "successful");
+    assert.ok(status.recovery.lastRetryAt);
+  } finally {
+    await refreshBot();
+    restoreTrelloConfig(previousConfig);
     globalThis.fetch = originalFetch;
   }
 });

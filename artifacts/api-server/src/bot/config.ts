@@ -6,6 +6,14 @@ export const config = {
   trelloApiKey: process.env["TRELLO_API_KEY"],
   trelloToken: process.env["TRELLO_TOKEN"],
   trelloBoardId: process.env["TRELLO_BOARD_ID"],
+  trelloRetryBaseDelayMs: parseDelay(
+    process.env["TRELLO_RETRY_BASE_DELAY_MS"],
+    30_000,
+  ),
+  trelloRetryMaxDelayMs: parseDelay(
+    process.env["TRELLO_RETRY_MAX_DELAY_MS"],
+    5 * 60_000,
+  ),
   trelloListNames: {
     appealable:
       process.env["TRELLO_LIST_APPEALABLE"] ?? "Appealable Blacklist",
@@ -19,6 +27,11 @@ export const config = {
   snapshotFile:
     process.env["ROLE_SNAPSHOT_FILE"] ?? "data/role-snapshots.json",
 } as const;
+
+function parseDelay(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : fallback;
+}
 
 export function getMissingConfiguration(): string[] {
   const required = [

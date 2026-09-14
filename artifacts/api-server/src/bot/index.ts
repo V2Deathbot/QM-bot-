@@ -95,12 +95,17 @@ const commands = [
 ].map((command) => command.toJSON());
 
 export type BotRecoveryStatus = "pending" | "successful" | "blocked";
+export type BotRetryOutcome = "pending" | "successful" | "blocked";
 
 interface BotRecoveryState {
   status: BotRecoveryStatus;
   lastAttemptAt: string | null;
   lastSuccessfulAt: string | null;
   error: string | null;
+  retryCount: number;
+  nextRetryAt: string | null;
+  lastRetryAt: string | null;
+  lastRetryOutcome: BotRetryOutcome | null;
 }
 
 const recovery: BotRecoveryState = {
@@ -108,11 +113,49 @@ const recovery: BotRecoveryState = {
   lastAttemptAt: null,
   lastSuccessfulAt: null,
   error: null,
+  retryCount: 0,
+  nextRetryAt: null,
+  lastRetryAt: null,
+  lastRetryOutcome: null,
 };
 
 let discordClient: Client | null = null;
 let commandsRegistered = false;
 let recoveryAttempt: Promise<BotRefreshResult> | null = null;
+let trelloRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearTrelloRetry(): void {
+  if (trelloRetryTimer) {
+    clearTimeout(trelloRetryTimer);
+    trelloRetryTimer = null;
+  }
+  recovery.nextRetryAt = null;
+}
+
+function resetTrelloRetry(): void {
+  clearTrelloRetry();
+  recovery.retryCount = 0;
+}
+
+function scheduleTrelloRetry(): void {
+  if (trelloRetryTimer) return;
+
+  const delay = Math.min(
+    config.trelloRetryBaseDelayMs * 2 ** recovery.retryCount,
+    config.trelloRetryMaxDelayMs,
+  );
+  recovery.retryCount += 1;
+  recovery.nextRetryAt = new Date(Date.now() + delay).toISOString();
+
+  trelloRetryTimer = setTimeout(() => {
+    trelloRetryTimer = null;
+    recovery.nextRetryAt = null;
+    void refreshBot("automatic").catch((error) => {
+      logger.error({ err: error }, "Automatic bot recovery retry failed");
+    });
+  }, delay);
+  trelloRetryTimer.unref?.();
+}
 
 function keyFor(guildId: string, robloxUserId: number): string {
   return `${guildId}:${robloxUserId}`;
@@ -422,19 +465,37 @@ export interface BotRefreshResult {
   error: string | null;
 }
 
-export async function refreshBot(): Promise<BotRefreshResult> {
+export async function refreshBot(
+  trigger: "manual" | "automatic" = "manual",
+): Promise<BotRefreshResult> {
   if (recoveryAttempt) {
     return recoveryAttempt;
   }
 
+  if (trigger === "manual") {
+    clearTrelloRetry();
+  }
+
   recoveryAttempt = (async () => {
     recovery.lastAttemptAt = new Date().toISOString();
+    if (trigger === "automatic") {
+      recovery.lastRetryAt = recovery.lastAttemptAt;
+      recovery.lastRetryOutcome = "pending";
+    }
     setRecoveryStatus("pending");
 
     try {
       const trello = await checkTrelloReadiness();
       if (!trello.ready) {
         setRecoveryStatus("blocked", trello.error);
+        if (trigger === "automatic") {
+          recovery.lastRetryOutcome = "blocked";
+        }
+        if (trello.status === "unavailable") {
+          scheduleTrelloRetry();
+        } else {
+          clearTrelloRetry();
+        }
         logger.warn(
           {
             readiness: trello.status,
@@ -444,6 +505,11 @@ export async function refreshBot(): Promise<BotRefreshResult> {
           "Blacklist bot is waiting for Trello board readiness",
         );
         return refreshResult();
+      }
+
+      resetTrelloRetry();
+      if (trigger === "automatic") {
+        recovery.lastRetryOutcome = "successful";
       }
 
       const missing = getMissingConfiguration();
@@ -465,6 +531,9 @@ export async function refreshBot(): Promise<BotRefreshResult> {
       const message =
         error instanceof Error ? error.message : "The bot could not be started.";
       setRecoveryStatus("blocked", message);
+      if (trigger === "automatic") {
+        recovery.lastRetryOutcome = "blocked";
+      }
       logger.error({ err: error }, "Blacklist bot recovery failed");
       return refreshResult();
     }
