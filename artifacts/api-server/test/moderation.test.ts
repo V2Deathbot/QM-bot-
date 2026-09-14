@@ -467,13 +467,62 @@ test("setup persists settings, audits the change, and enables moderation command
   );
 });
 
-test("moves a Trello blacklist card to revoked and updates its labels", async () => {
+test("revokes each Trello blacklist type with custom labels without losing unrelated labels", async () => {
+  const mappings = {
+    lists: {
+      appealable: "Appeals",
+      conditional: "Conditions",
+      permanent: "Permanents",
+      group: "Groups",
+      revoked: "Revocations",
+    },
+    labels: {
+      blacklisted: " blocked ",
+      appealable: " Appeal ",
+      conditional: " Condition ",
+      permanent: " Permanent ",
+      group: " Group ",
+      revoked: " Revoked ",
+    },
+  };
+  const activeTypes = [
+    "appealable",
+    "conditional",
+    "permanent",
+    "group",
+  ] as const;
+  const listIds = {
+    appealable: "list-appealable",
+    conditional: "list-conditional",
+    permanent: "list-permanent",
+    group: "list-group",
+    revoked: "list-revoked",
+  };
+  const labelIds = {
+    blacklisted: "label-blacklisted",
+    appealable: "label-appealable",
+    conditional: "label-conditional",
+    permanent: "label-permanent",
+    group: "label-group",
+    revoked: "label-revoked",
+    unrelated: "label-unrelated",
+  };
+  type CardState = {
+    id: string;
+    name: string;
+    desc: string;
+    idList: string;
+    idLabels: string[];
+    url: string;
+    dateLastActivity: string;
+    closed: boolean;
+  };
+  const cards = new Map<string, CardState>();
   const requests: Array<{
     path: string;
     method: string;
     body?: URLSearchParams;
   }> = [];
-
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input, init) => {
     const pathname = requestPath(input);
@@ -485,64 +534,102 @@ test("moves a Trello blacklist card to revoked and updates its labels", async ()
     });
 
     if (pathname.endsWith("/lists")) {
-      return jsonResponse([
-        { id: "list-blacklist", name: "Appealable Blacklist" },
-        { id: "list-revoked", name: "Revoked Blacklist" },
-      ]);
-    }
-    if (pathname === "/1/cards/card-1") {
-      return jsonResponse({
-        id: "card-1",
-        name: "Builder | 1",
-        desc: "- policy",
-        idList: "list-blacklist",
-        idLabels: ["label-appealable"],
-        url: "https://trello.test/card-1",
-        dateLastActivity: "2026-01-01T00:00:00.000Z",
-        closed: false,
-      });
+      return jsonResponse(
+        Object.entries(mappings.lists).map(([type, name]) => ({
+          id: listIds[type as keyof typeof listIds],
+          name,
+        })),
+      );
     }
     if (pathname.endsWith("/labels")) {
       return jsonResponse([
-        { id: "label-appealable", name: "Appealable", color: "orange" },
-        { id: "label-revoked", name: "revoked", color: "green" },
+        ...Object.entries(mappings.labels).map(([key, name]) => ({
+          id: labelIds[key as keyof typeof labelIds],
+          name: name.trim().toUpperCase(),
+          color: "blue",
+        })),
+        { id: labelIds.unrelated, name: "case notes", color: "blue" },
       ]);
     }
-    if (pathname === "/1/cards/card-1/idLabels/label-appealable") {
-      return jsonResponse(undefined);
+    const cardMatch = /^\/1\/cards\/([^/]+)$/.exec(pathname);
+    if (cardMatch && method === "GET") {
+      const card = cards.get(cardMatch[1]!);
+      if (!card) return jsonResponse({ error: "missing card" }, 404);
+      return jsonResponse(card);
     }
-    if (pathname === "/1/cards/card-1/idLabels") {
-      return jsonResponse(undefined);
+    if (cardMatch && method === "PUT") {
+      const card = cards.get(cardMatch[1]!);
+      assert.ok(card);
+      const body = init?.body as URLSearchParams;
+      card.idList = body.get("idList") ?? card.idList;
+      card.idLabels = (body.get("idLabels") ?? "").split(",").filter(Boolean);
+      return jsonResponse(card);
     }
 
     throw new Error(`Unexpected Trello request: ${method} ${pathname}`);
   };
 
   try {
-    const card = await revokeBlacklistCard({
-      id: "card-1",
-      name: "Builder | 1",
-      desc: "- policy",
-      idList: "list-blacklist",
-      idLabels: ["label-appealable"],
-      url: "https://trello.test/card-1",
-    });
+    for (const [index, type] of activeTypes.entries()) {
+      const cardId = `card-${type}`;
+      const allTypeLabels = activeTypes.map((labelType) => labelIds[labelType]);
+      cards.set(cardId, {
+        id: cardId,
+        name: `Builder | ${index + 1}`,
+        desc: "- policy",
+        idList: listIds[type],
+        idLabels: [
+          labelIds.blacklisted,
+          ...allTypeLabels,
+          labelIds.unrelated,
+        ],
+        url: `https://trello.test/${cardId}`,
+        dateLastActivity: "2026-01-01T00:00:00.000Z",
+        closed: false,
+      });
 
-    assert.equal(card.idList, "list-revoked");
-    assert.deepEqual(
-      requests.map(({ path: pathname, method }) => `${method} ${pathname}`),
-      [
-        "GET /1/cards/card-1",
-        "GET /1/boards/test-board/lists",
-        "PUT /1/cards/card-1",
-        "GET /1/boards/test-board/labels",
-        "DELETE /1/cards/card-1/idLabels/label-appealable",
-        "GET /1/boards/test-board/labels",
-        "POST /1/cards/card-1/idLabels",
-      ],
+      const firstRevocation = await revokeBlacklistCard(
+        cards.get(cardId)!,
+        mappings,
+      );
+      assert.equal(firstRevocation.idList, listIds.revoked);
+      assert.deepEqual(firstRevocation.idLabels, [
+        ...allTypeLabels,
+        labelIds.unrelated,
+        labelIds.revoked,
+      ]);
+
+      const secondRevocation = await revokeBlacklistCard(
+        cards.get(cardId)!,
+        mappings,
+      );
+      assert.deepEqual(secondRevocation.idLabels, firstRevocation.idLabels);
+      assert.deepEqual(cards.get(cardId)?.idLabels, firstRevocation.idLabels);
+      assert.equal(
+        new Set(secondRevocation.idLabels).size,
+        secondRevocation.idLabels.length,
+      );
+    }
+
+    assert.equal(
+      requests.filter(({ method }) => method === "PUT").length,
+      activeTypes.length * 2,
     );
-    assert.equal(requests[2]?.body?.get("idList"), "list-revoked");
-    assert.equal(requests[6]?.body?.get("value"), "label-revoked");
+    for (const update of requests.filter(({ method }) => method === "PUT")) {
+      assert.equal(update.body?.get("idList"), listIds.revoked);
+      assert.deepEqual(
+        update.body?.get("idLabels")?.split(","),
+        [
+          ...activeTypes.map((labelType) => labelIds[labelType]),
+          labelIds.unrelated,
+          labelIds.revoked,
+        ],
+      );
+    }
+    assert.equal(
+      requests.some(({ path }) => path.includes("/idLabels")),
+      false,
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

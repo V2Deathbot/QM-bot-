@@ -435,13 +435,6 @@ async function addLabel(cardId: string, label: TrelloLabel): Promise<void> {
   });
 }
 
-async function removeLabel(cardId: string, labelId: string): Promise<void> {
-  await request(
-    `/cards/${encodeURIComponent(cardId)}/idLabels/${encodeURIComponent(labelId)}`,
-    { method: "DELETE" },
-  );
-}
-
 async function updateCard(
   cardId: string,
   updates: Record<string, string>,
@@ -541,15 +534,36 @@ export async function reactivateBlacklistCardById(
       mappings.labels.revoked,
     ].map(normalizedLabelName),
   );
+  const revokedName = normalizedLabelName(mappings.labels.revoked);
+  const blacklistedName = normalizedLabelName(mappings.labels.blacklisted);
+  const selectedTypeName = normalizedLabelName(mappings.labels[input.type]);
   const labelById = new Map(labels.map((label) => [label.id, label]));
   const desiredLabelIds = (card.idLabels ?? []).filter((labelId) => {
     const label = labelById.get(labelId);
-    return !label || !lifecycleNames.has(normalizedLabelName(label.name));
+    if (!label) return true;
+    const normalizedName = normalizedLabelName(label.name);
+    if (normalizedName === revokedName) return false;
+    return (
+      !lifecycleNames.has(normalizedName) ||
+      normalizedName === selectedTypeName
+    );
   });
-  if (!desiredLabelIds.includes(blacklistedLabel.id)) {
+  if (
+    !desiredLabelIds.some(
+      (labelId) =>
+        normalizedLabelName(labelById.get(labelId)?.name ?? "") ===
+        blacklistedName,
+    )
+  ) {
     desiredLabelIds.push(blacklistedLabel.id);
   }
-  if (!desiredLabelIds.includes(typeLabel.id)) {
+  if (
+    !desiredLabelIds.some(
+      (labelId) =>
+        normalizedLabelName(labelById.get(labelId)?.name ?? "") ===
+        selectedTypeName,
+    )
+  ) {
     desiredLabelIds.push(typeLabel.id);
   }
 
@@ -605,28 +619,41 @@ export async function revokeBlacklistCardById(
     throw new Error("The approved Trello blacklist card is closed and cannot be revoked.");
   }
   const revokedList = await findList(mappings.lists.revoked);
-  if (card.idList !== revokedList.id) {
-    await request<TrelloCard>(`/cards/${encodeURIComponent(card.id)}`, {
-      method: "PUT",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ idList: revokedList.id }),
-    });
-  }
-
   const labels = await getLabels();
-  for (const label of labels) {
-    if (
-        [mappings.labels.appealable, mappings.labels.conditional, mappings.labels.permanent, mappings.labels.group]
-          .map((name) => name.toLowerCase()).includes(label.name.toLowerCase()) &&
-      card.idLabels.includes(label.id)
-    ) {
-      await removeLabel(card.id, label.id);
-    }
+  const revokedLabel = await ensureLabel(
+    mappings.labels.revoked,
+    "green",
+    labels,
+  );
+  if (!labels.some((label) => label.id === revokedLabel.id)) {
+    labels.push(revokedLabel);
   }
 
-  const revokedLabel = await ensureLabel(mappings.labels.revoked, "green");
-  if (!card.idLabels.includes(revokedLabel.id)) {
-    await addLabel(card.id, revokedLabel);
+  const labelById = new Map(labels.map((label) => [label.id, label]));
+  const blacklistedName = normalizedLabelName(mappings.labels.blacklisted);
+  const revokedName = normalizedLabelName(mappings.labels.revoked);
+  const desiredLabelIds = (card.idLabels ?? []).filter((labelId) => {
+    const label = labelById.get(labelId);
+    return normalizedLabelName(label?.name ?? "") !== blacklistedName;
+  });
+  if (
+    !desiredLabelIds.some(
+      (labelId) =>
+        normalizedLabelName(labelById.get(labelId)?.name ?? "") ===
+        revokedName,
+    )
+  ) {
+    desiredLabelIds.push(revokedLabel.id);
   }
-  return { ...card, idList: revokedList.id };
+
+  await updateCard(card.id, {
+    idList: revokedList.id,
+    idLabels: desiredLabelIds.join(","),
+  });
+
+  return {
+    ...card,
+    idList: revokedList.id,
+    idLabels: desiredLabelIds,
+  };
 }
