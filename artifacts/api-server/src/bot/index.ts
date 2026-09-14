@@ -1,12 +1,12 @@
 import {
   Client,
+  Events,
   GatewayIntentBits,
   Partials,
   PermissionFlagsBits,
-  REST,
-  Routes,
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
+  type Guild,
   type GuildMember,
 } from "discord.js";
 import { logger } from "../lib/logger";
@@ -27,12 +27,40 @@ import {
   saveRoleSnapshot,
 } from "./role-store";
 import { findRobloxUser, getRobloxGroupUrl } from "./roblox";
+import {
+  requireAuditChannel,
+  sendAuditEvent,
+  validateGuildSetup,
+  validateModeratorRole,
+  type AuditEvent,
+} from "./audit";
+import {
+  getGuildSetup,
+  saveGuildSetup,
+  type GuildSetup,
+} from "./setup-store";
 
-const commands = [
+const setupCommand = new SlashCommandBuilder()
+  .setName("setup")
+  .setDescription("Configure the moderation role and audit channel.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .addRoleOption((option) =>
+    option
+      .setName("role")
+      .setDescription("The minimum role allowed to use blacklist commands.")
+      .setRequired(true),
+  )
+  .addStringOption((option) =>
+    option
+      .setName("audit_channel_id")
+      .setDescription("The ID of the text channel that receives audit logs.")
+      .setRequired(true),
+  );
+
+const moderationCommands = [
   new SlashCommandBuilder()
     .setName("blacklist")
     .setDescription("Blacklist a Roblox user and remove their server roles.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption((option) =>
       option
         .setName("user")
@@ -64,7 +92,6 @@ const commands = [
   new SlashCommandBuilder()
     .setName("group_blacklist")
     .setDescription("Add a Roblox group to the group blacklist.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption((option) =>
       option
         .setName("id")
@@ -80,7 +107,6 @@ const commands = [
   new SlashCommandBuilder()
     .setName("revoke_blacklist")
     .setDescription("Move a user blacklist card to revoked and restore roles.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption((option) =>
       option
         .setName("username")
@@ -92,7 +118,12 @@ const commands = [
         .setName("discord_user")
         .setDescription("Optional: ping the Discord member directly."),
     ),
-].map((command) => command.toJSON());
+];
+
+const setupOnlyCommands = [setupCommand.toJSON()];
+const enabledCommands = [setupCommand, ...moderationCommands].map((command) =>
+  command.toJSON(),
+);
 
 export type BotRecoveryStatus = "pending" | "successful" | "blocked";
 export type BotRetryOutcome = "pending" | "successful" | "blocked";
@@ -121,6 +152,8 @@ const recovery: BotRecoveryState = {
 
 let discordClient: Client | null = null;
 let commandsRegistered = false;
+let setupCommandRegistered = false;
+let guildSetupComplete = false;
 let recoveryAttempt: Promise<BotRefreshResult> | null = null;
 let trelloRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -159,6 +192,52 @@ function scheduleTrelloRetry(): void {
 
 function keyFor(guildId: string, robloxUserId: number): string {
   return `${guildId}:${robloxUserId}`;
+}
+
+function safeRoleList(member: GuildMember, roleIds: string[]): string {
+  if (roleIds.length === 0) return "None";
+  return roleIds
+    .map((roleId) => {
+      const role = member.guild.roles.cache.get(roleId);
+      return role ? `${role.name} (${role.id})` : roleId;
+    })
+    .join(", ")
+    .slice(0, 1_000);
+}
+
+async function auditBestEffort(
+  guild: Guild,
+  setup: GuildSetup,
+  event: AuditEvent,
+): Promise<void> {
+  try {
+    await sendAuditEvent(guild, setup, event);
+  } catch {
+    logger.warn(
+      { guildId: guild.id, action: event.action },
+      "Could not send moderation audit event",
+    );
+  }
+}
+
+async function interactionMember(
+  interaction: ChatInputCommandInteraction,
+): Promise<GuildMember> {
+  return interaction.guild!.members.fetch(interaction.user.id);
+}
+
+export async function canUseModerationCommands(
+  interaction: ChatInputCommandInteraction,
+  setup: GuildSetup,
+): Promise<boolean> {
+  const guild = interaction.guild!;
+  const member = await interactionMember(interaction);
+  if (guild.ownerId === member.id) return true;
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+
+  const moderatorRole = await guild.roles.fetch(setup.moderatorRoleId);
+  if (!moderatorRole) return false;
+  return member.roles.highest.position >= moderatorRole.position;
 }
 
 async function resolveMember(
@@ -214,8 +293,82 @@ async function restoreRoles(member: GuildMember, roleIds: string[]): Promise<voi
   }
 }
 
+export async function handleSetup(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  const guild = interaction.guild!;
+  const member = await interactionMember(interaction);
+  if (
+    guild.ownerId !== member.id &&
+    !member.permissions.has(PermissionFlagsBits.Administrator)
+  ) {
+    throw new Error(
+      "Only the server owner or an administrator can run /setup.",
+    );
+  }
+
+  const selectedRole = interaction.options.getRole("role", true);
+  const role = await guild.roles.fetch(selectedRole.id);
+  if (!role) {
+    throw new Error("The selected moderator role does not exist.");
+  }
+  validateModeratorRole(guild, role);
+
+  const auditChannelId = interaction.options
+    .getString("audit_channel_id", true)
+    .trim();
+  if (!/^\d{5,25}$/.test(auditChannelId)) {
+    throw new Error("The audit channel ID must contain only numbers.");
+  }
+
+  const previous = await getGuildSetup(guild.id);
+  const setup: GuildSetup = {
+    guildId: guild.id,
+    moderatorRoleId: role.id,
+    auditChannelId,
+    updatedBy: interaction.user.id,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await requireAuditChannel(guild, setup);
+  await saveGuildSetup(setup);
+  await sendAuditEvent(guild, setup, {
+    action: previous ? "Bot setup updated" : "Bot setup completed",
+    status: "success",
+    actorId: interaction.user.id,
+    fields: [
+      {
+        name: "Minimum moderator role",
+        value: `${role.name} (${role.id})`,
+      },
+      {
+        name: "Audit channel",
+        value: `<#${auditChannelId}> (${auditChannelId})`,
+      },
+      ...(previous
+        ? [
+            {
+              name: "Previous configuration",
+              value: `Role: ${previous.moderatorRoleId}\nChannel: ${previous.auditChannelId}`,
+            },
+          ]
+        : []),
+    ],
+  });
+
+  await registerGuildCommands(guild, true);
+  commandsRegistered = true;
+  setupCommandRegistered = true;
+  guildSetupComplete = true;
+  setRecoveryStatus("successful");
+  await interaction.editReply(
+    `Setup complete. Members with **${role.name}** or a higher role can now use moderation commands. Audits will be sent to <#${auditChannelId}>.`,
+  );
+}
+
 export async function handleBlacklist(
   interaction: ChatInputCommandInteraction,
+  setup?: GuildSetup,
 ): Promise<void> {
   const username = interaction.options.getString("user", true);
   const type = interaction.options.getString("type", true) as BlacklistType;
@@ -228,7 +381,25 @@ export async function handleBlacklist(
     throw new Error(`${robloxUser.name} already has an active blacklist snapshot.`);
   }
 
+  const roleSummary = safeRoleList(
+    member,
+    member.roles.cache
+      .filter((role) => role.id !== member.guild.id && !role.managed)
+      .map((role) => role.id),
+  );
   const roleIds = await removeRoles(member);
+  if (setup) {
+    await auditBestEffort(interaction.guild!, setup, {
+      action: "Discord roles removed",
+      status: "success",
+      actorId: interaction.user.id,
+      target: `<@${member.id}> (${member.id})`,
+      fields: [
+        { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
+        { name: "Roles removed", value: roleSummary },
+      ],
+    });
+  }
   const key = keyFor(interaction.guild!.id, robloxUser.id);
   await saveRoleSnapshot({
     key,
@@ -259,27 +430,91 @@ export async function handleBlacklist(
       status: "active",
       createdAt: new Date().toISOString(),
     });
-    await member.send({
-      content: `You have been blacklisted from this server. Trello record: ${card.url}`,
-      embeds: [],
-    });
+    if (setup) {
+      await auditBestEffort(interaction.guild!, setup, {
+        action: "Trello blacklist card created",
+        status: "success",
+        actorId: interaction.user.id,
+        target: `<@${member.id}> (${member.id})`,
+        fields: [
+          { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
+          { name: "Blacklist type", value: type, inline: true },
+          { name: "Reason", value: reason },
+          { name: "Trello card", value: `${card.id}\n${card.url}` },
+        ],
+      });
+    }
+
+    try {
+      await member.send({
+        content: `You have been blacklisted from this server. Trello record: ${card.url}`,
+        embeds: [],
+      });
+    } catch {
+      if (setup) {
+        await auditBestEffort(interaction.guild!, setup, {
+          action: "Blacklist DM could not be delivered",
+          status: "failed",
+          actorId: interaction.user.id,
+          target: `<@${member.id}> (${member.id})`,
+          fields: [{ name: "Trello card", value: `${card.id}\n${card.url}` }],
+        });
+      }
+    }
+
+    if (setup) {
+      await auditBestEffort(interaction.guild!, setup, {
+        action: "User blacklist completed",
+        status: "success",
+        actorId: interaction.user.id,
+        target: `<@${member.id}> (${member.id})`,
+        fields: [
+          { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
+          { name: "Roles removed", value: roleSummary },
+          { name: "Trello card", value: `${card.id}\n${card.url}` },
+        ],
+      });
+    }
     await interaction.editReply(
       `Blacklisted **${robloxUser.name}** (${robloxUser.id}). Removed ${roleIds.length} role(s) and created the Trello card: ${card.url}`,
     );
   } catch (error) {
     await restoreRoles(member, roleIds);
+    if (setup) {
+      await auditBestEffort(interaction.guild!, setup, {
+        action: "Blacklist failed and roles were restored",
+        status: "failed",
+        actorId: interaction.user.id,
+        target: `<@${member.id}> (${member.id})`,
+        fields: [
+          { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
+          { name: "Roles restored", value: roleSummary },
+        ],
+      });
+    }
     throw error;
   }
 }
 
 async function handleGroupBlacklist(
   interaction: ChatInputCommandInteraction,
+  setup: GuildSetup,
 ): Promise<void> {
   const groupId = interaction.options.getString("id", true);
   const reason = interaction.options.getString("reason", true).trim();
   const groupUrl = getRobloxGroupUrl(groupId);
   const card = await createGroupBlacklistCard({ groupUrl, reason });
 
+  await auditBestEffort(interaction.guild!, setup, {
+    action: "Group blacklist card created",
+    status: "success",
+    actorId: interaction.user.id,
+    target: groupUrl,
+    fields: [
+      { name: "Reason", value: reason },
+      { name: "Trello card", value: `${card.id}\n${card.url}` },
+    ],
+  });
   await interaction.editReply(
     `Blacklisted group ${groupUrl}. Created the Trello card: ${card.url}`,
   );
@@ -287,6 +522,7 @@ async function handleGroupBlacklist(
 
 async function handleRevoke(
   interaction: ChatInputCommandInteraction,
+  setup: GuildSetup,
 ): Promise<void> {
   const username = interaction.options.getString("username", true);
   const robloxUser = await findRobloxUser(username);
@@ -301,14 +537,61 @@ async function handleRevoke(
   }
 
   const revokedCard = await revokeBlacklistCard(card);
+  await auditBestEffort(interaction.guild!, setup, {
+    action: "Trello blacklist card moved to revoked",
+    status: "success",
+    actorId: interaction.user.id,
+    target: `<@${member.id}> (${member.id})`,
+    fields: [
+      { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
+      { name: "Trello card", value: `${card.id}\n${revokedCard.url}` },
+    ],
+  });
   if (snapshot) {
     await restoreRoles(member, snapshot.roleIds);
     await revokeRoleSnapshot(snapshot.key);
+    await auditBestEffort(interaction.guild!, setup, {
+      action: "Discord roles restored",
+      status: "success",
+      actorId: interaction.user.id,
+      target: `<@${member.id}> (${member.id})`,
+      fields: [
+        {
+          name: "Roles restored",
+          value: safeRoleList(member, snapshot.roleIds),
+        },
+      ],
+    });
   }
 
-  await member.send({
-    content: `Your blacklist has been revoked. Trello record: ${revokedCard.url}`,
-    embeds: [],
+  try {
+    await member.send({
+      content: `Your blacklist has been revoked. Trello record: ${revokedCard.url}`,
+      embeds: [],
+    });
+  } catch {
+    await auditBestEffort(interaction.guild!, setup, {
+      action: "Revocation DM could not be delivered",
+      status: "failed",
+      actorId: interaction.user.id,
+      target: `<@${member.id}> (${member.id})`,
+      fields: [{ name: "Trello card", value: `${card.id}\n${revokedCard.url}` }],
+    });
+  }
+
+  await auditBestEffort(interaction.guild!, setup, {
+    action: "User blacklist revoked",
+    status: "success",
+    actorId: interaction.user.id,
+    target: `<@${member.id}> (${member.id})`,
+    fields: [
+      { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
+      {
+        name: "Roles restored",
+        value: snapshot ? safeRoleList(member, snapshot.roleIds) : "No saved roles",
+      },
+      { name: "Trello card", value: `${card.id}\n${revokedCard.url}` },
+    ],
   });
   await interaction.editReply(
     `Revoked the blacklist for **${robloxUser.name}** and moved the Trello card to the revoked list.${snapshot ? ` Restored ${snapshot.roleIds.length} saved role(s).` : " No saved role snapshot was found, so no roles were restored."}`,
@@ -328,19 +611,100 @@ async function handleInteraction(
 
   await interaction.deferReply({ ephemeral: true });
 
+  if (interaction.commandName === "setup") {
+    try {
+      await handleSetup(interaction);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "The setup command failed unexpectedly.";
+      const previousSetup = await getGuildSetup(interaction.guild.id).catch(
+        () => undefined,
+      );
+      if (previousSetup) {
+        await auditBestEffort(interaction.guild, previousSetup, {
+          action: "Bot setup failed",
+          status: "failed",
+          actorId: interaction.user.id,
+          fields: [
+            {
+              name: "Result",
+              value: "Setup was not activated. Check the private command reply.",
+            },
+          ],
+        });
+      }
+      logger.error(
+        { err: error, guildId: interaction.guild.id },
+        "Bot setup command failed",
+      );
+      await interaction.editReply(`Could not complete setup: ${message}`);
+    }
+    return;
+  }
+
+  const setup = await getGuildSetup(interaction.guild.id).catch(() => undefined);
+  if (!setup) {
+    await interaction.editReply(
+      "This server has not completed bot setup. Ask the server owner or an administrator to run /setup first.",
+    );
+    return;
+  }
+
   try {
+    await validateGuildSetup(interaction.guild, setup);
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "The saved setup is invalid.";
+    await interaction.editReply(`Moderation commands are disabled: ${message}`);
+    return;
+  }
+
+  if (!(await canUseModerationCommands(interaction, setup))) {
+    await auditBestEffort(interaction.guild, setup, {
+      action: "Unauthorized moderation command denied",
+      status: "failed",
+      actorId: interaction.user.id,
+      fields: [{ name: "Command", value: `/${interaction.commandName}` }],
+    });
+    await interaction.editReply(
+      "You need the configured moderator role or a higher role to use this command.",
+    );
+    return;
+  }
+
+  try {
+    await sendAuditEvent(interaction.guild, setup, {
+      action: "Moderation command started",
+      status: "started",
+      actorId: interaction.user.id,
+      fields: [{ name: "Command", value: `/${interaction.commandName}` }],
+    });
     await requireTrelloReadiness();
 
     if (interaction.commandName === "blacklist") {
-      await handleBlacklist(interaction);
+      await handleBlacklist(interaction, setup);
     } else if (interaction.commandName === "group_blacklist") {
-      await handleGroupBlacklist(interaction);
+      await handleGroupBlacklist(interaction, setup);
     } else if (interaction.commandName === "revoke_blacklist") {
-      await handleRevoke(interaction);
+      await handleRevoke(interaction, setup);
     }
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "The command failed unexpectedly.";
+    await auditBestEffort(interaction.guild, setup, {
+      action: "Moderation command failed",
+      status: "failed",
+      actorId: interaction.user.id,
+      fields: [
+        { name: "Command", value: `/${interaction.commandName}` },
+        {
+          name: "Result",
+          value: "The operation failed. Check the private command reply and bot logs.",
+        },
+      ],
+    });
     logger.error({ err: error, command: interaction.commandName }, "Blacklist command failed");
     await interaction.editReply(`Could not complete the command: ${message}`);
   }
@@ -352,6 +716,8 @@ export function getBotStatus() {
     configured: getMissingConfiguration().length === 0,
     missing: getMissingConfiguration(),
     commandsEnabled: commandsRegistered,
+    setupCommandAvailable: setupCommandRegistered,
+    setupComplete: guildSetupComplete,
     discordConnected: discordClient?.isReady() ?? false,
     recoveryStatus: recovery.status,
     recovery: {
@@ -381,27 +747,59 @@ function refreshResult(): BotRefreshResult {
   };
 }
 
-async function registerCommands(readyClient: Client<true>): Promise<void> {
-  if (config.discordGuildId) {
-    const guild = await readyClient.guilds.fetch(config.discordGuildId);
-    await guild.commands.set(commands);
-    logger.info(
-      {
-        guildId: config.discordGuildId,
-        commandCount: commands.length,
-      },
-      "Blacklist commands registered for guild",
-    );
-  } else {
-    const rest = new REST({ version: "10" }).setToken(config.discordToken!);
-    await rest.put(Routes.applicationCommands(readyClient.user.id), {
-      body: commands,
-    });
-    logger.info(
-      { commandCount: commands.length },
-      "Blacklist commands registered globally",
-    );
+async function registerGuildCommands(
+  guild: Guild,
+  expectedSetup = false,
+): Promise<boolean> {
+  const setup = await getGuildSetup(guild.id);
+  let setupValid = false;
+
+  if (setup) {
+    try {
+      await validateGuildSetup(guild, setup);
+      setupValid = true;
+    } catch (error) {
+      logger.warn(
+        {
+          guildId: guild.id,
+          reason:
+            error instanceof Error ? error.message : "Stored setup is invalid",
+        },
+        "Stored Discord setup must be updated",
+      );
+    }
   }
+
+  if (expectedSetup && !setupValid) {
+    throw new Error("The saved setup could not be validated.");
+  }
+
+  const commandData = setupValid ? enabledCommands : setupOnlyCommands;
+  commandsRegistered = false;
+  setupCommandRegistered = false;
+  guildSetupComplete = setupValid;
+  await guild.commands.set(commandData);
+  setupCommandRegistered = true;
+  commandsRegistered = setupValid;
+  logger.info(
+    {
+      guildId: guild.id,
+      commandCount: commandData.length,
+      moderationCommandsEnabled: setupValid,
+    },
+    setupValid
+      ? "Setup and moderation commands registered for guild"
+      : "Setup command registered for guild",
+  );
+  return setupValid;
+}
+
+async function registerCommands(readyClient: Client<true>): Promise<boolean> {
+  if (!config.discordGuildId) {
+    throw new Error("DISCORD_GUILD_ID is required for guild setup.");
+  }
+  const guild = await readyClient.guilds.fetch(config.discordGuildId);
+  return registerGuildCommands(guild);
 }
 
 async function connectDiscord(): Promise<void> {
@@ -416,13 +814,21 @@ async function connectDiscord(): Promise<void> {
 
   discordClient = client;
   commandsRegistered = false;
+  setupCommandRegistered = false;
+  guildSetupComplete = false;
 
   const ready = new Promise<void>((resolve, reject) => {
-    client.once("ready", (readyClient) => {
+    client.once(Events.ClientReady, (readyClient) => {
       void registerCommands(readyClient)
-        .then(() => {
-          commandsRegistered = true;
-          setRecoveryStatus("successful");
+        .then((moderationEnabled) => {
+          if (moderationEnabled) {
+            setRecoveryStatus("successful");
+          } else {
+            setRecoveryStatus(
+              "blocked",
+              "Discord setup is required. Run /setup in the configured server.",
+            );
+          }
           logger.info({ user: readyClient.user.tag }, "Discord blacklist bot is online");
           resolve();
         })
@@ -445,6 +851,8 @@ async function connectDiscord(): Promise<void> {
     await ready;
   } catch (error) {
     commandsRegistered = false;
+    setupCommandRegistered = false;
+    guildSetupComplete = false;
     if (discordClient === client) {
       discordClient = null;
     }
@@ -457,6 +865,8 @@ export interface BotRefreshResult {
   configured: boolean;
   missing: string[];
   commandsEnabled: boolean;
+  setupCommandAvailable: boolean;
+  setupComplete: boolean;
   discordConnected: boolean;
   recoveryStatus: BotRecoveryStatus;
   recovery: BotRecoveryState;
@@ -487,6 +897,7 @@ export async function refreshBot(
     try {
       const trello = await checkTrelloReadiness();
       if (!trello.ready) {
+        commandsRegistered = false;
         setRecoveryStatus("blocked", trello.error);
         if (trigger === "automatic") {
           recovery.lastRetryOutcome = "blocked";
@@ -514,14 +925,25 @@ export async function refreshBot(
 
       const missing = getMissingConfiguration();
       if (missing.length > 0) {
+        commandsRegistered = false;
         const error = `Bot configuration is incomplete: ${missing.join(", ")}.`;
         setRecoveryStatus("blocked", error);
         logger.warn({ missing }, "Blacklist bot is waiting for configuration");
         return refreshResult();
       }
 
-      if (discordClient?.isReady() && commandsRegistered) {
-        setRecoveryStatus("successful");
+      if (discordClient?.isReady()) {
+        const moderationEnabled = await registerCommands(
+          discordClient as Client<true>,
+        );
+        if (moderationEnabled) {
+          setRecoveryStatus("successful");
+        } else {
+          setRecoveryStatus(
+            "blocked",
+            "Discord setup is required. Run /setup in the configured server.",
+          );
+        }
         return refreshResult();
       }
 

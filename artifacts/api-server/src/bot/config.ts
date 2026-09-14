@@ -26,6 +26,8 @@ export const config = {
   },
   snapshotFile:
     process.env["ROLE_SNAPSHOT_FILE"] ?? "data/role-snapshots.json",
+  setupFile:
+    process.env["BOT_SETUP_FILE"] ?? "data/guild-settings.json",
 } as const;
 
 function parseDelay(value: string | undefined, fallback: number): number {
@@ -36,6 +38,7 @@ function parseDelay(value: string | undefined, fallback: number): number {
 export function getMissingConfiguration(): string[] {
   const required = [
     ["DISCORD_BOT_TOKEN", config.discordToken],
+    ["DISCORD_GUILD_ID", config.discordGuildId],
     ["TRELLO_API_KEY", config.trelloApiKey],
     ["TRELLO_TOKEN", config.trelloToken],
     ["TRELLO_BOARD_ID", config.trelloBoardId],

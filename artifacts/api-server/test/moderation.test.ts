@@ -4,15 +4,24 @@ import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Client, Collection, GuildManager } from "discord.js";
+import {
+  ChannelType,
+  Client,
+  Collection,
+  Events,
+  GuildManager,
+  PermissionFlagsBits,
+} from "discord.js";
 
 const snapshotDirectory = await mkdtemp(
   path.join(os.tmpdir(), "blacklist-bot-tests-"),
 );
 const snapshotFile = path.join(snapshotDirectory, "role-snapshots.json");
+const setupFile = path.join(snapshotDirectory, "guild-settings.json");
 
 process.env.NODE_ENV = "production";
 process.env.ROLE_SNAPSHOT_FILE = snapshotFile;
+process.env.BOT_SETUP_FILE = setupFile;
 process.env.TRELLO_API_KEY = "test-key";
 process.env.TRELLO_TOKEN = "test-token";
 process.env.TRELLO_BOARD_ID = "test-board";
@@ -21,9 +30,19 @@ process.env.TRELLO_LIST_REVOKED = "Revoked Blacklist";
 const { config } = await import("../src/bot/config.ts");
 const { findActiveSnapshot, revokeRoleSnapshot, saveRoleSnapshot } =
   await import("../src/bot/role-store.ts");
+const { getGuildSetup, saveGuildSetup } =
+  await import("../src/bot/setup-store.ts");
+const { requireAuditChannel, sendAuditEvent } =
+  await import("../src/bot/audit.ts");
 const { checkTrelloReadiness, revokeBlacklistCard } =
   await import("../src/bot/trello.ts");
-const { getBotStatus, handleBlacklist, refreshBot } =
+const {
+  canUseModerationCommands,
+  getBotStatus,
+  handleBlacklist,
+  handleSetup,
+  refreshBot,
+} =
   await import("../src/bot/index.ts");
 const { default: app } = await import("../src/app.ts");
 
@@ -35,6 +54,7 @@ type MutableTrelloConfig = {
   trelloBoardId: string | undefined;
   trelloRetryBaseDelayMs: number;
   trelloRetryMaxDelayMs: number;
+  setupFile: string;
 };
 
 const mutableTrelloConfig = config as unknown as MutableTrelloConfig;
@@ -158,6 +178,215 @@ test("persists snapshots and only considers matching active snapshots restorable
     ).revokedAt ?? "",
     /^\d{4}-\d{2}-\d{2}T/,
   );
+});
+
+test("persists and safely updates guild setup", async () => {
+  const initial = {
+    guildId: "guild-settings",
+    moderatorRoleId: "role-1",
+    auditChannelId: "12345",
+    updatedBy: "owner-1",
+    updatedAt: "2026-09-14T00:00:00.000Z",
+  };
+  await saveGuildSetup(initial);
+  assert.deepEqual(await getGuildSetup(initial.guildId), initial);
+
+  const updated = {
+    ...initial,
+    moderatorRoleId: "role-2",
+    auditChannelId: "67890",
+    updatedAt: "2026-09-14T01:00:00.000Z",
+  };
+  await saveGuildSetup(updated);
+  assert.deepEqual(await getGuildSetup(initial.guildId), updated);
+
+  const persisted = JSON.parse(await readFile(setupFile, "utf8")) as {
+    guilds: typeof updated[];
+  };
+  assert.equal(
+    persisted.guilds.filter((setup) => setup.guildId === initial.guildId)
+      .length,
+    1,
+  );
+});
+
+test("allows the configured role and higher roles while denying lower roles", async () => {
+  let highestPosition = 4;
+  let administrator = false;
+  const member = {
+    id: "moderator",
+    permissions: {
+      has: (permission: bigint) =>
+        permission === PermissionFlagsBits.Administrator && administrator,
+    },
+    roles: { highest: { position: highestPosition } },
+  };
+  const guild = {
+    id: "guild-permissions",
+    ownerId: "owner",
+    members: {
+      fetch: async () => ({
+        ...member,
+        roles: { highest: { position: highestPosition } },
+      }),
+    },
+    roles: {
+      fetch: async () => ({ id: "moderator-role", position: 5 }),
+    },
+  };
+  const interaction = {
+    guild,
+    user: { id: member.id },
+  };
+  const setup = {
+    guildId: guild.id,
+    moderatorRoleId: "moderator-role",
+    auditChannelId: "12345",
+    updatedBy: "owner",
+    updatedAt: new Date().toISOString(),
+  };
+
+  assert.equal(
+    await canUseModerationCommands(interaction as never, setup),
+    false,
+  );
+  highestPosition = 5;
+  assert.equal(
+    await canUseModerationCommands(interaction as never, setup),
+    true,
+  );
+  highestPosition = 4;
+  administrator = true;
+  assert.equal(
+    await canUseModerationCommands(interaction as never, setup),
+    true,
+  );
+  guild.ownerId = member.id;
+  administrator = false;
+  assert.equal(
+    await canUseModerationCommands(interaction as never, setup),
+    true,
+  );
+});
+
+test("validates audit channels and redacts credentials from audit messages", async () => {
+  const sent: unknown[] = [];
+  let channelType = ChannelType.GuildText;
+  let allowed = true;
+  const channel = {
+    type: channelType,
+    permissionsFor: () => ({ has: () => allowed }),
+    send: async (payload: unknown) => {
+      sent.push(payload);
+    },
+  };
+  const guild = {
+    id: "guild-audit",
+    members: { me: { id: "bot" } },
+    channels: {
+      fetch: async () => ({ ...channel, type: channelType }),
+    },
+  };
+  const setup = {
+    guildId: guild.id,
+    moderatorRoleId: "role-audit",
+    auditChannelId: "12345",
+    updatedBy: "owner",
+    updatedAt: new Date().toISOString(),
+  };
+
+  await sendAuditEvent(guild as never, setup, {
+    action: "Moderation command failed",
+    status: "failed",
+    actorId: "moderator",
+    fields: [
+      {
+        name: "Sensitive provider response",
+        value: `key=${config.trelloApiKey}&token=${config.trelloToken}`,
+      },
+    ],
+  });
+  const serialized = JSON.stringify(sent);
+  assert.match(serialized, /\[redacted\]/);
+  assert.doesNotMatch(serialized, /test-key|test-token/);
+
+  allowed = false;
+  await assert.rejects(
+    requireAuditChannel(guild as never, setup),
+    /cannot view, send messages, and embed links/,
+  );
+  allowed = true;
+  channelType = ChannelType.GuildVoice;
+  await assert.rejects(
+    requireAuditChannel(guild as never, setup),
+    /missing or is not a text channel/,
+  );
+});
+
+test("setup persists settings, audits the change, and enables moderation commands", async () => {
+  const auditMessages: unknown[] = [];
+  const registeredCommandNames: string[][] = [];
+  const replies: string[] = [];
+  const guild = {
+    id: "guild-setup-command",
+    ownerId: "owner-setup",
+    members: {
+      me: {
+        permissions: { has: () => true },
+        roles: { highest: { position: 10 } },
+      },
+      fetch: async () => ({
+        id: "owner-setup",
+        permissions: { has: () => false },
+      }),
+    },
+    roles: {
+      fetch: async () => role,
+    },
+    channels: {
+      fetch: async () => ({
+        type: ChannelType.GuildText,
+        permissionsFor: () => ({ has: () => true }),
+        send: async (payload: unknown) => {
+          auditMessages.push(payload);
+        },
+      }),
+    },
+    commands: {
+      set: async (commandData: Array<{ name: string }>) => {
+        registeredCommandNames.push(commandData.map((command) => command.name));
+      },
+    },
+  };
+  const role = {
+    id: "role-setup",
+    name: "Moderators",
+    managed: false,
+    position: 5,
+    guild,
+  };
+  const interaction = {
+    guild,
+    user: { id: "owner-setup" },
+    options: {
+      getRole: () => role,
+      getString: () => "12345678901234567",
+    },
+    editReply: async (reply: string) => {
+      replies.push(reply);
+    },
+  };
+
+  await handleSetup(interaction as never);
+
+  const saved = await getGuildSetup(guild.id);
+  assert.equal(saved?.moderatorRoleId, role.id);
+  assert.equal(saved?.auditChannelId, "12345678901234567");
+  assert.equal(auditMessages.length, 1);
+  assert.deepEqual(registeredCommandNames, [
+    ["setup", "blacklist", "group_blacklist", "revoke_blacklist"],
+  ]);
+  assert.match(replies[0] ?? "", /Setup complete/);
 });
 
 test("moves a Trello blacklist card to revoked and updates its labels", async () => {
@@ -446,6 +675,7 @@ test("keeps commands disabled after registration failure and enables them on ret
   const configuredListNames = [...new Set(Object.values(config.trelloListNames))];
   let trelloReady = false;
   let registrationAttempts = 0;
+  const registeredCommandNames: string[][] = [];
 
   Object.assign(mutableTrelloConfig, {
     discordGuildId: "test-guild",
@@ -466,21 +696,49 @@ test("keeps commands disabled after registration failure and enables them on ret
     (this as unknown as { user: { tag: string } }).user = {
       tag: "test-bot#0000",
     };
-    this.emit("ready", this);
+    this.emit(Events.ClientReady, this);
     return "test-discord-token";
   };
-  (GuildManager.prototype as unknown as {
-    fetch: () => Promise<{ commands: { set: () => Promise<void> } }>;
-  }).fetch = async () => ({
+  const fakeGuild = {
+    id: "test-guild",
+    members: {
+      me: {
+        permissions: { has: () => true },
+        roles: { highest: { position: 10 } },
+      },
+    },
+    roles: {
+      fetch: async () => moderatorRole,
+    },
+    channels: {
+      fetch: async () => ({
+        type: ChannelType.GuildText,
+        permissionsFor: () => ({ has: () => true }),
+        send: async () => undefined,
+      }),
+    },
     commands: {
-      set: async () => {
+      set: async (commandData: Array<{ name: string }>) => {
         registrationAttempts += 1;
+        registeredCommandNames.push(
+          commandData.map((command) => command.name),
+        );
         if (registrationAttempts === 1) {
           throw new Error("Discord command registration failed");
         }
       },
     },
-  });
+  };
+  const moderatorRole = {
+    id: "moderator-role",
+    name: "Moderators",
+    managed: false,
+    position: 5,
+    guild: fakeGuild,
+  };
+  (GuildManager.prototype as unknown as {
+    fetch: () => Promise<typeof fakeGuild>;
+  }).fetch = async () => fakeGuild;
 
   try {
     const blocked = await refreshBot();
@@ -501,6 +759,26 @@ test("keeps commands disabled after registration failure and enables them on ret
     assert.match(failedBody.error ?? "", /Discord command registration failed/);
     assert.equal(getBotStatus().commandsEnabled, false);
 
+    const setupOnlyRefresh = await requestBotRefresh();
+    const setupOnlyBody = setupOnlyRefresh.body as {
+      commandsEnabled: boolean;
+      setupCommandAvailable: boolean;
+      recoveryStatus: string;
+    };
+    assert.equal(setupOnlyRefresh.statusCode, 503);
+    assert.equal(setupOnlyBody.commandsEnabled, false);
+    assert.equal(setupOnlyBody.setupCommandAvailable, true);
+    assert.equal(setupOnlyBody.recoveryStatus, "blocked");
+    assert.deepEqual(registeredCommandNames[1], ["setup"]);
+
+    await saveGuildSetup({
+      guildId: "test-guild",
+      moderatorRoleId: moderatorRole.id,
+      auditChannelId: "12345678901234567",
+      updatedBy: "owner",
+      updatedAt: new Date().toISOString(),
+    });
+
     const successfulRefresh = await requestBotRefresh();
     const successfulBody = successfulRefresh.body as {
       commandsEnabled: boolean;
@@ -512,7 +790,13 @@ test("keeps commands disabled after registration failure and enables them on ret
     assert.equal(successfulBody.recoveryStatus, "successful");
     assert.equal(successfulBody.trelloReady, true);
     assert.equal(getBotStatus().commandsEnabled, true);
-    assert.equal(registrationAttempts, 2);
+    assert.equal(registrationAttempts, 3);
+    assert.deepEqual(registeredCommandNames[2], [
+      "setup",
+      "blacklist",
+      "group_blacklist",
+      "revoke_blacklist",
+    ]);
   } finally {
     await refreshBot();
     (Client.prototype as unknown as { login: typeof originalLogin }).login =
