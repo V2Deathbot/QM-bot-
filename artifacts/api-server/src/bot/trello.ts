@@ -5,6 +5,21 @@ interface TrelloList {
   name: string;
 }
 
+export type TrelloReadinessStatus =
+  | "unknown"
+  | "ready"
+  | "not_configured"
+  | "missing_lists"
+  | "unavailable";
+
+export interface TrelloReadiness {
+  ready: boolean;
+  status: TrelloReadinessStatus;
+  checkedAt: string | null;
+  missingLists: string[];
+  error: string | null;
+}
+
 export interface TrelloCard {
   id: string;
   name: string;
@@ -21,6 +36,14 @@ interface TrelloLabel {
 }
 
 const BASE_URL = "https://api.trello.com/1";
+
+let readiness: TrelloReadiness = {
+  ready: false,
+  status: "unknown",
+  checkedAt: null,
+  missingLists: [],
+  error: null,
+};
 
 function requireTrelloConfig(): {
   key: string;
@@ -74,11 +97,97 @@ function body(params: Record<string, string>): RequestInit {
   };
 }
 
-export async function findList(listName: string): Promise<TrelloList> {
+async function getOpenLists(): Promise<TrelloList[]> {
   const { boardId } = requireTrelloConfig();
-  const lists = await request<TrelloList[]>(
+  return request<TrelloList[]>(
     `/boards/${encodeURIComponent(boardId)}/lists?filter=open`,
   );
+}
+
+function configuredListNames(): string[] {
+  return [...new Set(Object.values(config.trelloListNames))];
+}
+
+function updateReadiness(
+  result: Omit<TrelloReadiness, "checkedAt">,
+): TrelloReadiness {
+  readiness = {
+    ...result,
+    checkedAt: new Date().toISOString(),
+  };
+  return getTrelloReadiness();
+}
+
+export function getTrelloReadiness(): TrelloReadiness {
+  return {
+    ...readiness,
+    missingLists: [...readiness.missingLists],
+  };
+}
+
+export async function checkTrelloReadiness(): Promise<TrelloReadiness> {
+  try {
+    requireTrelloConfig();
+  } catch {
+    return updateReadiness({
+      ready: false,
+      status: "not_configured",
+      missingLists: [],
+      error:
+        "Trello is not configured. Add TRELLO_API_KEY, TRELLO_TOKEN, and TRELLO_BOARD_ID.",
+    });
+  }
+
+  try {
+    const lists = await getOpenLists();
+    const normalizedListNames = new Set(
+      lists.map((list) => list.name.trim().toLowerCase()),
+    );
+    const missingLists = configuredListNames().filter(
+      (listName) => !normalizedListNames.has(listName.trim().toLowerCase()),
+    );
+
+    if (missingLists.length > 0) {
+      return updateReadiness({
+        ready: false,
+        status: "missing_lists",
+        missingLists,
+        error: `Missing Trello list(s) on the configured board: ${missingLists.join(", ")}. Create or rename them, then restart the bot.`,
+      });
+    }
+
+    return updateReadiness({
+      ready: true,
+      status: "ready",
+      missingLists: [],
+      error: null,
+    });
+  } catch {
+    return updateReadiness({
+      ready: false,
+      status: "unavailable",
+      missingLists: [],
+      error:
+        "Trello readiness could not be verified. Check the configured board and Trello access, then restart the bot.",
+    });
+  }
+}
+
+export async function requireTrelloReadiness(): Promise<void> {
+  const current = getTrelloReadiness();
+  const currentOrChecked =
+    current.status === "unknown" ? await checkTrelloReadiness() : current;
+
+  if (!currentOrChecked.ready) {
+    throw new Error(
+      currentOrChecked.error ??
+        "Trello is not ready. Check GET /api/bot/status for setup details.",
+    );
+  }
+}
+
+export async function findList(listName: string): Promise<TrelloList> {
+  const lists = await getOpenLists();
   const list = lists.find(
     (candidate) => candidate.name.trim().toLowerCase() === listName.trim().toLowerCase(),
   );

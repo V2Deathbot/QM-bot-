@@ -12,9 +12,12 @@ import {
 import { logger } from "../lib/logger";
 import { config, getMissingConfiguration, type BlacklistType } from "./config";
 import {
+  checkTrelloReadiness,
   createBlacklistCard,
   createGroupBlacklistCard,
   findBlacklistCard,
+  getTrelloReadiness,
+  requireTrelloReadiness,
   revokeBlacklistCard,
 } from "./trello";
 import {
@@ -262,6 +265,8 @@ async function handleInteraction(
   await interaction.deferReply({ ephemeral: true });
 
   try {
+    await requireTrelloReadiness();
+
     if (interaction.commandName === "blacklist") {
       await handleBlacklist(interaction);
     } else if (interaction.commandName === "group_blacklist") {
@@ -278,9 +283,11 @@ async function handleInteraction(
 }
 
 export function getBotStatus() {
+  const trello = getTrelloReadiness();
   return {
     configured: getMissingConfiguration().length === 0,
     missing: getMissingConfiguration(),
+    commandsEnabled: trello.ready,
   };
 }
 
@@ -288,6 +295,19 @@ export async function startBot(): Promise<void> {
   const missing = getMissingConfiguration();
   if (missing.length > 0) {
     logger.warn({ missing }, "Blacklist bot is waiting for configuration");
+    return;
+  }
+
+  const trello = await checkTrelloReadiness();
+  if (!trello.ready) {
+    logger.warn(
+      {
+        readiness: trello.status,
+        missingLists: trello.missingLists,
+        error: trello.error,
+      },
+      "Blacklist bot is waiting for Trello board readiness",
+    );
     return;
   }
 
