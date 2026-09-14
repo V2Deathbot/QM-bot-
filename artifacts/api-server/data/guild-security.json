@@ -1,0 +1,19 @@
+{
+  "guilds": [
+    {
+      "guildId": "1114860005334716422",
+      "lockdown": {
+        "active": false,
+        "automatic": false,
+        "reason": "",
+        "startedAt": null,
+        "startedBy": null
+      },
+      "destructiveActions": [],
+      "observedAdministrators": {
+        "555727322695860234": "1970-01-01T00:00:00.000Z"
+      },
+      "identityLedger": []
+    }
+  ]
+}

@@ -887,8 +887,10 @@ async function synchronizeBlacklistsUnlocked(
     status.counts = emptyCounts();
     status.recentIssues = [];
 
+    let stage = "approved-record recovery";
     try {
       const approved = await enforceApprovedSnapshots(guild, setup);
+      stage = "Trello index";
       const fallbackUsersById = new Map(
         [...cachedIndex.active, ...cachedIndex.revoked].map((entry) => [
           entry.robloxId,
@@ -905,6 +907,7 @@ async function synchronizeBlacklistsUnlocked(
       });
       cachedIndex = index;
       currentRuntimeIssueKeys = new Set<string>();
+      stage = "Discord reconciliation";
       const reconciled = await reconcileIndex(guild, setup, index);
       reconciled.enforced += approved.enforced;
       reconciled.skipped += approved.skipped;
@@ -971,7 +974,16 @@ async function synchronizeBlacklistsUnlocked(
         );
       }
       return getBlacklistSyncStatus();
-    } catch {
+    } catch (error) {
+      const failure = error as { name?: unknown; code?: unknown; stack?: unknown };
+      logger.error({
+        stage,
+        errorType: typeof failure?.name === "string" ? failure.name : "Unknown",
+        code: typeof failure?.code === "number" ? failure.code : undefined,
+        frames: typeof failure?.stack === "string"
+          ? failure.stack.split("\n").filter((line) => /^\s+at .*\/src\/bot\//.test(line)).slice(0, 4)
+          : [],
+      }, "Blacklist synchronization step failed");
       currentRuntimeIssueKeys = null;
       status.state = "failed";
       status.lastCompletedAt = new Date().toISOString();

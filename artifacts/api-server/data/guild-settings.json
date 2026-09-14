@@ -1,0 +1,73 @@
+{
+  "guilds": [
+    {
+      "guildId": "1114860005334716422",
+      "moderatorRoleId": "1548958021160411216",
+      "auditChannelId": "1548957768386478160",
+      "security": {
+        "perAdminLimit": 3,
+        "globalLimit": 8,
+        "windowMinutes": 5,
+        "automaticLockdown": true,
+        "automaticLockdownThreshold": 8,
+        "confirmationsRequired": true,
+        "protectedUserIds": [],
+        "protectedRoleIds": [],
+        "altDetectionEnabled": true,
+        "robloxAltDetectionEnabled": true,
+        "historicalAssociationWarnings": true,
+        "recentPermissionEscalationProtection": true,
+        "securityAuditAlerts": true
+      },
+      "monitoring": {
+        "manualChangeDetection": true,
+        "desyncDetection": true,
+        "pollingIntervalSeconds": 60
+      },
+      "trello": {
+        "lists": {
+          "appealable": "Appealable Blacklists",
+          "conditional": "Conditional Blacklists",
+          "permanent": "Permanent Blacklists",
+          "revoked": "Revoked Blacklists",
+          "group": "Blacklisted Groups"
+        },
+        "labels": {
+          "blacklisted": "blacklisted",
+          "appealable": "appealable",
+          "conditional": "conditional",
+          "permanent": "permanent",
+          "group": "group blacklist",
+          "revoked": "revoked"
+        }
+      },
+      "audit": {
+        "trelloAlerts": true,
+        "blacklistLogs": true,
+        "roleEnforcementLogs": true,
+        "joinLeaveBlacklistLogs": true
+      },
+      "identity": {
+        "sameRobloxDifferentDiscord": true,
+        "sameDiscordDifferentRoblox": true,
+        "historicalAssociationWarnings": true,
+        "autoPunishPossibleAlts": false
+      },
+      "presence": {
+        "enabled": true,
+        "activities": [
+          "Customers",
+          "Quartermaster Corps",
+          "Blacklist Records",
+          "Supply Operations",
+          "Active Blacklists"
+        ],
+        "rotationEnabled": true,
+        "minIntervalMinutes": 5,
+        "maxIntervalMinutes": 20
+      },
+      "updatedBy": "555727322695860234",
+      "updatedAt": "2026-09-14T08:43:34.474Z"
+    }
+  ]
+}
