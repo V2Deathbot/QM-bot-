@@ -2,3 +2,4 @@
 - [Role snapshot runtime state](role-snapshot-runtime-state.md) — File cleanup requires a bot restart because snapshots are cached in memory.
 - [Trello list configuration](trello-list-configuration.md) — Tests should derive list names from effective guild settings rather than hardcoded defaults.
 - [Authority and recovery review](authority-recovery-review.md) — Permission tests do not cover lifecycle safety; verify provider/store interruption boundaries and role ownership.
+- [Discord member scan limits](discord-member-scan-limits.md) — Repeated Gateway member scans can fail despite healthy Trello; use rate-limited REST enumeration and share scan results.

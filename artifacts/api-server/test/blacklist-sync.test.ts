@@ -112,6 +112,7 @@ function createDiscordFixture(guildId: string, initialMembers: boolean) {
         roles: { highest: { position: 10 } },
       },
       fetch: async () => members,
+      list: async () => members,
     },
   };
   const member = {

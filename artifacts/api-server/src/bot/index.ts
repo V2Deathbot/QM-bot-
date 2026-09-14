@@ -80,6 +80,7 @@ import {
   validatePresenceSettings,
   type PresenceSettings,
 } from "./presence";
+import { fetchGuildMembers } from "./guild-members";
 import {
   enforceBlacklistForJoinedMember,
   getBlacklistSyncStatus,
@@ -512,7 +513,7 @@ async function resolveMember(
   const directUser = interaction.options.getUser("discord_user");
   if (directUser) return interaction.guild!.members.fetch(directUser.id);
 
-  const members = await interaction.guild!.members.fetch();
+  const members = await fetchGuildMembers(interaction.guild!);
   const normalized = robloxUsername.trim().toLowerCase();
   const matches = members.filter((member) =>
     [member.user.username, member.user.globalName, member.nickname]
@@ -1933,8 +1934,8 @@ async function observeExistingAdministrators(guild: Guild): Promise<void> {
   // GuildManager fixtures and very early partial guilds may not expose a
   // member fetcher yet. Live configured guilds do; defer observation rather
   // than treating every established administrator as newly escalated.
-  if (typeof guild.members.fetch !== "function") return;
-  const members = await guild.members.fetch();
+  if (typeof guild.members.list !== "function") return;
+  const members = await fetchGuildMembers(guild);
   await mutateSecurityState(guild.id, (state) => {
     for (const member of members.values()) {
       if (member.id === guild.ownerId || member.permissions.has(PermissionFlagsBits.Administrator)) {

@@ -114,6 +114,7 @@ const guild = {
       if (id) return memberFor(id);
       return new Collection([...members.keys()].map((memberId) => [memberId, memberFor(memberId)]));
     },
+    list: async () => new Collection([...members.keys()].map((memberId) => [memberId, memberFor(memberId)])),
   },
   roles: {
     cache: guildRoles,

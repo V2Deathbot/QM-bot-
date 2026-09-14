@@ -1,4 +1,5 @@
-import type { Guild, GuildMember } from "discord.js";
+import type { Collection, Guild, GuildMember } from "discord.js";
+import { fetchGuildMembers } from "./guild-members";
 import { logger } from "../lib/logger";
 import {
   fetchBlacklistIndex,
@@ -636,8 +637,8 @@ async function reconcileIndex(
   guild: Guild,
   setup: GuildSetup,
   index: BlacklistIndex,
+  fetchedMembers: Collection<string, GuildMember>,
 ): Promise<ReconcileCounts> {
-  const fetchedMembers = await guild.members.fetch();
   const members = [...fetchedMembers.values()];
   const totals: ReconcileCounts = {
     enforced: 0,
@@ -887,9 +888,11 @@ async function synchronizeBlacklistsUnlocked(
     status.counts = emptyCounts();
     status.recentIssues = [];
 
-    let stage = "approved-record recovery";
+    let stage = "Discord member list";
     try {
-      const approved = await enforceApprovedSnapshots(guild, setup);
+      const members = await fetchGuildMembers(guild);
+      stage = "approved-record recovery";
+      const approved = await enforceApprovedSnapshots(guild, setup, members);
       stage = "Trello index";
       const fallbackUsersById = new Map(
         [...cachedIndex.active, ...cachedIndex.revoked].map((entry) => [
@@ -908,7 +911,7 @@ async function synchronizeBlacklistsUnlocked(
       cachedIndex = index;
       currentRuntimeIssueKeys = new Set<string>();
       stage = "Discord reconciliation";
-      const reconciled = await reconcileIndex(guild, setup, index);
+      const reconciled = await reconcileIndex(guild, setup, index, members);
       reconciled.enforced += approved.enforced;
       reconciled.skipped += approved.skipped;
       reconciled.failures += approved.failures;
@@ -1029,9 +1032,9 @@ export function synchronizeBlacklists(
 async function enforceApprovedSnapshots(
   guild: Guild,
   setup: GuildSetup,
+  members: Collection<string, GuildMember>,
 ): Promise<ReconcileCounts> {
   const totals: ReconcileCounts = { enforced: 0, restored: 0, skipped: 0, failures: 0 };
-  const members = await guild.members.fetch();
   for (const snapshot of await listRestorableSnapshots(guild.id)) {
     if (snapshot.source !== "command") continue;
     const member = members.get(snapshot.discordUserId);
