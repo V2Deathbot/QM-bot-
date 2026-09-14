@@ -21,3 +21,9 @@ timeoutMs = 20000
 
 [nix]
 channel = "stable-25_05"
+
+[userenv]
+
+[userenv.shared]
+DISCORD_GUILD_ID = "1114860005334716422"
+TRELLO_BOARD_ID = "pqeRROcq"
