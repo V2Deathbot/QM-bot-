@@ -38,8 +38,12 @@
       "blacklistReason": "fff",
       "source": "command",
       "blacklistNotificationAttemptedAt": "2026-09-15T05:46:08.862Z",
-      "status": "active",
-      "createdAt": "2026-09-15T05:46:06.910Z"
+      "status": "revoked",
+      "createdAt": "2026-09-15T05:46:06.910Z",
+      "cardUpdatedAt": "2026-09-15T05:46:07.873Z",
+      "revocationCardMovedAt": "2026-09-15T05:56:40.588Z",
+      "revokedAt": "2026-09-15T05:56:40.884Z",
+      "revocationNotificationAttemptedAt": "2026-09-15T05:56:40.884Z"
     },
     {
       "key": "1114860005334716422:1370330049",

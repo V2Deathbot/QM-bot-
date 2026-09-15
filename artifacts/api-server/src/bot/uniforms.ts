@@ -220,7 +220,7 @@ export class UniformNotificationError extends Error {
   }
 }
 
-type DiscordDeliveryStage = "upload-log notice" | "customer delivery";
+type DiscordDeliveryStage = "upload-log notice" | "customer delivery" | "purchase audit" | "relog audit";
 
 interface DiscordFailureDetails {
   status?: number;
@@ -317,6 +317,7 @@ interface PendingUniformConfirmation {
   command: UniformCommandName;
   submission: UniformSubmission;
   destinationChannelId: string;
+  ticketChannelName: string;
   customerId?: string;
   seqmId?: string;
   expiresAt: number;
@@ -585,8 +586,12 @@ async function requireUniformSubmitter(
 
 type UniformChannel = {
   type: ChannelType;
+  name?: string;
   permissionsFor: (member: GuildMember) => { has: (permissions: PermissionResolvable[]) => boolean } | null;
   send: (payload: unknown) => Promise<unknown>;
+  messages?: {
+    fetch: (messageId: string) => Promise<{ edit: (payload: unknown) => Promise<unknown> } | null>;
+  };
 };
 
 async function requireUniformChannel(
@@ -802,7 +807,7 @@ export async function handleUniformCommand(
     interaction.guild!, command === "log" ? settings.logChannelId : settings.moderatedChannelId, command,
   );
   const selectedChannel = interaction.options.getChannel("channel", true);
-  await requireUniformChannel(interaction.guild!, selectedChannel.id, command);
+  const ticketChannel = await requireUniformChannel(interaction.guild!, selectedChannel.id, command);
   const submission = await resolveSubmission(interaction, command);
   const submissionId = interaction.id;
   if (!submissionId) throw new Error("The Discord interaction has no submission ID.");
@@ -810,6 +815,9 @@ export async function handleUniformCommand(
   const pending: PendingUniformConfirmation = {
     nonce, submissionId, guildId: interaction.guildId!, actorId: interaction.user.id,
     command, submission, destinationChannelId: selectedChannel.id,
+    ticketChannelName: typeof ticketChannel.name === "string" && ticketChannel.name.trim()
+      ? ticketChannel.name.trim()
+      : "Ticket name unavailable",
     expiresAt: Date.now() + uniformConfirmationLifetimeMs,
   };
   pendingUniformConfirmations.set(nonce, pending);
@@ -942,6 +950,7 @@ async function startRelog(
     const oldCustomerMessageId = item.customerMessageId;
     item.relog = {
       state: "claimed",
+      auditState: "pending",
       rowIndex,
       newAsset,
       oldCustomerMessageId,
@@ -987,7 +996,7 @@ async function continueRelog(record: UniformDeliveryRecord, guild: Guild): Promi
   let current = await getUniformDelivery(record.submissionId) ?? record;
   const relog = current.relog;
   if (!relog) throw new Error("This recorded relog is unavailable.");
-  if (relog.state === "sent") return current;
+  if (relog.state === "sent") return sendRelogAudit(current, guild);
   if (relog.state === "customer-claimed" || relog.state === "unresolved") {
     if (relog.state === "customer-claimed") {
       await updateUniformDelivery(current.submissionId, (item) => {
@@ -1023,7 +1032,7 @@ async function continueRelog(record: UniformDeliveryRecord, guild: Guild): Promi
   if (current.relog?.state === "pending" || current.relog?.state === "sheet-updated") {
     current = await sendRelogDelivery(current, guild);
   }
-  return current;
+  return current.relog?.state === "sent" ? sendRelogAudit(current, guild) : current;
 }
 
 async function sendRelogDelivery(record: UniformDeliveryRecord, guild: Guild): Promise<UniformDeliveryRecord> {
@@ -1067,6 +1076,52 @@ async function sendRelogDelivery(record: UniformDeliveryRecord, guild: Guild): P
     throw failure;
   }
   return current;
+}
+
+async function sendRelogAudit(record: UniformDeliveryRecord, guild: Guild): Promise<UniformDeliveryRecord> {
+  let current = await getUniformDelivery(record.submissionId) ?? record;
+  const auditState = current.relog?.auditState ?? "pending";
+  if (!current.relog || current.relog.state !== "sent" || auditState === "sent") return current;
+  if (auditState === "unresolved") {
+    throw new Error("The relog audit outcome is unresolved. No duplicate audit message will be sent.");
+  }
+  if (auditState === "claimed") {
+    await updateUniformDelivery(current.submissionId, (item) => {
+      if (item.relog?.auditState === "claimed") item.relog.auditState = "unresolved";
+    });
+    throw new Error("The relog audit outcome is unresolved. No duplicate audit message will be sent.");
+  }
+  const operationNonce = current.relog.nonce;
+  current = await updateUniformDelivery(current.submissionId, (item) => {
+    if (!item.relog || item.relog.state !== "sent" || (item.relog.auditState && item.relog.auditState !== "pending")) {
+      throw new Error("The relog audit is no longer ready to send.");
+    }
+    item.relog.auditState = "claimed";
+  });
+  try {
+    const channel = await requireUniformChannel(guild, current.uploadLogChannelId, current.command);
+    await channel.send({
+      content: "",
+      embeds: [relogAuditEmbed(current)],
+      allowedMentions: noMentions,
+      // A submission can legitimately relog more than one of its ten assets.
+      // Bind the audit nonce to the durable relog operation, not just the
+      // submission, while retaining a stable key for retries of this operation.
+      nonce: uniformDiscordNonce("relog", `${current.submissionId}:${operationNonce}`),
+      enforceNonce: true,
+    });
+    return updateUniformDelivery(current.submissionId, (item) => {
+      if (item.relog?.auditState === "claimed") item.relog.auditState = "sent";
+    });
+  } catch (error) {
+    const failure = error instanceof UniformDiscordDeliveryError
+      ? error
+      : discordDeliveryFailure("relog audit", error);
+    await updateUniformDelivery(current.submissionId, (item) => {
+      if (item.relog?.auditState === "claimed") item.relog.auditState = failure.retryable ? "pending" : "unresolved";
+    }).catch(() => undefined);
+    throw failure;
+  }
 }
 
 export async function handleUniformRelogCommand(
@@ -1231,6 +1286,97 @@ function customerDeliveryEmbed(record: UniformDeliveryRecord): EmbedBuilder {
   );
 }
 
+/**
+ * Audit text is reconstructed only from frozen sheet rows.  This keeps a
+ * relog and a purchase tied to the original Roblox credits rather than to
+ * mutable Discord display names or later command values.
+ */
+function auditCredits(record: UniformDeliveryRecord): Array<{ name: string; value: string; inline?: boolean }> {
+  const row = record.rows[0] ?? [];
+  const text = (value: unknown) => safePresentationText(typeof value === "string" && value ? value : "Not available");
+  return record.command === "log"
+    ? [
+        { name: "Senior Quartermaster", value: text(row[1]), inline: true },
+        { name: "Publisher", value: text(row[2]), inline: true },
+        { name: "Quartermaster", value: text(row[0]), inline: true },
+      ]
+    : [
+        { name: "Uploaded by", value: text(row[0]), inline: true },
+        { name: "Published by", value: text(row[1]), inline: true },
+      ];
+}
+
+function auditTicketAndCustomer(record: UniformDeliveryRecord) {
+  const row = record.rows[0] ?? [];
+  const customerIndex = record.command === "log" ? 3 : 2;
+  return [
+    { name: "Ticket Channel", value: safePresentationText(record.ticketChannelName ?? "Ticket name unavailable"), inline: true },
+    { name: "Requested by", value: safePresentationText(typeof row[customerIndex] === "string" && row[customerIndex] ? row[customerIndex] : record.customerName), inline: true },
+  ];
+}
+
+function uniformLinks(record: UniformDeliveryRecord): string {
+  return record.assets
+    .map((asset, index) => `[Uniform ${index + 1}](${asset.url})`)
+    .join("\n");
+}
+
+function uploadAuditEmbed(record: UniformDeliveryRecord, title = "Uniform Upload Logged"): EmbedBuilder {
+  return presentationEmbed(
+    title,
+    "A uniform upload was recorded for this ticket.",
+    "success",
+    undefined,
+    [
+      ...auditTicketAndCustomer(record),
+      ...auditCredits(record),
+      { name: "Uniform Links", value: uniformLinks(record) },
+    ],
+  );
+}
+
+function relogAuditEmbed(record: UniformDeliveryRecord): EmbedBuilder {
+  const operation = record.relog!;
+  return presentationEmbed(
+    "Uniform Updated",
+    "A recorded uniform link was replaced.",
+    "success",
+    undefined,
+    [
+      ...auditTicketAndCustomer(record),
+      ...auditCredits(record),
+      { name: "Changed Uniform Link", value: `[Uniform ${operation.rowIndex + 1}](${operation.newAsset.url})` },
+    ],
+  );
+}
+
+function purchaseConfirmationEmbed(record: UniformDeliveryRecord): EmbedBuilder {
+  const row = record.rows[0] ?? [];
+  const text = (value: unknown) => safePresentationText(typeof value === "string" && value ? value : "Not available");
+  const fields = record.command === "log"
+    ? [
+        { name: "Made by", value: text(row[0]), inline: true },
+        { name: "Uploaded by", value: text(row[1]), inline: true },
+        { name: "Published by", value: text(row[2]), inline: true },
+      ]
+    : [
+        { name: "Uploaded by", value: text(row[0]), inline: true },
+        { name: "Published by", value: text(row[1]), inline: true },
+      ];
+  const footerName = record.command === "log" && typeof row[0] === "string" && row[0]
+    ? row[0]
+    : typeof row[record.command === "log" ? 2 : 1] === "string" && row[record.command === "log" ? 2 : 1]
+      ? row[record.command === "log" ? 2 : 1]
+      : "The publisher";
+  return presentationEmbed(
+    "Purchase Confirmed",
+    "Thank you for your purchase. Your ticket will be closed shortly.",
+    "success",
+    undefined,
+    fields,
+  ).setFooter({ text: `${safePresentationText(footerName, 200)} tried to take a bite of your tie.` });
+}
+
 function customerDeliveryButtons(record: UniformDeliveryRecord, disabled = false) {
   return [new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`uniform:purchase:${record.submissionId}`).setLabel("Purchased").setStyle(ButtonStyle.Success).setDisabled(disabled),
@@ -1263,7 +1409,8 @@ function canRetryDelivery(record: UniformDeliveryRecord | undefined): boolean {
   if (record?.relog) {
     return record.relog.state === "claimed" ||
       record.relog.state === "sheet-updated" ||
-      record.relog.state === "pending";
+      record.relog.state === "pending" ||
+      (record.relog.state === "sent" && record.relog.auditState === "pending");
   }
   return Boolean(
     record &&
@@ -1345,7 +1492,8 @@ async function sendPendingDelivery(
     let notice: unknown;
     try {
       notice = await logChannel.send({
-        content: `Uniform logged: /${record.command} (${record.assets.length} asset${record.assets.length === 1 ? "" : "s"}).`,
+        content: "",
+        embeds: [uploadAuditEmbed(current)],
         allowedMentions: noMentions, nonce: uniformDiscordNonce("notice", record.submissionId), enforceNonce: true,
       });
     } catch (error) {
@@ -1356,6 +1504,11 @@ async function sendPendingDelivery(
       throw failure;
     }
     try {
+      const auditMessageId = sentMessageId(notice);
+      if (!auditMessageId) throw new Error("Discord did not return a message ID for the upload audit.");
+      current = await updateUniformDelivery(record.submissionId, (item) => {
+        item.auditMessageId = auditMessageId;
+      });
       await markUniformRowsNotified(record.spreadsheet, record.command, record.submissionId, sentMessageId(notice));
       current = await updateUniformDelivery(record.submissionId, (item) => { item.logNoticeState = "sent"; });
     } catch (error) {
@@ -1433,7 +1586,8 @@ export async function handleUniformSubmitButton(
       destinationChannelId: pending.destinationChannelId, uploadLogChannelId: uploadLogChannelId!,
       spreadsheet, rows, sheetState: "prepared", assets: pending.submission.assets,
       customerName: pending.submission.users.customer.name, logNoticeState: "pending",
-      customerDeliveryState: "pending", createdAt: new Date().toISOString(),
+      customerDeliveryState: "pending", ticketChannelName: pending.ticketChannelName,
+      createdAt: new Date().toISOString(),
     });
   }
   // The durable record is now authoritative. It outlives the private review
@@ -1614,6 +1768,65 @@ async function boundDelivery(
   return record;
 }
 
+async function completePurchasedAudit(record: UniformDeliveryRecord, guild: Guild): Promise<UniformDeliveryRecord> {
+  let current = await getUniformDelivery(record.submissionId) ?? record;
+  const auditState = current.action?.auditState ?? "pending";
+  if (current.terminal !== "purchased" || auditState === "sent") return current;
+  if (auditState === "unresolved") {
+    throw new Error("The purchase audit outcome is unresolved. The customer confirmation was already delivered and will not be sent again.");
+  }
+  if (auditState === "claimed") {
+    await updateUniformDelivery(current.submissionId, (item) => {
+      if (item.action?.auditState === "claimed") item.action.auditState = "unresolved";
+    });
+    throw new Error("The purchase audit outcome is unresolved. The customer confirmation was already delivered and will not be sent again.");
+  }
+  current = await updateUniformDelivery(current.submissionId, (item) => {
+    if (item.terminal !== "purchased" || !item.action || (item.action.auditState && item.action.auditState !== "pending")) {
+      throw new Error("The purchase audit is no longer ready to send.");
+    }
+    item.action.auditState = "claimed";
+  });
+  try {
+    const channel = await requireUniformChannel(guild, current.uploadLogChannelId, current.command);
+    if (current.auditMessageId) {
+      const original = await channel.messages?.fetch(current.auditMessageId);
+      if (!original) throw new Error("The recorded original upload audit message could not be fetched.");
+      await original.edit({
+        content: "",
+        embeds: [uploadAuditEmbed(current, "Uniform Sold Successfully")],
+        allowedMentions: noMentions,
+      });
+    } else {
+      // Older records did not retain the initial audit message ID. Their
+      // dedicated nonce keeps this explicit fallback from creating duplicates.
+      const message = await channel.send({
+        content: "",
+        embeds: [uploadAuditEmbed(current, "Uniform Sold Successfully")],
+        allowedMentions: noMentions,
+        nonce: uniformDiscordNonce("sold", current.submissionId),
+        enforceNonce: true,
+      });
+      const auditMessageId = sentMessageId(message);
+      if (!auditMessageId) throw new Error("Discord did not return a message ID for the sold audit.");
+      current = await updateUniformDelivery(current.submissionId, (item) => {
+        item.auditMessageId = auditMessageId;
+      });
+    }
+    return updateUniformDelivery(current.submissionId, (item) => {
+      if (item.action?.auditState === "claimed") item.action.auditState = "sent";
+    });
+  } catch (error) {
+    const failure = error instanceof UniformDiscordDeliveryError
+      ? error
+      : discordDeliveryFailure("purchase audit", error);
+    await updateUniformDelivery(current.submissionId, (item) => {
+      if (item.action?.auditState === "claimed") item.action.auditState = failure.retryable ? "pending" : "unresolved";
+    }).catch(() => undefined);
+    throw failure;
+  }
+}
+
 export async function handleUniformCustomerButton(interaction: ButtonInteraction): Promise<void> {
   const [, action, submissionId] = interaction.customId.split(":");
   if ((action !== "purchase" && action !== "assist") || !submissionId) throw new Error("That uniform delivery control is unavailable.");
@@ -1622,6 +1835,7 @@ export async function handleUniformCustomerButton(interaction: ButtonInteraction
     // A prior terminal outbox send succeeded but the message edit may have
     // failed. Repair the visible controls without sending another outcome.
     await interaction.update({ components: customerDeliveryButtons(record, true) });
+    if (record.terminal === "purchased") await completePurchasedAudit(record, interaction.guild!);
     return;
   }
   if (record.action) {
@@ -1657,15 +1871,19 @@ export async function handleUniformCustomerButton(interaction: ButtonInteraction
     const channel = await requireUniformChannel(interaction.guild!, record.destinationChannelId, record.command);
     await channel.send({
       content: record.command === "log" ? `<@${record.seqmId}>` : "A customer has confirmed their purchase.",
-      embeds: [presentationEmbed("Purchase Confirmed", "Thank you for your purchase. Your ticket will be closed shortly.", "success")],
+      embeds: [purchaseConfirmationEmbed(record)],
       allowedMentions: record.command === "log" ? { parse: [], users: [record.seqmId] } : noMentions,
       nonce: claimed.action.nonce,
       enforceNonce: true,
     });
     await updateUniformDelivery(submissionId, (item) => {
       item.terminal = "purchased";
-      if (item.action) item.action.state = "sent";
+      if (item.action) {
+        item.action.state = "sent";
+        item.action.auditState = "pending";
+      }
     });
+    await completePurchasedAudit(record, interaction.guild!);
   } catch (error) {
     await updateUniformDelivery(submissionId, (item) => {
       if (item.action?.state === "claimed") item.action.state = "unresolved";

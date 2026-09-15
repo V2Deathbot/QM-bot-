@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { config } from "./config";
 
-export type UniformDiscordNonceKind = "notice" | "customer" | "purchased" | "assistance";
+export type UniformDiscordNonceKind = "notice" | "customer" | "purchased" | "assistance" | "sold" | "relog";
 
 /**
  * Discord accepts nonces up to 25 characters. Interaction IDs are already
@@ -45,6 +45,10 @@ export interface UniformDeliveryRecord {
   sheetState: "prepared" | "saved";
   assets: Array<{ id: number; url: string }>;
   customerName: string;
+  /** Real ticket channel name frozen at submission time; never infer it from a Discord user. */
+  ticketChannelName?: string;
+  /** The original upload audit message, when it was durably recorded. */
+  auditMessageId?: string;
   logNoticeState: "pending" | "claimed" | "sent" | "unresolved";
   customerDeliveryState: "pending" | "claimed" | "sent" | "unresolved";
   customerMessageId?: string;
@@ -57,6 +61,8 @@ export interface UniformDeliveryRecord {
    */
   relog?: {
     state: "claimed" | "sheet-updated" | "pending" | "customer-claimed" | "sent" | "unresolved";
+    /** A distinct outbox: a customer replacement must never be replayed for an audit retry. */
+    auditState?: "pending" | "claimed" | "sent" | "unresolved";
     rowIndex: number;
     newAsset: { id: number; url: string };
     oldCustomerMessageId?: string;
@@ -73,6 +79,8 @@ export interface UniformDeliveryRecord {
     kind: "purchased" | "assistance";
     reason?: string;
     state: "claimed" | "sent" | "unresolved";
+    /** Audit completion is separate from the customer-facing confirmation. */
+    auditState?: "pending" | "claimed" | "sent" | "unresolved";
     nonce: string;
   };
   createdAt: string;

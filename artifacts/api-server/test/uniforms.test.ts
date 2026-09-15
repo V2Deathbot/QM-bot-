@@ -12,7 +12,7 @@ process.env.UNIFORM_DELIVERY_FILE = path.join(directory, "deliveries.json");
 
 const {
   canSubmitUniforms, handleUniformAssistanceModal, handleUniformCommand, handleUniformCustomerButton,
-  handleUniformRetryButton, handleUniformSubmitButton, handleUniformUserSelection, parseUniformAssetInput,
+  handleUniformRelogCommand, handleUniformRetryButton, handleUniformSubmitButton, handleUniformUserSelection, parseUniformAssetInput,
   resetUniformSubmissionStateForTests, saveUniformSettings,
   saveUniformSpreadsheetSettings, uniformCommands, uniformSheetRows,
   UniformDeliveryRecoveryError, uniformDeliveryRecoveryResponse, validateUniformSettings,
@@ -43,6 +43,9 @@ globalThis.fetch = async (_input, init) => {
 
 const rows = new Map<string, unknown[][]>();
 let sends: unknown[] = [];
+let auditMessageEdits: Array<{ id: string; payload: unknown }> = [];
+const sentMessages = new Set<string>();
+let auditEditFailure: Error | undefined;
 let sendFailure: Error | undefined;
 let rejectLongDiscordNonces = false;
 let sheetFailure: Error | undefined;
@@ -90,6 +93,7 @@ const guild = {
     };
     return {
       type: ChannelType.GuildText,
+      name: id === "customer-channel" ? "ticket-uniforms" : `${id}-audit`,
       permissionsFor: () => ({ has: () => true }),
       send: async (payload: unknown) => {
         if (sendFailure) throw sendFailure;
@@ -98,7 +102,17 @@ const guild = {
           throw Object.assign(new Error("Invalid Form Body"), { status: 400, code: 50035 });
         }
         sends.push({ id, payload });
-        return { id: `notice-${sends.length}` };
+        const messageId = `notice-${sends.length}`;
+        sentMessages.add(messageId);
+        return { id: messageId };
+      },
+      messages: {
+        fetch: async (messageId: string) => sentMessages.has(messageId)
+          ? { edit: async (payload: unknown) => {
+            if (auditEditFailure) throw auditEditFailure;
+            auditMessageEdits.push({ id: messageId, payload });
+          } }
+          : null,
       },
     };
   } },
@@ -157,7 +171,7 @@ async function prepareAndSubmit(command: "log" | "moderated", values: Record<str
   return commandInteraction;
 }
 beforeEach(() => {
-  rows.clear(); sends = []; sendFailure = undefined; sheetFailure = undefined;
+  rows.clear(); sends = []; auditMessageEdits = []; sentMessages.clear(); auditEditFailure = undefined; sendFailure = undefined; sheetFailure = undefined;
   rejectLongDiscordNonces = false; sheetValidationGate = undefined;
   resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
 });
@@ -284,6 +298,156 @@ test("writes ten /log rows before one notice and routes /moderated separately", 
   assert.deepEqual(rows.get("Moderated Logs"), [["Uploader", "Publisher", "Customer", "https://www.roblox.com/catalog/77"]]);
   assert.equal((sends[2] as { id: string }).id, "moderated");
   assert.doesNotMatch(JSON.stringify(sends.slice(2)), /seqm-discord/);
+});
+
+test("uses frozen Roblox credits and all links in quiet upload audits", async () => {
+  await prepareAndSubmit("log", {
+    qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer",
+    ...Object.fromEntries(Array.from({ length: 10 }, (_value, index) => [`shirtid${index + 1}`, String(index + 1)])),
+  });
+  const logAudit = (sends[0] as { id: string; payload: {
+    content: string; allowedMentions: { parse: unknown[] }; embeds: Array<{ data: {
+      title: string; fields: Array<{ name: string; value: string }>;
+    } }>;
+  } }).payload;
+  assert.equal(logAudit.content, "");
+  assert.deepEqual(logAudit.allowedMentions, { parse: [] });
+  assert.match(logAudit.embeds[0]!.data.title, /Uniform Upload Logged$/);
+  assert.doesNotMatch(logAudit.embeds[0]!.data.title, /Sold/i);
+  assert.deepEqual(
+    logAudit.embeds[0]!.data.fields.map((field) => field.name),
+    ["Ticket Channel", "Requested by", "Senior Quartermaster", "Publisher", "Quartermaster", "Uniform Links"],
+  );
+  assert.equal(logAudit.embeds[0]!.data.fields[0]!.value, "ticket-uniforms");
+  assert.equal(logAudit.embeds[0]!.data.fields[1]!.value, "Customer");
+  assert.equal(logAudit.embeds[0]!.data.fields[2]!.value, "SEQM");
+  assert.equal(logAudit.embeds[0]!.data.fields[4]!.value, "QM");
+  assert.match(logAudit.embeds[0]!.data.fields[5]!.value, /Uniform 10.*catalog\/10/);
+  assert.doesNotMatch(JSON.stringify(logAudit), /<@|@everyone|@here/);
+
+  await prepareAndSubmit("moderated", {
+    uploader: "Uploader", publisher: "Publisher", customer: "Customer", shirtid: "77",
+  });
+  const moderatedAudit = (sends[2] as { payload: { embeds: Array<{ data: { fields: Array<{ name: string; value: string }> } }> } }).payload;
+  assert.deepEqual(
+    moderatedAudit.embeds[0]!.data.fields.map((field) => field.name),
+    ["Ticket Channel", "Requested by", "Uploaded by", "Published by", "Uniform Links"],
+  );
+  assert.doesNotMatch(JSON.stringify(moderatedAudit.embeds[0]!.data.fields), /Quartermaster|SEQM/);
+});
+
+test("confirms purchase once, credits frozen names, and upgrades its original audit only after Sold", async () => {
+  await prepareAndSubmit("log", {
+    qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer", shirtid1: "42",
+  }, "purchase-audit");
+  const record = await getUniformDelivery("purchase-audit");
+  assert.equal(record?.auditMessageId, "notice-1");
+  await handleUniformCustomerButton({
+    customId: "uniform:purchase:purchase-audit", guild, guildId: guild.id, channelId: "customer-channel",
+    message: { id: "notice-2" }, user: { id: "customer-discord" },
+    deferUpdate: async () => undefined, editReply: async () => undefined, update: async () => undefined,
+  } as never);
+  const confirmation = (sends[2] as { payload: {
+    content: string; allowedMentions: { parse: unknown[]; users: string[] }; embeds: Array<{ data: {
+      title: string; description: string; fields: Array<{ name: string; value: string }>; footer?: { text: string };
+    } }>;
+  } }).payload;
+  assert.equal(confirmation.content, "<@seqm-discord>");
+  assert.deepEqual(confirmation.allowedMentions, { parse: [], users: ["seqm-discord"] });
+  assert.match(confirmation.embeds[0]!.data.title, /Purchase Confirmed$/);
+  assert.equal(confirmation.embeds[0]!.data.description, "Thank you for your purchase. Your ticket will be closed shortly.");
+  assert.deepEqual(confirmation.embeds[0]!.data.fields, [
+    { name: "Made by", value: "QM", inline: true },
+    { name: "Uploaded by", value: "SEQM", inline: true },
+    { name: "Published by", value: "Publisher", inline: true },
+  ]);
+  assert.equal(confirmation.embeds[0]!.data.footer?.text, "QM tried to take a bite of your tie.");
+  assert.equal(auditMessageEdits.length, 1);
+  const soldAudit = auditMessageEdits[0]!.payload as { content: string; allowedMentions: { parse: unknown[] }; embeds: Array<{ data: { title: string } }> };
+  assert.equal(soldAudit.content, "");
+  assert.deepEqual(soldAudit.allowedMentions, { parse: [] });
+  assert.match(soldAudit.embeds[0]!.data.title, /Uniform Sold Successfully$/);
+  assert.equal((await getUniformDelivery("purchase-audit"))?.action?.auditState, "sent");
+});
+
+test("uses only moderated uploader and publisher credits in a quiet purchase confirmation", async () => {
+  await prepareAndSubmit("moderated", {
+    uploader: "Uploader", publisher: "Publisher", customer: "Customer", shirtid: "42",
+  }, "moderated-purchase-audit");
+  await handleUniformCustomerButton({
+    customId: "uniform:purchase:moderated-purchase-audit", guild, guildId: guild.id, channelId: "customer-channel",
+    message: { id: "notice-2" }, user: { id: "customer-discord" },
+    deferUpdate: async () => undefined, editReply: async () => undefined, update: async () => undefined,
+  } as never);
+  const confirmation = (sends[2] as { payload: {
+    content: string; allowedMentions: { parse: unknown[] }; embeds: Array<{ data: {
+      fields: Array<{ name: string; value: string }>; footer?: { text: string };
+    } }>;
+  } }).payload;
+  assert.equal(confirmation.content, "A customer has confirmed their purchase.");
+  assert.deepEqual(confirmation.allowedMentions, { parse: [] });
+  assert.deepEqual(confirmation.embeds[0]!.data.fields, [
+    { name: "Uploaded by", value: "Uploader", inline: true },
+    { name: "Published by", value: "Publisher", inline: true },
+  ]);
+  assert.equal(confirmation.embeds[0]!.data.footer?.text, "Publisher tried to take a bite of your tie.");
+  assert.doesNotMatch(JSON.stringify(confirmation.embeds[0]!.data.fields), /Quartermaster|SEQM/);
+});
+
+test("retries a definite purchase-audit failure without duplicating the customer thank-you or SEQM ping", async () => {
+  await prepareAndSubmit("log", {
+    qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer", shirtid1: "42",
+  }, "purchase-audit-retry");
+  const click = {
+    customId: "uniform:purchase:purchase-audit-retry", guild, guildId: guild.id, channelId: "customer-channel",
+    message: { id: "notice-2" }, user: { id: "customer-discord" },
+    deferUpdate: async () => undefined, editReply: async () => undefined, update: async () => undefined,
+  };
+  auditEditFailure = Object.assign(new Error("Discord rejected audit edit"), { status: 400, code: 50035 });
+  await assert.rejects(handleUniformCustomerButton(click as never), /purchase audit/i);
+  assert.equal(sends.length, 3);
+  assert.equal((await getUniformDelivery("purchase-audit-retry"))?.terminal, "purchased");
+  assert.equal((await getUniformDelivery("purchase-audit-retry"))?.action?.auditState, "pending");
+  auditEditFailure = undefined;
+  await handleUniformCustomerButton(click as never);
+  assert.equal(sends.length, 3, "the saved customer acknowledgement must not be replayed");
+  assert.equal(auditMessageEdits.length, 1);
+  assert.equal((await getUniformDelivery("purchase-audit-retry"))?.action?.auditState, "sent");
+});
+
+test("posts a quiet relog audit with the frozen ticket, customer, credits, and replacement link", async () => {
+  await prepareAndSubmit("log", {
+    qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer", shirtid1: "42", channel: "relog-ticket",
+  }, "relog-audit");
+  const edits: unknown[] = [];
+  await handleUniformRelogCommand({
+    guild, guildId: guild.id, user: { id: "seqm-discord" },
+    options: {
+      getChannel: () => ({ id: "relog-ticket", type: ChannelType.GuildText }),
+      getString: () => "99",
+    },
+    editReply: async (payload: unknown) => { edits.push(payload); },
+  } as never);
+  assert.equal((await getUniformDelivery("relog-audit"))?.relog?.state, "sent");
+  assert.equal((await getUniformDelivery("relog-audit"))?.relog?.auditState, "sent");
+  assert.equal(sends.length, 4);
+  const audit = (sends[3] as { id: string; payload: {
+    content: string; allowedMentions: { parse: unknown[] }; embeds: Array<{ data: {
+      title: string; fields: Array<{ name: string; value: string }>;
+    } }>;
+  } }).payload;
+  assert.equal(audit.content, "");
+  assert.deepEqual(audit.allowedMentions, { parse: [] });
+  assert.match(audit.embeds[0]!.data.title, /Uniform Updated$/);
+  assert.deepEqual(
+    audit.embeds[0]!.data.fields.map((field) => field.name),
+    ["Ticket Channel", "Requested by", "Senior Quartermaster", "Publisher", "Quartermaster", "Changed Uniform Link"],
+  );
+  assert.equal(audit.embeds[0]!.data.fields[0]!.value, "relog-ticket-audit");
+  assert.equal(audit.embeds[0]!.data.fields[1]!.value, "Customer");
+  assert.equal(audit.embeds[0]!.data.fields[5]!.value, "[Uniform 1](https://www.roblox.com/catalog/99)");
+  assert.doesNotMatch(JSON.stringify(audit), /<@|@everyone|@here/);
+  assert.match(JSON.stringify(edits[0]), /Uniform Link Replaced/);
 });
 
 test("uses deterministic Discord-safe nonces for 19- and 20-digit delivery IDs", async () => {
