@@ -99,6 +99,8 @@ import {
   handleUniformCommand,
   handleUniformSettingsComponent,
   handleUniformSettingsModal,
+  handleUniformSpreadsheetSettingsModal,
+  UniformNotificationError,
   renderUniformSettings,
   uniformCommandNames,
   uniformCommands,
@@ -1284,7 +1286,9 @@ function settingsCategoryForAction(id: string): SettingsCategory | undefined {
   if (
     id === "setup:uniforms" ||
     id === "setup:uniforms-config" ||
-    id === "setup:uniforms-reset"
+    id === "setup:uniforms-reset" ||
+    id === "setup:uniforms-spreadsheet-config" ||
+    id === "setup:uniforms-spreadsheet-reset"
   ) return "uniforms";
   if (
     id === "setup:bot-state" ||
@@ -1656,7 +1660,12 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
     await renderUniformSettings(interaction, setup, botAvatarUrl());
     return;
   }
-  if (id === "setup:uniforms-config" || id === "setup:uniforms-reset") {
+  if (
+    id === "setup:uniforms-config" ||
+    id === "setup:uniforms-reset" ||
+    id === "setup:uniforms-spreadsheet-config" ||
+    id === "setup:uniforms-spreadsheet-reset"
+  ) {
     if (!interaction.isButton()) {
       throw new Error("Uniforms settings controls must be used from their settings page.");
     }
@@ -2032,6 +2041,10 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
   }
   if (id === "setup-modal:uniforms") {
     await handleUniformSettingsModal(interaction, setup);
+    return;
+  }
+  if (id === "setup-modal:uniforms-spreadsheet") {
+    await handleUniformSpreadsheetSettingsModal(interaction, setup);
     return;
   }
   if (
@@ -3551,7 +3564,12 @@ async function handleInteraction(
       await handleUniformCommand(interaction, setup, botAvatarUrl());
     } catch (error) {
       const message = error instanceof Error ? error.message : "The uniform log failed unexpectedly.";
-      await interaction.editReply(errorResponse(`Could not complete the uniform log: ${message}`, "Uniform Log Failed"));
+      await interaction.editReply(errorResponse(
+        error instanceof UniformNotificationError
+          ? message
+          : `Could not complete the uniform log: ${message}`,
+        error instanceof UniformNotificationError ? "Saved, Notification Failed" : "Uniform Log Failed",
+      ));
     }
     return;
   }

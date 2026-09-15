@@ -21,6 +21,7 @@ import { findRobloxUser, type RobloxUser } from "./roblox";
 import {
   defaultUniformSettings,
   saveGuildSetup,
+  updateGuildSetup,
   uniformSettingsFor,
   type GuildSetup,
   type UniformSettings,
@@ -32,6 +33,13 @@ import {
   readableDate,
   safePresentationText,
 } from "./presentation";
+import {
+  appendUniformRows,
+  markUniformRowsNotified,
+  normalizeUniformSpreadsheetConfig,
+  validateSpreadsheetConfiguration,
+  type UniformSheetRow,
+} from "./google-sheets";
 
 /**
  * Uniform logging deliberately has no provider side effects.  In particular,
@@ -137,6 +145,39 @@ export const uniformCommands = [
 export const uniformCommandNames = new Set(["log", "moderated"]);
 
 export type UniformCommandName = "log" | "moderated";
+
+export const uniformSpreadsheetInputIds = [
+  "spreadsheet_id",
+  "log_tab",
+  "moderated_tab",
+  "create_missing_tabs",
+] as const;
+
+/**
+ * This error is intentionally distinguishable by the command router: the
+ * detailed spreadsheet rows are durable even when Discord's notification
+ * endpoint fails, so the private response must never suggest a resubmission.
+ */
+export class UniformNotificationError extends Error {
+  readonly sheetSaved = true;
+  readonly notificationFailed = true;
+
+  constructor(command: UniformCommandName, cause: unknown, notificationPosted = false) {
+    super(
+      `The /${command} uniform rows were saved to Google Sheets, but ` +
+      `${notificationPosted ? "the notification status could not be recorded after the Discord notice was posted" : "the Discord notification failed"}. ` +
+      `Do not resubmit; an administrator should check the configured channel. ` +
+      `Notification error: ${cause instanceof Error ? cause.message : "unknown Discord error"}`,
+    );
+    this.name = "UniformNotificationError";
+  }
+}
+
+const activeUniformSubmissions = new Set<string>();
+
+export function resetUniformSubmissionStateForTests(): void {
+  activeUniformSubmissions.clear();
+}
 
 export interface UniformAsset {
   id: number;
@@ -434,6 +475,121 @@ function profileLink(user: RobloxUser): string {
   return `[${safePresentationText(user.name, 100)}](https://www.roblox.com/users/${user.id}/profile)\nRoblox ID: ${displayId(user.id)}`;
 }
 
+function sheetValue(value: string | number | null | undefined): string {
+  // The API request uses valueInputOption=RAW.  Do not turn user-provided
+  // usernames or links into formulas while keeping empty role columns useful.
+  return value === undefined ? "" : String(value);
+}
+
+export function uniformSheetRows(
+  submission: UniformSubmission,
+  interaction: Pick<ChatInputCommandInteraction, "id" | "user" | "guildId">,
+  at: Date,
+): UniformSheetRow[] {
+  if (!interaction.id) {
+    throw new Error("The Discord interaction has no submission ID.");
+  }
+  const timestamp = at.toISOString();
+  const users = submission.users;
+  return submission.assets.map((asset) => [
+    timestamp,
+    submission.command,
+    sheetValue(users.customer.name),
+    sheetValue(users.customer.id),
+    sheetValue(users.qm?.name),
+    sheetValue(users.qm?.id),
+    sheetValue(users.seqm?.name),
+    sheetValue(users.seqm?.id),
+    sheetValue(users.uploader?.name),
+    sheetValue(users.uploader?.id),
+    sheetValue(users.publisher.name),
+    sheetValue(users.publisher.id),
+    sheetValue(asset.id),
+    sheetValue(asset.url),
+    sheetValue(interaction.user.id),
+    sheetValue(interaction.guildId),
+    sheetValue(interaction.id),
+  ]);
+}
+
+function configuredSpreadsheet(
+  settings: UniformSettings,
+): UniformSettings["spreadsheet"] {
+  return settings.spreadsheet
+    ? normalizeUniformSpreadsheetConfig(settings.spreadsheet)
+    : undefined;
+}
+
+function sentDiscordMessageId(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const id = (value as { id?: unknown }).id;
+  return typeof id === "string" ? id : "";
+}
+
+export async function validateUniformSpreadsheetSettings(
+  settings: UniformSettings,
+): Promise<void> {
+  if (!settings.spreadsheet) {
+    throw new Error(
+      "Google Sheets is not configured. Ask an Administrator to open /settings → Uniforms → Spreadsheet Configuration and save a spreadsheet URL or ID.",
+    );
+  }
+  await validateSpreadsheetConfiguration(settings.spreadsheet);
+}
+
+export async function saveUniformSpreadsheetSettings(
+  guild: Guild,
+  setup: GuildSetup,
+  actorId: string,
+  spreadsheet: UniformSettings["spreadsheet"],
+): Promise<GuildSetup> {
+  if (!spreadsheet) throw new Error("Spreadsheet configuration is required.");
+  const normalized = normalizeUniformSpreadsheetConfig(spreadsheet);
+  await validateSpreadsheetConfiguration(normalized);
+  return updateGuildSetup(setup.guildId, async (latest) => {
+    const base = latest ?? setup;
+    const current = uniformSettingsFor(base);
+    const merged: UniformSettings = {
+      ...current,
+      spreadsheet: normalized,
+    };
+    await validateUniformSettings(guild, merged);
+    return {
+      ...base,
+      uniforms: merged,
+      updatedBy: actorId,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+}
+
+export async function resetUniformSpreadsheetSettings(
+  setup: GuildSetup,
+  actorId: string,
+): Promise<GuildSetup> {
+  return updateGuildSetup(setup.guildId, (latest) => {
+    const base = latest ?? setup;
+    const current = uniformSettingsFor(base);
+    const remaining: UniformSettings = {
+      ...current,
+      spreadsheet: undefined,
+    };
+    const updated = {
+      ...base,
+      uniforms: remaining,
+      updatedBy: actorId,
+      updatedAt: new Date().toISOString(),
+    } as GuildSetup;
+    if (!remaining.logChannelId &&
+        !remaining.moderatedChannelId &&
+        !remaining.authorizedRoleIds.length &&
+        !remaining.authorizedMemberIds.length) {
+      delete updated.uniforms;
+    }
+    return updated;
+  });
+}
+
 export function uniformSubmissionEmbed(
   submission: UniformSubmission,
   actorId: string,
@@ -493,16 +649,82 @@ export async function handleUniformCommand(
   // All account and asset validation occurs before the public send. A failed
   // lookup can therefore never leave a partial uniform log in the channel.
   const submission = await resolveSubmission(interaction, command);
-  await channel.send({
-    content: "",
-    embeds: [uniformSubmissionEmbed(submission, interaction.user.id, avatarUrl)],
-    allowedMentions: noMentions,
-  });
+  const spreadsheet = configuredSpreadsheet(settings);
+  if (!spreadsheet) {
+    throw new Error(
+      "Google Sheets is not configured. Ask an Administrator to open /settings → Uniforms → Spreadsheet Configuration and save a spreadsheet URL or ID before submitting.",
+    );
+  }
+  const submissionId = interaction.id;
+  if (!submissionId) throw new Error("The Discord interaction has no submission ID.");
+  const duplicateKey = `${interaction.guildId}:${submissionId}`;
+  if (activeUniformSubmissions.has(duplicateKey)) {
+    throw new Error(
+      "This Discord interaction has already been processed or is still in progress. Do not resubmit it.",
+    );
+  }
+  activeUniformSubmissions.add(duplicateKey);
+
+  const rows = uniformSheetRows(submission, interaction, new Date());
+  let appendResult;
+  try {
+    appendResult = await appendUniformRows({
+      config: spreadsheet,
+      logKind: command,
+      rows,
+      submissionId,
+    });
+  } catch (error) {
+    // No successful append means a transient Sheets failure can be retried.
+    // If the provider actually committed before timing out, the append helper's
+    // submission-ID check makes the next delivery idempotent.
+    activeUniformSubmissions.delete(duplicateKey);
+    throw error;
+  }
+  if (appendResult.alreadyWritten && appendResult.alreadyNotified) {
+    await interaction.editReply({
+      content: "",
+      embeds: [presentationEmbed(
+        "Uniform Already Submitted",
+        `This /${command} submission is already saved and its Discord notice is already recorded. No duplicate message was sent.`,
+        "info",
+        avatarUrl,
+      )],
+      allowedMentions: noMentions,
+    });
+    return;
+  }
+
+  let sentMessage: unknown;
+  try {
+    sentMessage = await channel.send({
+      content: `Uniform logged: /${command} (${rows.length} asset${rows.length === 1 ? "" : "s"}).`,
+      allowedMentions: noMentions,
+      nonce: submissionId,
+      enforceNonce: true,
+    });
+  } catch (error) {
+    throw new UniformNotificationError(command, error);
+  }
+  try {
+    await markUniformRowsNotified(
+      spreadsheet,
+      command,
+      submissionId,
+      sentDiscordMessageId(sentMessage),
+    );
+  } catch (error) {
+    // The Discord notice is durable, but its bookkeeping write is not. Allow
+    // a later delivery to retry the keyed notice/status operation; Discord's
+    // nonce+enforceNonce pair prevents a second public message when supported.
+    activeUniformSubmissions.delete(duplicateKey);
+    throw new UniformNotificationError(command, error, true);
+  }
   await interaction.editReply({
     content: "",
     embeds: [presentationEmbed(
       "Uniform Log Submitted",
-      `Your /${command} submission was posted to the configured uniform channel.`,
+      `Your /${command} submission was saved to Google Sheets and posted as one short notice to the configured uniform channel.`,
       "success",
       avatarUrl,
       [{ name: "Destination", value: `<#${command === "log" ? settings.logChannelId : settings.moderatedChannelId}>` }],
@@ -578,33 +800,41 @@ export async function saveUniformSettings(
   actorId: string,
   settings: UniformSettings,
 ): Promise<GuildSetup> {
-  const normalized: UniformSettings = {
-    ...defaultUniformSettings(),
-    ...settings,
-    authorizedRoleIds: [...new Set(settings.authorizedRoleIds ?? [])],
-    authorizedMemberIds: [...new Set(settings.authorizedMemberIds ?? [])],
-  };
-  await validateUniformSettings(guild, normalized);
-  const updated: GuildSetup = {
-    ...setup,
-    uniforms: normalized,
-    updatedBy: actorId,
-    updatedAt: new Date().toISOString(),
-  };
-  await saveGuildSetup(updated);
-  return updated;
+  return updateGuildSetup(setup.guildId, async (latest) => {
+    const existing = uniformSettingsFor(latest ?? setup);
+    const normalized: UniformSettings = {
+      ...existing,
+      ...settings,
+      authorizedRoleIds: [...new Set(settings.authorizedRoleIds ?? [])],
+      authorizedMemberIds: [...new Set(settings.authorizedMemberIds ?? [])],
+      ...(Object.prototype.hasOwnProperty.call(settings, "spreadsheet")
+        ? { spreadsheet: settings.spreadsheet }
+        : existing.spreadsheet
+          ? { spreadsheet: existing.spreadsheet }
+          : {}),
+    };
+    await validateUniformSettings(guild, normalized);
+    const base = latest ?? setup;
+    return {
+      ...base,
+      uniforms: normalized,
+      updatedBy: actorId,
+      updatedAt: new Date().toISOString(),
+    };
+  });
 }
 
 export async function resetUniformSettings(
   setup: GuildSetup,
   actorId: string,
 ): Promise<GuildSetup> {
-  const updated = { ...setup } as GuildSetup & { uniforms?: UniformSettings };
-  delete updated.uniforms;
-  updated.updatedBy = actorId;
-  updated.updatedAt = new Date().toISOString();
-  await saveGuildSetup(updated);
-  return updated;
+  return updateGuildSetup(setup.guildId, (latest) => {
+    const updated = { ...(latest ?? setup) } as GuildSetup & { uniforms?: UniformSettings };
+    delete updated.uniforms;
+    updated.updatedBy = actorId;
+    updated.updatedAt = new Date().toISOString();
+    return updated;
+  });
 }
 
 export function uniformSettingsEmbed(
@@ -624,6 +854,13 @@ export function uniformSettingsEmbed(
       { name: "/moderated destination", value: settings.moderatedChannelId ? `<#${settings.moderatedChannelId}>` : "Not configured", inline: true },
       { name: "Authorized roles", value: mentionList(settings.authorizedRoleIds, "<@&"), inline: false },
       { name: "Authorized members", value: mentionList(settings.authorizedMemberIds, "<@"), inline: false },
+      {
+        name: "Google Sheets",
+        value: settings.spreadsheet
+          ? `${safePresentationText(settings.spreadsheet.spreadsheetId)}\n/log: ${safePresentationText(settings.spreadsheet.logTab)} · /moderated: ${safePresentationText(settings.spreadsheet.moderatedTab)}`
+          : "Not configured — submissions require Spreadsheet Configuration",
+        inline: false,
+      },
     ],
   );
 }
@@ -641,6 +878,14 @@ export async function renderUniformSettings(
           .setCustomId("setup:uniforms-config")
           .setLabel("Uploading Configuration")
           .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId("setup:uniforms-spreadsheet-config")
+          .setLabel("Spreadsheet Configuration")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId("setup:uniforms-spreadsheet-reset")
+          .setLabel("Reset Spreadsheet")
+          .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
           .setCustomId("setup:uniforms-reset")
           .setLabel("Reset Uniforms")
@@ -661,6 +906,61 @@ export async function handleUniformSettingsComponent(
       embeds: [uniformSettingsEmbed(updated)],
       components: [],
     });
+    return;
+  }
+  if (id === "setup:uniforms-spreadsheet-reset") {
+    const updated = await resetUniformSpreadsheetSettings(setup, interaction.user.id);
+    await interaction.update({
+      embeds: [uniformSettingsEmbed(updated)],
+      components: [],
+    });
+    return;
+  }
+  if (id === "setup:uniforms-spreadsheet-config") {
+    const spreadsheet = uniformSettingsFor(setup).spreadsheet;
+    await interaction.showModal(
+      new ModalBuilder()
+        .setCustomId("setup-modal:uniforms-spreadsheet")
+        .setTitle("Uniform Spreadsheet Configuration")
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId("spreadsheet_id")
+              .setLabel("Google Sheets URL or spreadsheet ID")
+              .setStyle(TextInputStyle.Short)
+              .setValue(spreadsheet?.spreadsheetId ?? "")
+              .setRequired(true)
+              .setMaxLength(300),
+          ),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId("log_tab")
+              .setLabel("/log worksheet tab (default: Uniform Logs)")
+              .setStyle(TextInputStyle.Short)
+              .setValue(spreadsheet?.logTab ?? "Uniform Logs")
+              .setRequired(true)
+              .setMaxLength(100),
+          ),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId("moderated_tab")
+              .setLabel("/moderated tab (default: Moderated Logs)")
+              .setStyle(TextInputStyle.Short)
+              .setValue(spreadsheet?.moderatedTab ?? "Moderated Logs")
+              .setRequired(true)
+              .setMaxLength(100),
+          ),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId("create_missing_tabs")
+              .setLabel("Create missing tabs? Type YES (otherwise NO)")
+              .setStyle(TextInputStyle.Short)
+              .setValue(spreadsheet?.createMissingTabs ? "YES" : "NO")
+              .setRequired(true)
+              .setMaxLength(3),
+          ),
+        ),
+    );
     return;
   }
   if (id !== "setup:uniforms-config") {
@@ -761,6 +1061,45 @@ export async function handleUniformSettingsModal(
       [
         { name: "/log", value: updated.uniforms?.logChannelId ? `<#${updated.uniforms.logChannelId}>` : "Not configured", inline: true },
         { name: "/moderated", value: updated.uniforms?.moderatedChannelId ? `<#${updated.uniforms.moderatedChannelId}>` : "Not configured", inline: true },
+      ],
+    )],
+    allowedMentions: noMentions,
+    ephemeral: true,
+  });
+  return updated;
+}
+
+export async function handleUniformSpreadsheetSettingsModal(
+  interaction: ModalSubmitInteraction,
+  setup: GuildSetup,
+): Promise<GuildSetup> {
+  const createInput = uniformModalValue(interaction, "create_missing_tabs").trim().toLowerCase();
+  if (createInput !== "yes" && createInput !== "no") {
+    throw new Error('Create missing tabs must be exactly "YES" or "NO".');
+  }
+  const spreadsheet = {
+    spreadsheetId: uniformModalValue(interaction, "spreadsheet_id"),
+    logTab: uniformModalValue(interaction, "log_tab") || "Uniform Logs",
+    moderatedTab: uniformModalValue(interaction, "moderated_tab") || "Moderated Logs",
+    createMissingTabs: createInput === "yes",
+  };
+  const updated = await saveUniformSpreadsheetSettings(
+    interaction.guild!,
+    setup,
+    interaction.user.id,
+    spreadsheet,
+  );
+  await interaction.reply({
+    content: "",
+    embeds: [presentationEmbed(
+      "Spreadsheet Configuration Saved",
+      "Google Sheets connectivity and both dedicated worksheet headers were validated before saving. Uniform submissions will write detailed RAW rows before posting one short Discord notice.",
+      "success",
+      undefined,
+      [
+        { name: "Spreadsheet", value: safePresentationText(updated.uniforms?.spreadsheet?.spreadsheetId ?? "") },
+        { name: "/log tab", value: safePresentationText(updated.uniforms?.spreadsheet?.logTab ?? "Uniform Logs"), inline: true },
+        { name: "/moderated tab", value: safePresentationText(updated.uniforms?.spreadsheet?.moderatedTab ?? "Moderated Logs"), inline: true },
       ],
     )],
     allowedMentions: noMentions,

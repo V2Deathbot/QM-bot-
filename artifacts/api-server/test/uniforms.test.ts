@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { beforeEach, test } from "node:test";
 import {
   ChannelType,
   Collection,
@@ -20,15 +20,23 @@ const {
   handleUniformCommand,
   parseUniformAssetInput,
   saveUniformSettings,
+  saveUniformSpreadsheetSettings,
   resetUniformSettings,
   uniformCommands,
   uniformSubmissionEmbed,
   validateUniformSettings,
+  resetUniformSubmissionStateForTests,
 } = await import("../src/bot/uniforms.ts");
 const {
   getGuildSetup,
+  saveGuildSetup,
   defaultUniformSettings,
 } = await import("../src/bot/setup-store.ts");
+const {
+  resetGoogleSheetsProxyForTests,
+  setGoogleSheetsProxyForTests,
+  UNIFORM_SHEET_HEADERS,
+} = await import("../src/bot/google-sheets.ts");
 
 const users = new Map([
   ["Customer", { id: 101, name: "Customer", displayName: "Customer" }],
@@ -40,6 +48,98 @@ const users = new Map([
 
 const originalFetch = globalThis.fetch;
 let lookupCalls: string[] = [];
+let interactionCounter = 0;
+let sheetsCalls: Array<{ path: string; options?: { method?: string; body?: unknown } }> = [];
+let sheetFailure: string | undefined;
+let appendFailureAfterCommit = false;
+let sheetValidationGate: Promise<void> | undefined;
+let notificationStatusFailure = false;
+const sheetRows = new Map<string, unknown[][]>();
+
+function resetSheetState(): void {
+  sheetsCalls = [];
+  sheetFailure = undefined;
+  appendFailureAfterCommit = false;
+  sheetValidationGate = undefined;
+  notificationStatusFailure = false;
+  sheetRows.clear();
+  sheetRows.set("Uniform Logs", [Array.from(UNIFORM_SHEET_HEADERS)]);
+  sheetRows.set("Moderated Logs", [Array.from(UNIFORM_SHEET_HEADERS)]);
+  resetUniformSubmissionStateForTests();
+}
+
+function sheetResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function sheetTab(pathname: string): string {
+  const decoded = decodeURIComponent(pathname);
+  const match = /\/values\/'((?:''|[^'])+)'!/.exec(decoded);
+  if (!match) throw new Error(`Unexpected Sheets range: ${decoded}`);
+  return match[1]!.replaceAll("''", "'");
+}
+
+function sheetTabFromRange(range: string): string {
+  const decoded = decodeURIComponent(range);
+  const match = /^'((?:''|[^'])+)'!/.exec(decoded);
+  if (!match) throw new Error(`Unexpected Sheets range: ${decoded}`);
+  return match[1]!.replaceAll("''", "'");
+}
+
+setGoogleSheetsProxyForTests(async (pathname, options) => {
+  sheetsCalls.push({ path: pathname, options });
+  if (sheetFailure) throw new Error(sheetFailure);
+  const method = options?.method ?? "GET";
+  if (pathname.includes("?fields=")) {
+    return sheetResponse({
+      sheets: [
+        { properties: { title: "Uniform Logs", sheetId: 1 } },
+        { properties: { title: "Moderated Logs", sheetId: 2 } },
+      ],
+    });
+  }
+  if (method === "GET") {
+    if (sheetValidationGate) await sheetValidationGate;
+    return sheetResponse({ values: sheetRows.get(sheetTab(pathname)) ?? [] });
+  }
+  if (method === "POST" && pathname.includes(":append")) {
+    const body = options?.body as { values?: unknown[][] } | undefined;
+    const tab = sheetTab(pathname);
+    const rows = sheetRows.get(tab) ?? [Array.from(UNIFORM_SHEET_HEADERS)];
+    rows.push(...(body?.values ?? []));
+    sheetRows.set(tab, rows);
+    if (appendFailureAfterCommit) {
+      appendFailureAfterCommit = false;
+      throw new Error("Sheets append response timed out after commit");
+    }
+    return sheetResponse({ updates: { updatedRows: body?.values?.length ?? 0 } });
+  }
+  if (method === "POST" && pathname.includes("/values:batchUpdate")) {
+    if (notificationStatusFailure) throw new Error("notification status update failed");
+    const body = options?.body as {
+      data?: Array<{ range?: string; values?: unknown[][] }>;
+    } | undefined;
+    for (const entry of body?.data ?? []) {
+      const match = /!R(\d+):S\1$/.exec(decodeURIComponent(entry.range ?? ""));
+      if (!match) throw new Error(`Unexpected status range: ${entry.range}`);
+      const rows = sheetRows.get(sheetTabFromRange(entry.range ?? ""))!;
+      const row = rows[Number(match[1]) - 1]!;
+      row[17] = entry.values?.[0]?.[0] ?? "";
+      row[18] = entry.values?.[0]?.[1] ?? "";
+    }
+    return sheetResponse({ totalUpdatedCells: (body?.data ?? []).length * 2 });
+  }
+  if (method === "PUT") {
+    const tab = sheetTab(pathname);
+    sheetRows.set(tab, [Array.from(UNIFORM_SHEET_HEADERS)]);
+    return sheetResponse({ updatedRows: 1 });
+  }
+  throw new Error(`Unexpected Sheets method/path: ${method} ${pathname}`);
+});
+
 globalThis.fetch = async (input, init) => {
   const url = new URL(input.toString());
   if (url.pathname !== "/v1/usernames/users") {
@@ -60,6 +160,7 @@ type ChannelState = {
   type: ChannelType;
   allowed: boolean;
   sends: unknown[];
+  sendFailure?: Error;
 };
 
 const channels = new Map<string, ChannelState>([
@@ -119,7 +220,18 @@ const guild = {
         ...channel,
         permissionsFor: () => ({ has: () => channel.allowed }),
         send: async (payload: unknown) => {
+          if (channel.sendFailure) throw channel.sendFailure;
+          const nonce = (payload as { nonce?: unknown }).nonce;
+          if (
+            (payload as { enforceNonce?: unknown }).enforceNonce === true &&
+            typeof nonce === "string" &&
+            channel.sends.some((entry) => (entry as { nonce?: unknown }).nonce === nonce)
+          ) {
+            const existing = channel.sends.find((entry) => (entry as { nonce?: unknown }).nonce === nonce);
+            return { id: (existing as { id?: string }).id ?? `message-${channel.sends.length}` };
+          }
           channel.sends.push(payload);
+          return { id: `message-${channel.sends.length}` };
         },
       };
     },
@@ -135,6 +247,12 @@ const setup = {
     moderatedChannelId: "moderated-channel",
     authorizedRoleIds: ["20000000000000001"],
     authorizedMemberIds: ["20000000000000002"],
+    spreadsheet: {
+      spreadsheetId: "sheet-id",
+      logTab: "Uniform Logs",
+      moderatedTab: "Moderated Logs",
+      createMissingTabs: false,
+    },
   },
   updatedBy: "owner",
   updatedAt: new Date().toISOString(),
@@ -144,9 +262,11 @@ function interaction(
   commandName: "log" | "moderated",
   values: Record<string, string | undefined>,
   userId = "20000000000000002",
+  id = `interaction-${++interactionCounter}`,
 ) {
   const privateReplies: unknown[] = [];
   return {
+    id,
     commandName,
     guild,
     guildId: guild.id,
@@ -165,6 +285,18 @@ function interaction(
   };
 }
 
+beforeEach(() => {
+  resetSheetState();
+  channels.get("log-channel")!.sendFailure = undefined;
+  channels.get("moderated-channel")!.sendFailure = undefined;
+  channels.get("log-channel")!.sends.length = 0;
+  channels.get("moderated-channel")!.sends.length = 0;
+  channels.get("log-channel")!.allowed = true;
+  channels.get("moderated-channel")!.allowed = true;
+  channels.get("log-channel")!.type = ChannelType.GuildText;
+  channels.get("moderated-channel")!.type = ChannelType.GuildText;
+});
+
 function logValues(assets: string[]): Record<string, string> {
   return {
     customer: "Customer",
@@ -177,6 +309,7 @@ function logValues(assets: string[]): Record<string, string> {
 
 test.after(() => {
   globalThis.fetch = originalFetch;
+  resetGoogleSheetsProxyForTests();
 });
 
 test("registers the exact six-command uniform contract and parses only Roblox assets", () => {
@@ -219,7 +352,7 @@ test("authorizes administrators, configured roles, and members while denying the
   );
 });
 
-test("logs all /log participants and ten assets once, with canonical IDs and no mentions", async () => {
+test("logs all /log participants as ten RAW sheet rows and one short channel message", async () => {
   lookupCalls = [];
   channels.get("log-channel")!.sends.length = 0;
   const result = interaction("log", logValues([
@@ -231,15 +364,31 @@ test("logs all /log participants and ten assets once, with canonical IDs and no 
   assert.deepEqual(lookupCalls.sort(), ["Customer", "Publisher", "Senior", "Shared"].sort());
   assert.equal(channels.get("log-channel")!.sends.length, 1);
   const publicPayload = channels.get("log-channel")!.sends[0] as {
-    embeds: Array<{ data: { fields?: Array<{ name: string; value: string }> } }>;
+    content: string;
+    embeds?: unknown[];
     allowedMentions: { parse: unknown[] };
   };
-  const fields = publicPayload.embeds[0]!.data.fields ?? [];
-  assert.equal(fields.filter((field) => field.name.startsWith("Uniform ")).length, 10);
-  assert.match(fields.find((field) => field.name === "Customer")?.value ?? "", /Customer/);
-  assert.match(fields.find((field) => field.name === "Customer")?.value ?? "", /101/);
-  assert.match(fields.find((field) => field.name === "Uniform 10")?.value ?? "", /110/);
+  assert.match(publicPayload.content, /^Uniform logged: \/log \(10 assets\)\.$/);
+  assert.equal(publicPayload.embeds, undefined);
   assert.deepEqual(publicPayload.allowedMentions.parse, []);
+  const detailedRows = sheetRows.get("Uniform Logs")!;
+  assert.equal(detailedRows.length, 11);
+  assert.deepEqual(detailedRows[0], Array.from(UNIFORM_SHEET_HEADERS));
+  assert.equal(detailedRows.slice(1).length, 10);
+  assert.equal(detailedRows[1]![1], "log");
+  assert.equal(detailedRows[1]![2], "Customer");
+  assert.equal(detailedRows[1]![3], "101");
+  assert.equal(detailedRows[1]![12], "101");
+  assert.equal(detailedRows[10]![12], "110");
+  assert.equal(detailedRows[1]![16], result.id);
+  assert.equal(detailedRows[1]![17], "NOTIFIED");
+  assert.equal(detailedRows[1]![18], "message-1");
+  assert.equal((channels.get("log-channel")!.sends[0] as { nonce: string; enforceNonce: boolean }).nonce, result.id);
+  assert.equal((channels.get("log-channel")!.sends[0] as { enforceNonce: boolean }).enforceNonce, true);
+  assert.equal(
+    sheetsCalls.filter(({ path, options }) => path.includes(":append") && options?.method === "POST").length,
+    1,
+  );
   assert.match(JSON.stringify(result.privateReplies), /Uniform Log Submitted/);
 });
 
@@ -257,10 +406,164 @@ test("validates /moderated uploader and posts only to its separate channel", asy
   assert.deepEqual(lookupCalls.sort(), ["Customer", "Publisher", "Uploader"].sort());
   assert.equal(channels.get("log-channel")!.sends.length, 0);
   assert.equal(channels.get("moderated-channel")!.sends.length, 1);
-  const serialized = JSON.stringify(channels.get("moderated-channel")!.sends[0]);
-  assert.match(serialized, /Uploader/);
-  assert.match(serialized, /Moderated Uniform Logged/);
-  assert.match(serialized, /77/);
+  const publicPayload = channels.get("moderated-channel")!.sends[0] as { content: string };
+  assert.equal(publicPayload.content, "Uniform logged: /moderated (1 asset).");
+  const detailedRows = sheetRows.get("Moderated Logs")!;
+  assert.equal(detailedRows.length, 2);
+  assert.equal(detailedRows[1]![1], "moderated");
+  assert.equal(detailedRows[1]![8], "Uploader");
+  assert.equal(detailedRows[1]![9], "104");
+  assert.equal(detailedRows[1]![12], "77");
+  assert.equal(detailedRows[1]![16], result.id);
+  assert.equal(detailedRows[1]![17], "NOTIFIED");
+});
+
+test("does not announce when the sheet connector fails", async () => {
+  sheetFailure = "connector unavailable";
+  const result = interaction("log", logValues(["1"]));
+  await assert.rejects(
+    handleUniformCommand(result as never, setup),
+    /Google Sheets.*failed|connector unavailable/i,
+  );
+  assert.equal(channels.get("log-channel")!.sends.length, 0);
+  assert.equal(sheetRows.get("Uniform Logs")!.length, 1);
+});
+
+test("reports durable sheet save when Discord notification fails and rejects resubmission", async () => {
+  const result = interaction("moderated", {
+    customer: "Customer",
+    uploader: "Uploader",
+    publisher: "Publisher",
+    shirtid: "77",
+  }, "20000000000000002", "notification-failure");
+  channels.get("moderated-channel")!.sendFailure = new Error("Discord channel unavailable");
+  await assert.rejects(
+    handleUniformCommand(result as never, setup),
+    /saved to Google Sheets.*Discord notification failed.*Do not resubmit/i,
+  );
+  assert.equal(sheetRows.get("Moderated Logs")!.length, 2);
+  assert.equal(channels.get("moderated-channel")!.sends.length, 0);
+
+  channels.get("moderated-channel")!.sendFailure = undefined;
+  await assert.rejects(
+    handleUniformCommand(result as never, setup),
+    /already been processed|already present/i,
+  );
+  assert.equal(sheetRows.get("Moderated Logs")!.length, 2);
+  assert.equal(channels.get("moderated-channel")!.sends.length, 0);
+});
+
+test("retries a pending notice after process state is lost without appending rows", async () => {
+  const result = interaction("moderated", {
+    customer: "Customer",
+    uploader: "Uploader",
+    publisher: "Publisher",
+    shirtid: "77",
+  }, "20000000000000002", "pending-notice-retry");
+  channels.get("moderated-channel")!.sendFailure = new Error("temporary Discord failure");
+  await assert.rejects(handleUniformCommand(result as never, setup), /Discord notification failed/i);
+  channels.get("moderated-channel")!.sendFailure = undefined;
+  resetUniformSubmissionStateForTests();
+  await handleUniformCommand(result as never, setup);
+  assert.equal(sheetRows.get("Moderated Logs")!.length, 2);
+  assert.equal(sheetRows.get("Moderated Logs")![1]![17], "NOTIFIED");
+  assert.equal(channels.get("moderated-channel")!.sends.length, 1);
+});
+
+test("retries notification bookkeeping after a notice succeeds but status update fails", async () => {
+  const result = interaction("log", logValues(["1"]), "20000000000000002", "status-timeout");
+  notificationStatusFailure = true;
+  await assert.rejects(
+    handleUniformCommand(result as never, setup),
+    /notification status could not be recorded.*Do not resubmit/i,
+  );
+  assert.equal(channels.get("log-channel")!.sends.length, 1);
+  assert.equal(sheetRows.get("Uniform Logs")![1]![17], "PENDING");
+  notificationStatusFailure = false;
+  await handleUniformCommand(result as never, setup);
+  assert.equal(channels.get("log-channel")!.sends.length, 1);
+  assert.equal(sheetRows.get("Uniform Logs")![1]![17], "NOTIFIED");
+});
+
+test("verifies an append committed before timeout and still posts its notice", async () => {
+  appendFailureAfterCommit = true;
+  const result = interaction("log", logValues(["1"]), "20000000000000002", "append-timeout");
+  await handleUniformCommand(result as never, setup);
+  assert.equal(channels.get("log-channel")!.sends.length, 1);
+  assert.equal(sheetRows.get("Uniform Logs")![1]![16], result.id);
+  assert.equal(sheetRows.get("Uniform Logs")![1]![17], "NOTIFIED");
+  assert.equal(sheetRows.get("Uniform Logs")![1]![18], "message-1");
+});
+
+test("does not send a duplicate when persisted rows already record the notice", async () => {
+  const result = interaction("log", logValues(["1"]), "20000000000000002", "already-notified");
+  await handleUniformCommand(result as never, setup);
+  resetUniformSubmissionStateForTests();
+  await handleUniformCommand(result as never, setup);
+  assert.equal(channels.get("log-channel")!.sends.length, 1);
+  assert.match(JSON.stringify(result.privateReplies), /already saved.*notice is already recorded/i);
+});
+
+test("does not append duplicate rows for duplicate interaction delivery", async () => {
+  const result = interaction("log", logValues(["1", "2"]), "20000000000000002", "duplicate-interaction");
+  await handleUniformCommand(result as never, setup);
+  const callsAfterFirst = sheetsCalls.length;
+  await assert.rejects(
+    handleUniformCommand(result as never, setup),
+    /already been processed|already present/i,
+  );
+  assert.equal(sheetRows.get("Uniform Logs")!.length, 3);
+  assert.equal(sheetsCalls.length, callsAfterFirst);
+  assert.equal(channels.get("log-channel")!.sends.length, 1);
+});
+
+test("explains missing spreadsheet configuration without posting a channel message", async () => {
+  const withoutSpreadsheet = {
+    ...setup,
+    uniforms: { ...setup.uniforms!, spreadsheet: undefined },
+  };
+  const result = interaction("log", logValues(["1"]));
+  await assert.rejects(
+    handleUniformCommand(result as never, withoutSpreadsheet),
+    /Spreadsheet Configuration.*spreadsheet URL or ID/i,
+  );
+  assert.equal(channels.get("log-channel")!.sends.length, 0);
+});
+
+test("serializes slow Spreadsheet Configuration saves against latest uploading settings", async () => {
+  await saveGuildSetup(setup as never);
+  let releaseValidation!: () => void;
+  sheetValidationGate = new Promise<void>((resolve) => {
+    releaseValidation = resolve;
+  });
+  const spreadsheetSave = saveUniformSpreadsheetSettings(
+    guild as never,
+    setup as never,
+    "sheet-admin",
+    {
+      spreadsheetId: "new-sheet-id",
+      logTab: "Uniform Logs",
+      moderatedTab: "Moderated Logs",
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const uploadingSave = saveUniformSettings(guild as never, setup as never, "upload-admin", {
+    logChannelId: "moderated-channel",
+    moderatedChannelId: "log-channel",
+    authorizedRoleIds: ["20000000000000001"],
+    authorizedMemberIds: ["20000000000000002"],
+  });
+  await uploadingSave;
+  releaseValidation();
+  await spreadsheetSave;
+
+  const saved = await getGuildSetup(guild.id);
+  assert.equal(saved?.uniforms?.spreadsheet?.spreadsheetId, "new-sheet-id");
+  assert.equal(saved?.uniforms?.logChannelId, "moderated-channel");
+  assert.equal(saved?.uniforms?.moderatedChannelId, "log-channel");
+  assert.deepEqual(saved?.uniforms?.authorizedRoleIds, ["20000000000000001"]);
+  assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["20000000000000002"]);
 });
 
 test("rejects invalid accounts/assets and malformed gaps before sending anything", async () => {

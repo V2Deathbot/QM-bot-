@@ -83,6 +83,17 @@ export interface UniformSettings {
   /** Additional submitters allowed to use either uniform command. */
   authorizedRoleIds: string[];
   authorizedMemberIds: string[];
+  /** Optional Google Sheets destination for the detailed uniform rows. */
+  spreadsheet?: UniformSpreadsheetSettings;
+}
+
+export interface UniformSpreadsheetSettings {
+  /** Canonical Google Sheets ID; credentials remain in the Replit connector. */
+  spreadsheetId: string;
+  logTab: string;
+  moderatedTab: string;
+  /** Missing tabs are created only when explicitly enabled by an administrator. */
+  createMissingTabs?: boolean;
 }
 
 export const defaultUniformSettings = (): UniformSettings => ({
@@ -91,11 +102,19 @@ export const defaultUniformSettings = (): UniformSettings => ({
 });
 
 export function uniformSettingsFor(setup: GuildSetup): UniformSettings {
+  const spreadsheet = setup.uniforms?.spreadsheet
+    ? {
+        ...setup.uniforms.spreadsheet,
+        logTab: setup.uniforms.spreadsheet.logTab || "Uniform Logs",
+        moderatedTab: setup.uniforms.spreadsheet.moderatedTab || "Moderated Logs",
+      }
+    : undefined;
   return {
     ...defaultUniformSettings(),
     ...setup.uniforms,
     authorizedRoleIds: [...(setup.uniforms?.authorizedRoleIds ?? [])],
     authorizedMemberIds: [...(setup.uniforms?.authorizedMemberIds ?? [])],
+    ...(spreadsheet ? { spreadsheet } : {}),
   };
 }
 
@@ -252,4 +271,33 @@ export async function saveGuildSetup(
   mutationQueue = operation.catch(() => undefined);
   await operation;
   return setup;
+}
+
+/**
+ * Apply a setup mutation while holding the same serialized store queue used by
+ * saveGuildSetup. The updater reads the latest persisted record inside the
+ * queue, so a slow provider-backed settings flow cannot overwrite unrelated
+ * changes made while it was waiting.
+ */
+export async function updateGuildSetup(
+  guildId: string,
+  updater: (current: GuildSetup | undefined) => GuildSetup | Promise<GuildSetup>,
+): Promise<GuildSetup> {
+  const operation = mutationQueue.then(async () => {
+    const store = await readStore();
+    migrateObsoletePresence(store);
+    const index = store.guilds.findIndex((candidate) => candidate.guildId === guildId);
+    const current = index === -1 ? undefined : store.guilds[index];
+    const updated = await updater(current);
+    if (updated.guildId !== guildId) {
+      throw new Error("The guild setup mutation returned the wrong guild.");
+    }
+    if (index === -1) store.guilds.push(updated);
+    else store.guilds[index] = updated;
+    await writeStore(store);
+    return updated;
+  });
+
+  mutationQueue = operation.then(() => undefined, () => undefined);
+  return operation;
 }

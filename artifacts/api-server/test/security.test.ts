@@ -28,6 +28,11 @@ process.env.ROLE_SNAPSHOT_FILE = path.join(directory, "snapshots.json");
 
 const { config } = await import("../src/bot/config.ts");
 const { saveGuildSetup } = await import("../src/bot/setup-store.ts");
+const {
+  resetGoogleSheetsProxyForTests,
+  setGoogleSheetsProxyForTests,
+  UNIFORM_SHEET_HEADERS,
+} = await import("../src/bot/google-sheets.ts");
 const { getSecurityState, mutateSecurityState } =
   await import("../src/bot/security-store.ts");
 const { findActiveSnapshot, findRoleSnapshot, saveRoleSnapshot } = await import("../src/bot/role-store.ts");
@@ -91,6 +96,45 @@ let trelloCreateFailure = false;
 let client: Client | undefined;
 let componentMessageSequence = 0;
 let latestComponentMessageId = "component-message-0";
+const spreadsheetRows = new Map<string, unknown[][]>([
+  ["Uniform Logs", [Array.from(UNIFORM_SHEET_HEADERS)]],
+  ["Moderated Logs", [Array.from(UNIFORM_SHEET_HEADERS)]],
+]);
+
+function sheetTab(pathname: string): string {
+  const decoded = decodeURIComponent(pathname);
+  const match = /\/values\/'((?:''|[^'])+)'!/.exec(decoded);
+  if (!match) throw new Error(`Unexpected Sheets range: ${decoded}`);
+  return match[1]!.replaceAll("''", "'");
+}
+
+setGoogleSheetsProxyForTests(async (pathname, options) => {
+  if (pathname.includes("?fields=")) {
+    return new Response(JSON.stringify({
+      sheets: [
+        { properties: { title: "Uniform Logs", sheetId: 1 } },
+        { properties: { title: "Moderated Logs", sheetId: 2 } },
+      ],
+    }));
+  }
+  const method = options?.method ?? "GET";
+  if (method === "GET") {
+    return new Response(JSON.stringify({ values: spreadsheetRows.get(sheetTab(pathname)) ?? [] }));
+  }
+  if (method === "PUT") {
+    spreadsheetRows.set(sheetTab(pathname), [Array.from(UNIFORM_SHEET_HEADERS)]);
+    return new Response(JSON.stringify({ updatedRows: 1 }));
+  }
+  if (method === "POST" && pathname.includes(":append")) {
+    const body = options?.body as { values?: unknown[][] } | undefined;
+    const tab = sheetTab(pathname);
+    const rows = spreadsheetRows.get(tab) ?? [Array.from(UNIFORM_SHEET_HEADERS)];
+    rows.push(...(body?.values ?? []));
+    spreadsheetRows.set(tab, rows);
+    return new Response(JSON.stringify({ updates: { updatedRows: body?.values?.length ?? 0 } }));
+  }
+  return new Response(JSON.stringify({}));
+});
 
 function presentationReplyText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -369,8 +413,9 @@ function modal(userId: string, customId: string, values: Record<string, string>)
 
 async function settle(): Promise<void> {
   // The Discord event listener intentionally starts asynchronous command work
-  // without awaiting it. A few turns lets a mocked interaction complete.
-  await new Promise((resolve) => setTimeout(resolve, 15));
+  // without awaiting it. Allow the mocked file-backed stores and concurrent
+  // continuation handlers enough time to settle under the serial full suite.
+  await new Promise((resolve) => setTimeout(resolve, 50));
 }
 
 async function dispatch(interaction: ReturnType<typeof command>): Promise<void> {
@@ -538,6 +583,11 @@ function modalTextInputIds(shownModal: ShownModal): string[] {
     assert.ok(input.custom_id, "serialized modal text input must have a custom ID");
   }
   return inputs.map((input) => input.custom_id!);
+}
+
+function modalTextInputValues(shownModal: ShownModal): string[] {
+  const inputs = shownModal.components.flatMap((row) => row.components ?? []);
+  return inputs.map((input) => (input as SerializedModalComponent & { value?: string }).value ?? "");
 }
 
 async function openSettings(userId: string): Promise<{
@@ -747,6 +797,7 @@ test.after(() => {
   (GuildManager.prototype as unknown as { fetch: typeof originalGuildFetch }).fetch =
     originalGuildFetch;
   globalThis.fetch = originalFetch;
+  resetGoogleSheetsProxyForTests();
 });
 
 test("denies normal members and non-Administrator moderators before administrative handlers execute", async () => {
@@ -912,6 +963,77 @@ test("navigates to Uniforms uploading configuration, seals modal fields, saves, 
   const backInteraction = button("setup-owner", backToCategory);
   await dispatchRaw(backInteraction);
   assert.match(presentationReplyText(backInteraction.localReplies.at(-1)), /Uniforms/);
+});
+
+test("configures Spreadsheet Configuration with stable nonce-bound fields and preserves uploading access", async () => {
+  await setSecurity({});
+  members.set("12345678901234570", { administrator: false });
+  const store = await import("../src/bot/setup-store.ts");
+  const current = await store.getGuildSetup(guild.id);
+  assert.ok(current);
+  await saveGuildSetup({
+    ...current!,
+    uniforms: {
+      logChannelId: "12345678901234567",
+      moderatedChannelId: "12345678901234568",
+      authorizedRoleIds: ["12345678901234569"],
+      authorizedMemberIds: ["12345678901234570"],
+    },
+  });
+
+  const { root } = await openSettings("setup-owner");
+  const uniforms = await chooseSettingsCategory("setup-owner", root, "uniforms");
+  const uniformPageInteraction = await chooseSettingsAction("setup-owner", uniforms, "setup:uniforms");
+  let uniformPage = latestComponentPayload(uniformPageInteraction);
+  const configure = renderedButton(uniformPage, "Spreadsheet Configuration", "setup:");
+  assert.match(configure, /^setup:uniforms-spreadsheet-config:[a-f0-9]{32}$/);
+  await dispatchRaw(button("setup-owner", configure));
+  let shown = shownModals.at(-1)!;
+  assert.deepEqual(modalTextInputIds(shown), [
+    "spreadsheet_id",
+    "log_tab",
+    "moderated_tab",
+    "create_missing_tabs",
+  ]);
+  assert.deepEqual(modalTextInputValues(shown), ["", "Uniform Logs", "Moderated Logs", "NO"]);
+  assert.match(shown.customId, /^setup-modal:uniforms-spreadsheet:[a-f0-9]{32}$/);
+
+  await dispatchRaw(modal("setup-owner", shown.customId, {
+    spreadsheet_id: "https://docs.google.com/spreadsheets/d/sheet-id/edit",
+    log_tab: "Uniform Logs",
+    moderated_tab: "Moderated Logs",
+    create_missing_tabs: "NO",
+  }));
+  let saved = await store.getGuildSetup(guild.id);
+  assert.equal(saved?.uniforms?.spreadsheet?.spreadsheetId, "sheet-id");
+  assert.equal(saved?.uniforms?.logChannelId, "12345678901234567");
+  assert.deepEqual(saved?.uniforms?.authorizedRoleIds, ["12345678901234569"]);
+  assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["12345678901234570"]);
+
+  // A fresh modal still re-checks current Administrator access.
+  uniformPage = latestComponentPayload(uniformPageInteraction);
+  const secondConfigure = renderedButton(uniformPage, "Spreadsheet Configuration", "setup:");
+  await dispatchRaw(button("setup-owner", secondConfigure));
+  shown = shownModals.at(-1)!;
+  members.set("setup-owner", { administrator: false });
+  await dispatchRaw(modal("setup-owner", shown.customId, {
+    spreadsheet_id: "sheet-id",
+    log_tab: "Uniform Logs",
+    moderated_tab: "Moderated Logs",
+    create_missing_tabs: "NO",
+  }));
+  assert.match(replies.at(-1) ?? "", /Administrator|permission/i);
+  saved = await store.getGuildSetup(guild.id);
+  assert.equal(saved?.uniforms?.spreadsheet?.spreadsheetId, "sheet-id");
+  members.set("setup-owner", { administrator: true });
+
+  const reset = button("setup-owner", renderedButton(uniformPage, "Reset Spreadsheet", "setup:"));
+  await dispatchRaw(reset);
+  saved = await store.getGuildSetup(guild.id);
+  assert.equal(saved?.uniforms?.spreadsheet, undefined);
+  assert.equal(saved?.uniforms?.logChannelId, "12345678901234567");
+  assert.deepEqual(saved?.uniforms?.authorizedRoleIds, ["12345678901234569"]);
+  assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["12345678901234570"]);
 });
 
 test("manual lockdown stops destructive handlers without stopping authorized status commands", async () => {
@@ -1305,6 +1427,9 @@ test("confirmation tokens are atomically claimed before duplicate continuations 
     client!.emit("interactionCreate", first);
     client!.emit("interactionCreate", duplicate);
     await settle();
+    for (let attempt = 0; attempt < 40 && !first.deferred; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     assert.equal(first.deferred, true);
     assert.equal(duplicate.deferred, false);
     assert.equal(
