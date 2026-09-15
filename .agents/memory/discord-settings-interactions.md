@@ -7,4 +7,10 @@ Test menu actions with Discord's actual acknowledgement and component constraint
 
 **Why:** A menu migration exposed cases where permissive mocks accepted editing an unacknowledged response, and stored text exceeded Discord's shorter select-label limit. Slash-command coverage alone did not catch these integration errors.
 
-**How to apply:** Every dropdown/button must reply, update, or defer before editing; every new child component must retain the session nonce. Test long stored values separately from truncated UI labels, and migrate only recognized old defaults while preserving custom settings.
+**How to apply:** Every dropdown/button must reply, update, or defer before editing. Bind interactive controls and the modal itself to the session nonce, not modal text-input field keys. Test long stored values separately from truncated UI labels, and migrate only recognized old defaults while preserving custom settings.
+
+Test modal submissions using the actual serialized field IDs, with missing-field errors matching Discord.
+
+**Why:** Tests that invented submission keys concealed a form-builder mismatch: completed forms failed because session scoping had renamed their input fields.
+
+**How to apply:** Capture the emitted modal JSON, construct submissions from its fields, and verify persisted values rather than only checking the modal opened.

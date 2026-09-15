@@ -63,7 +63,26 @@ const replies: string[] = [];
 const auditEvents: unknown[] = [];
 const trelloWrites: string[] = [];
 const trelloCardCreations: string[] = [];
-const shownModals: Array<{ userId: string; customId: string }> = [];
+type SerializedModalComponent = {
+  type?: number;
+  custom_id?: string;
+};
+type SerializedModal = {
+  custom_id?: string;
+  components?: Array<{
+    type?: number;
+    components?: SerializedModalComponent[];
+  }>;
+};
+type ShownModal = {
+  userId: string;
+  customId: string;
+  components: Array<{
+    type?: number;
+    components?: SerializedModalComponent[];
+  }>;
+};
+const shownModals: ShownModal[] = [];
 let providerRequests = 0;
 let roleMutationCalls = 0;
 let trelloCards: Array<Record<string, unknown>> = [];
@@ -105,6 +124,16 @@ function presentationReplyText(value: unknown): string {
 function recordReply(value: unknown): void {
   const text = presentationReplyText(value);
   if (text) replies.push(text);
+}
+
+function captureShownModal(userId: string, value: { toJSON: () => unknown }): void {
+  const serialized = value.toJSON() as SerializedModal;
+  assert.ok(serialized.custom_id, "shown modal must have a serialized custom ID");
+  shownModals.push({
+    userId,
+    customId: serialized.custom_id,
+    components: serialized.components ?? [],
+  });
 }
 
 function memberFor(id: string): Member {
@@ -254,8 +283,8 @@ function button(userId: string, customId: string, messageId = latestComponentMes
     replied: false,
     deferUpdate: async () => { interaction.deferred = true; },
     update: async (value: unknown) => { interaction.replied = true; localReplies.push(value); },
-    showModal: async (value: { data: { custom_id: string } }) => {
-      shownModals.push({ userId, customId: value.data.custom_id });
+    showModal: async (value: { toJSON: () => unknown }) => {
+      captureShownModal(userId, value);
     },
     reply: async (value: unknown) => {
       interaction.replied = true;
@@ -289,8 +318,8 @@ function select(userId: string, customId: string, values: string[], messageId = 
     deferUpdate: async () => { interaction.deferred = true; },
     update: async (value: unknown) => { interaction.replied = true; localReplies.push(value); },
     editReply: async (value: unknown) => { localReplies.push(value); },
-    showModal: async (value: { data: { custom_id: string } }) => {
-      shownModals.push({ userId, customId: value.data.custom_id });
+    showModal: async (value: { toJSON: () => unknown }) => {
+      captureShownModal(userId, value);
     },
     reply: async (value: unknown) => {
       interaction.replied = true;
@@ -319,7 +348,14 @@ function modal(userId: string, customId: string, values: Record<string, string>)
     user: { id: userId },
     deferred: false,
     replied: false,
-    fields: { getTextInputValue: (name: string) => values[name] ?? "" },
+    fields: {
+      getTextInputValue: (name: string) => {
+        if (!Object.prototype.hasOwnProperty.call(values, name)) {
+          throw new Error(`Cannot find text input with custom ID "${name}"`);
+        }
+        return values[name]!;
+      },
+    },
     reply: async (value: unknown) => {
       interaction.replied = true;
       localReplies.push(value);
@@ -492,6 +528,16 @@ function renderedButton(
 function renderedOptions(payload: ComponentPayload): string[] {
   return renderedSelect(payload).options.map((option) =>
     (option.value ?? option.data?.value ?? "").replace(/:[a-f0-9]{32}$/, ""));
+}
+
+function modalTextInputIds(shownModal: ShownModal): string[] {
+  const inputs = shownModal.components.flatMap((row) => row.components ?? []);
+  assert.ok(inputs.length, "shown modal should contain text inputs");
+  for (const input of inputs) {
+    assert.equal(input.type, 4, "modal components must be Discord text inputs");
+    assert.ok(input.custom_id, "serialized modal text input must have a custom ID");
+  }
+  return inputs.map((input) => input.custom_id!);
 }
 
 async function openSettings(userId: string): Promise<{
@@ -1435,6 +1481,94 @@ test("/settings traverses categories and opens nonce-bound parameter modals", as
     await chooseSettingsAction("admin-a", category, action);
     assert.ok(shownModals.at(-1)?.customId.startsWith(expectedModal), `${action} should open its modal`);
   }
+});
+
+test("sealed settings modals keep field IDs stable while binding modal sessions", async () => {
+  await setSecurity({
+    confirmationsRequired: false,
+    perAdminLimit: 20,
+    globalLimit: 20,
+    windowMinutes: 5,
+    automaticLockdownThreshold: 20,
+  });
+  shownModals.splice(0);
+
+  const ratesRoot = await openSettings("admin-a");
+  const ratesCategory = await chooseSettingsCategory("admin-a", ratesRoot.root, "security");
+  const ratesPage = await chooseSettingsAction("admin-a", ratesCategory, "setup:security");
+  await dispatchRaw(button(
+    "admin-a",
+    renderedButton(latestComponentPayload(ratesPage), "Edit Rate Limits"),
+  ));
+  const ratesModal = shownModals.at(-1);
+  assert.ok(ratesModal);
+  assert.equal(ratesModal.userId, "admin-a");
+  assert.match(ratesModal.customId, /^setup-modal:rates:[a-f0-9]{32}$/);
+  const rateInputIds = modalTextInputIds(ratesModal);
+  assert.deepEqual(rateInputIds, ["per_admin", "global", "window"]);
+  assert.ok(
+    rateInputIds.every((id) => !/:([a-f0-9]{32})$/.test(id)),
+    "text input IDs must remain stable field keys, not session controls",
+  );
+
+  const rateValues: Record<string, string> = Object.fromEntries(rateInputIds.map((id) => [
+    id,
+    ({ per_admin: "7", global: "19", window: "23" } as Record<string, string>)[id]!,
+  ]));
+  await dispatchRaw(modal("admin-a", ratesModal.customId, rateValues));
+  const savedRates = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  assert.deepEqual(
+    {
+      perAdminLimit: savedRates?.security?.perAdminLimit,
+      globalLimit: savedRates?.security?.globalLimit,
+      windowMinutes: savedRates?.security?.windowMinutes,
+    },
+    { perAdminLimit: 7, globalLimit: 19, windowMinutes: 23 },
+  );
+
+  // The emitted modal ID is user/session bound as well. A different
+  // administrator and an expired owner may not submit it, even with the
+  // exact field IDs Discord emitted.
+  const foreignBefore = savedRates?.security;
+  await dispatchRaw(modal("admin-b", ratesModal.customId, rateValues));
+  assert.match(replies.at(-1) ?? "", /settings session has expired|another administrator/i);
+  const afterForeign = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  assert.deepEqual(afterForeign?.security, foreignBefore);
+
+  const realNow = Date.now;
+  Date.now = () => realNow() + 11 * 60_000;
+  try {
+    await dispatchRaw(modal("admin-a", ratesModal.customId, rateValues));
+    assert.match(replies.at(-1) ?? "", /settings session has expired/i);
+  } finally {
+    Date.now = realNow;
+  }
+  const afterExpired = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  assert.deepEqual(afterExpired?.security, foreignBefore);
+
+  // Threshold uses the same legacy setup-component renderer and therefore
+  // exercises the generic sealing path with a second parameter modal.
+  shownModals.splice(0);
+  const thresholdRoot = await openSettings("admin-a");
+  const thresholdCategory = await chooseSettingsCategory("admin-a", thresholdRoot.root, "security");
+  const securityPage = await chooseSettingsAction("admin-a", thresholdCategory, "setup:security");
+  const lockdown = button(
+    "admin-a",
+    renderedButton(latestComponentPayload(securityPage), "Lockdown Settings"),
+  );
+  await dispatchRaw(lockdown);
+  const thresholdButton = renderedButton(latestComponentPayload(lockdown), "Change Threshold");
+  await dispatchRaw(button("admin-a", thresholdButton));
+  const thresholdModal = shownModals.at(-1);
+  assert.ok(thresholdModal);
+  assert.match(thresholdModal.customId, /^setup-modal:threshold:[a-f0-9]{32}$/);
+  const thresholdInputIds = modalTextInputIds(thresholdModal);
+  assert.deepEqual(thresholdInputIds, ["threshold"]);
+  await dispatchRaw(modal("admin-a", thresholdModal.customId, {
+    [thresholdInputIds[0]!]: "37",
+  }));
+  const savedThreshold = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  assert.equal(savedThreshold?.security?.automaticLockdownThreshold, 37);
 });
 
 test("settings navigation returns through categories, nested pages, and saved results", async () => {

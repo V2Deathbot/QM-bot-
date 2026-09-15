@@ -3,6 +3,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ComponentType,
   EmbedBuilder,
   Events,
   GatewayIntentBits,
@@ -712,12 +713,15 @@ function setupSessionId(guildId: string, userId: string): string {
 function sealSettingsComponents(payload: unknown, nonce: string): unknown {
   const seal = (component: unknown) => {
     const candidate = component as {
-      data?: { custom_id?: string };
+      data?: { custom_id?: string; type?: number };
       components?: unknown[];
       setCustomId?: (id: string) => unknown;
     };
     const id = candidate.data?.custom_id;
-    if (id && !id.endsWith(`:${nonce}`) && typeof candidate.setCustomId === "function") {
+    // The modal carries the session nonce. Its input IDs are stable field keys
+    // read by getTextInputValue(), not independently actionable controls.
+    if (id && candidate.data?.type !== ComponentType.TextInput &&
+        !id.endsWith(`:${nonce}`) && typeof candidate.setCustomId === "function") {
       candidate.setCustomId(`${id}:${nonce}`);
     }
     for (const nested of candidate.components ?? []) seal(nested);

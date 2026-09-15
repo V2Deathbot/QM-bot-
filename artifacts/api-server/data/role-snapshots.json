@@ -77,8 +77,27 @@
       "blacklistReason": "Uploaded his own uniform",
       "source": "command",
       "blacklistNotificationAttemptedAt": "2026-09-15T00:31:41.470Z",
+      "status": "revoked",
+      "createdAt": "2026-09-15T00:31:41.470Z",
+      "cardUpdatedAt": "2026-09-15T00:33:53.373Z",
+      "revocationCardMovedAt": "2026-09-15T00:38:39.441Z",
+      "revokedAt": "2026-09-15T00:38:39.658Z",
+      "revocationNotificationAttemptedAt": "2026-09-15T00:38:39.658Z"
+    },
+    {
+      "key": "1114860005334716422:2478999609",
+      "guildId": "1114860005334716422",
+      "discordUserId": "1436793801556492468",
+      "robloxUserId": 2478999609,
+      "robloxUsername": "Goldbrix236",
+      "roleIds": [],
+      "cardId": "6aa894e4c0aef045fd2b5fbe",
+      "cardUrl": "https://trello.com/c/REw3TqCs/9-goldbrix236-2478999609",
+      "blacklistType": "permanent",
+      "blacklistReason": "gay man",
+      "source": "command",
       "status": "active",
-      "createdAt": "2026-09-15T00:31:41.470Z"
+      "createdAt": "2026-09-15T00:44:20.421Z"
     }
   ],
   "notes": [
