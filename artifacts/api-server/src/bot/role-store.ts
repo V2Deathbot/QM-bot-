@@ -1,6 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import path from "node:path";
 import { config } from "./config";
+import { isFileBotStorage, mutateBotDocument, readBotDocument } from "./persistent-store";
 
 export interface RoleSnapshot {
   key: string;
@@ -38,11 +37,9 @@ export interface BlacklistNote {
   createdAt: string;
 }
 
-let loaded: SnapshotFile | undefined;
-let writeQueue = Promise.resolve();
 const memberQueues = new Map<string, Promise<void>>();
 const guildLifecycleQueues = new Map<string, Promise<void>>();
-let temporaryFileSequence = 0;
+let loaded: SnapshotFile | undefined;
 
 /** Serializes command and synchronizer role sinks for the same Discord account. */
 export function withMemberRoleLock<T>(
@@ -83,24 +80,10 @@ export function withGuildBlacklistLifecycleLock<T>(
 }
 
 async function load(): Promise<SnapshotFile> {
-  if (loaded) return loaded;
-
-  try {
-    const raw = await readFile(config.snapshotFile, "utf8");
-    loaded = JSON.parse(raw) as SnapshotFile;
-    loaded.notes ??= [];
-    // Snapshots predating source tracking can only have been created by this
-    // bot's command flow. Migrate those records explicitly; never promote a
-    // known `sync` record to command-approved status.
-    for (const snapshot of loaded.snapshots) {
-      snapshot.source ??= "command";
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    loaded = { snapshots: [], notes: [] };
-  }
-
-  return loaded;
+  if (isFileBotStorage() && loaded) return cloneFile(loaded);
+  const file = await readBotDocument(storeOptions);
+  if (isFileBotStorage()) loaded = cloneFile(file);
+  return file;
 }
 
 function cloneSnapshot(snapshot: RoleSnapshot): RoleSnapshot {
@@ -114,27 +97,63 @@ function cloneFile(file: SnapshotFile): SnapshotFile {
   };
 }
 
+const storeOptions = {
+  name: "role-snapshots",
+  get filePath() { return config.snapshotFile; },
+  empty: (): SnapshotFile => ({ snapshots: [], notes: [] }),
+  validate(value: unknown): SnapshotFile {
+    const file = value as Partial<SnapshotFile>;
+    if (!file || typeof file !== "object" || !Array.isArray(file.snapshots) ||
+        (file.notes !== undefined && !Array.isArray(file.notes))) {
+      throw new Error("The persistent role snapshot document has an invalid format.");
+    }
+    if (!file.snapshots.every((snapshot) => {
+      const value = snapshot as Partial<RoleSnapshot>;
+      return Boolean(value) && typeof value === "object" &&
+        typeof value.key === "string" && typeof value.guildId === "string" &&
+        typeof value.discordUserId === "string" && typeof value.robloxUserId === "number" &&
+        Number.isSafeInteger(value.robloxUserId) && typeof value.robloxUsername === "string" &&
+        Array.isArray(value.roleIds) && value.roleIds.every((id) => typeof id === "string") &&
+        ["pending", "active", "revocation_pending", "revoked", "failed"].includes(value.status ?? "") &&
+        typeof value.createdAt === "string";
+    }) || !(file.notes ?? []).every((note) => {
+      const value = note as Partial<BlacklistNote>;
+      return Boolean(value) && typeof value === "object" && typeof value.id === "string" &&
+        typeof value.guildId === "string" && typeof value.actorId === "string" &&
+        typeof value.text === "string" && typeof value.createdAt === "string";
+    })) {
+      throw new Error("The persistent role snapshot document contains an invalid record.");
+    }
+    return {
+      snapshots: file.snapshots as RoleSnapshot[],
+      notes: (file.notes ?? []) as BlacklistNote[],
+    };
+  },
+};
+
+export function validateRoleSnapshotsDocument(value: unknown): void {
+  storeOptions.validate(value);
+}
+
 /**
- * Serialize mutations and only publish the replacement in-memory state after
- * its complete JSON document has been atomically installed. This deliberately
- * avoids modifying `loaded` before a failed disk write.
+ * PostgreSQL serializes mutations across all bot processes. Clone before
+ * changing state so a rejected mutation cannot publish a partial document.
  */
 async function mutateFile<T>(
   mutation: (file: SnapshotFile) => T,
 ): Promise<T> {
-  const operation = writeQueue.catch(() => undefined).then(async () => {
-    const next = cloneFile(await load());
+  let committed: SnapshotFile | undefined;
+  const result = await mutateBotDocument(storeOptions, (file) => {
+    for (const snapshot of file.snapshots) snapshot.source ??= "command";
+    const next = cloneFile(file);
     const result = mutation(next);
-    const directory = path.dirname(config.snapshotFile);
-    const temporaryFile = `${config.snapshotFile}.${process.pid}.${temporaryFileSequence++}.tmp`;
-    await mkdir(directory, { recursive: true });
-    await writeFile(temporaryFile, JSON.stringify(next, null, 2), "utf8");
-    await rename(temporaryFile, config.snapshotFile);
-    loaded = next;
+    file.snapshots = next.snapshots;
+    file.notes = next.notes;
+    committed = next;
     return result;
   });
-  writeQueue = operation.then(() => undefined, () => undefined);
-  return operation;
+  if (isFileBotStorage() && committed) loaded = cloneFile(committed);
+  return result;
 }
 
 export async function saveRoleSnapshot(snapshot: RoleSnapshot): Promise<void> {

@@ -1,6 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import path from "node:path";
 import { config } from "./config";
+import { mutateBotDocument, readBotDocument } from "./persistent-store";
 
 export interface GuildSetup {
   guildId: string;
@@ -213,8 +212,6 @@ interface GuildSetupFile {
   guilds: GuildSetup[];
 }
 
-let mutationQueue: Promise<void> = Promise.resolve();
-
 function isGuildSetup(value: unknown): value is GuildSetup {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
@@ -227,28 +224,26 @@ function isGuildSetup(value: unknown): value is GuildSetup {
   );
 }
 
-async function readStore(): Promise<GuildSetupFile> {
-  try {
-    const raw = await readFile(config.setupFile, "utf8");
-    const parsed = JSON.parse(raw) as { guilds?: unknown };
-    if (!Array.isArray(parsed.guilds) || !parsed.guilds.every(isGuildSetup)) {
-      throw new Error("The bot setup file has an invalid format.");
+const storeOptions = {
+  name: "guild-settings",
+  get filePath() { return config.setupFile; },
+  empty: (): GuildSetupFile => ({ guilds: [] }),
+  validate(value: unknown): GuildSetupFile {
+    const parsed = value as { guilds?: unknown };
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.guilds) ||
+        !parsed.guilds.every(isGuildSetup)) {
+      throw new Error("The persistent guild settings document has an invalid format.");
     }
     return { guilds: parsed.guilds };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { guilds: [] };
-    }
-    throw error;
-  }
+  },
+};
+
+export function validateGuildSettingsDocument(value: unknown): void {
+  storeOptions.validate(value);
 }
 
-async function writeStore(store: GuildSetupFile): Promise<void> {
-  const directory = path.dirname(config.setupFile);
-  const temporaryFile = `${config.setupFile}.tmp`;
-  await mkdir(directory, { recursive: true });
-  await writeFile(temporaryFile, JSON.stringify(store, null, 2), "utf8");
-  await rename(temporaryFile, config.setupFile);
+async function readStore(): Promise<GuildSetupFile> {
+  return readBotDocument(storeOptions);
 }
 
 function migrateObsoletePresence(store: GuildSetupFile): boolean {
@@ -268,34 +263,28 @@ function migrateObsoletePresence(store: GuildSetupFile): boolean {
 export async function getGuildSetup(
   guildId: string,
 ): Promise<GuildSetup | undefined> {
-  const operation = mutationQueue.then(async () => {
-    const store = await readStore();
-    const migrated = migrateObsoletePresence(store);
-    if (migrated) await writeStore(store);
-    const index = store.guilds.findIndex((setup) => setup.guildId === guildId);
-    return store.guilds[index];
+  const store = await readStore();
+  if (!migrateObsoletePresence(store)) {
+    return store.guilds.find((setup) => setup.guildId === guildId);
+  }
+  return mutateBotDocument(storeOptions, (current) => {
+    migrateObsoletePresence(current);
+    return current.guilds.find((setup) => setup.guildId === guildId);
   });
-  mutationQueue = operation.then(() => undefined, () => undefined);
-  return operation;
 }
 
 export async function saveGuildSetup(
   setup: GuildSetup,
 ): Promise<GuildSetup> {
-  const operation = mutationQueue.then(async () => {
-    const store = await readStore();
+  return mutateBotDocument(storeOptions, (store) => {
     migrateObsoletePresence(store);
     const index = store.guilds.findIndex(
       (candidate) => candidate.guildId === setup.guildId,
     );
     if (index === -1) store.guilds.push(setup);
     else store.guilds[index] = setup;
-    await writeStore(store);
+    return setup;
   });
-
-  mutationQueue = operation.catch(() => undefined);
-  await operation;
-  return setup;
 }
 
 /**
@@ -308,8 +297,7 @@ export async function updateGuildSetup(
   guildId: string,
   updater: (current: GuildSetup | undefined) => GuildSetup | Promise<GuildSetup>,
 ): Promise<GuildSetup> {
-  const operation = mutationQueue.then(async () => {
-    const store = await readStore();
+  return mutateBotDocument(storeOptions, async (store) => {
     migrateObsoletePresence(store);
     const index = store.guilds.findIndex((candidate) => candidate.guildId === guildId);
     const current = index === -1 ? undefined : store.guilds[index];
@@ -319,10 +307,6 @@ export async function updateGuildSetup(
     }
     if (index === -1) store.guilds.push(updated);
     else store.guilds[index] = updated;
-    await writeStore(store);
     return updated;
   });
-
-  mutationQueue = operation.then(() => undefined, () => undefined);
-  return operation;
 }

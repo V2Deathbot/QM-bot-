@@ -1,0 +1,38 @@
+[
+  {
+    "name": "guild-settings",
+    "file": "guild-settings.json",
+    "count": 1,
+    "sourceChecksum": "12d73e8a467acc88aeb52915ae766408de459f4ce6b05f0d0c7b98f72233e0c9"
+  },
+  {
+    "name": "role-snapshots",
+    "file": "role-snapshots.json",
+    "count": 6,
+    "sourceChecksum": "9857e1a050a70e2666b5acbe67675042c1110e837f9c126da54e389a9963f48b"
+  },
+  {
+    "name": "guild-security",
+    "file": "guild-security.json",
+    "count": 2,
+    "sourceChecksum": "754e8ae55e4bac5bd94db6961c3d6870f3b87dc263d88decd29ec30257860ea5"
+  },
+  {
+    "name": "uniform-submission-ledger",
+    "file": "uniform-submission-ledger.json",
+    "count": 10,
+    "sourceChecksum": "0cef5559a13f1032edde50a0113e838cc8b6fb83fd0aea6fec4157c21b5e01ed"
+  },
+  {
+    "name": "uniform-deliveries",
+    "file": "uniform-deliveries.json",
+    "count": 9,
+    "sourceChecksum": "389c1d2e71e4b521075a80ce2e440fc1aa1fbcdd159dc03b7094e76a22fe23fe"
+  },
+  {
+    "name": "payout-runs",
+    "file": "payout-runs.json",
+    "count": 2,
+    "sourceChecksum": "e68d2f6d8b276b95b14c7f78abead0862fca0b6976424eab80bff8ecc43405aa"
+  }
+]

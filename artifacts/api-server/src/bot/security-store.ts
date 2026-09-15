@@ -1,6 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import path from "node:path";
 import { config } from "./config";
+import { mutateBotDocument, readBotDocument } from "./persistent-store";
 
 export interface RateLimitAction {
   actorId: string;
@@ -51,8 +50,6 @@ interface SecurityFile {
   guilds: SecurityState[];
 }
 
-let queue: Promise<void> = Promise.resolve();
-
 const blank = (guildId: string): SecurityState => ({
   guildId,
   lockdown: {
@@ -74,6 +71,7 @@ const blank = (guildId: string): SecurityState => ({
   observedAdministrators: {},
   identityLedger: [],
 });
+let queue: Promise<void> = Promise.resolve();
 
 function valid(value: unknown): value is SecurityState {
   if (!value || typeof value !== "object") return false;
@@ -113,29 +111,32 @@ function normalized(state: SecurityState): SecurityState {
   };
 }
 
-async function readStore(): Promise<SecurityFile> {
-  try {
-    const parsed = JSON.parse(await readFile(config.securityFile, "utf8")) as {
-      guilds?: unknown;
-    };
-    if (!Array.isArray(parsed.guilds) || !parsed.guilds.every(valid)) {
-      throw new Error("The security state file has an invalid format.");
+const storeOptions = {
+  name: "guild-security",
+  get filePath() { return config.securityFile; },
+  empty: (): SecurityFile => ({ guilds: [] }),
+  validate(value: unknown): SecurityFile {
+    const parsed = value as { guilds?: unknown };
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.guilds) ||
+        !parsed.guilds.every(valid)) {
+      throw new Error("The persistent guild security document has an invalid format.");
     }
     return { guilds: (parsed.guilds as SecurityState[]).map(normalized) };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { guilds: [] };
-    throw error;
-  }
+  },
+};
+
+export function validateSecurityDocument(value: unknown): void {
+  storeOptions.validate(value);
 }
 
-async function writeStore(store: SecurityFile): Promise<void> {
-  await mkdir(path.dirname(config.securityFile), { recursive: true });
-  const temporary = `${config.securityFile}.tmp`;
-  await writeFile(temporary, JSON.stringify(store, null, 2), "utf8");
-  await rename(temporary, config.securityFile);
+async function readStore(): Promise<SecurityFile> {
+  return readBotDocument(storeOptions);
 }
 
 export async function getSecurityState(guildId: string): Promise<SecurityState> {
+  // A command may enqueue a fire-and-forget administrator observation just
+  // before another interaction checks it. Keep the read behind the local
+  // mutation tail as well as using DB row locks across processes.
   await queue;
   const store = await readStore();
   const found = store.guilds.find((entry) => entry.guildId === guildId);
@@ -147,9 +148,7 @@ export async function mutateSecurityState<T>(
   guildId: string,
   mutation: (state: SecurityState) => T | Promise<T>,
 ): Promise<T> {
-  let value!: T;
-  const operation = queue.then(async () => {
-    const store = await readStore();
+  const operation = queue.catch(() => undefined).then(() => mutateBotDocument(storeOptions, async (store) => {
     let state = store.guilds.find((entry) => entry.guildId === guildId);
     if (!state) {
       state = blank(guildId);
@@ -159,12 +158,10 @@ export async function mutateSecurityState<T>(
         const index = store.guilds.findIndex((entry) => entry.guildId === guildId);
         store.guilds[index] = state;
     }
-    value = await mutation(state);
-    await writeStore(store);
-  });
-  queue = operation.catch(() => undefined);
-  await operation;
-  return value;
+    return mutation(state);
+  }));
+  queue = operation.then(() => undefined, () => undefined);
+  return operation;
 }
 
 export async function recordIdentityAssociation(

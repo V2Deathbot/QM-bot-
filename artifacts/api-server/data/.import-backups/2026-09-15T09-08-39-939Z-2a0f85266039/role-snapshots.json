@@ -1,0 +1,145 @@
+{
+  "snapshots": [
+    {
+      "key": "1114860005334716422:1231098394",
+      "guildId": "1114860005334716422",
+      "discordUserId": "937942479980859412",
+      "robloxUserId": 1231098394,
+      "robloxUsername": "lumiivqs",
+      "roleIds": [
+        "1548958021160411216"
+      ],
+      "cardId": "6aa7b66c42a7d00bcd539797",
+      "cardUrl": "https://trello.com/c/qBKrzIQt/4-lumiivqs-1231098394",
+      "blacklistType": "conditional",
+      "blacklistReason": "reban",
+      "source": "command",
+      "blacklistNotificationAttemptedAt": "2026-09-14T15:44:32.260Z",
+      "status": "revoked",
+      "createdAt": "2026-09-14T15:44:32.260Z",
+      "cardUpdatedAt": "2026-09-14T15:44:31.181Z",
+      "revocationCardMovedAt": "2026-09-14T15:46:11.443Z",
+      "revokedAt": "2026-09-14T15:46:11.621Z",
+      "revocationNotificationAttemptedAt": "2026-09-14T15:46:11.621Z"
+    },
+    {
+      "key": "1114860005334716422:663770855",
+      "guildId": "1114860005334716422",
+      "discordUserId": "1170780243754242199",
+      "robloxUserId": 663770855,
+      "robloxUsername": "26138z",
+      "roleIds": [
+        "1548958021160411216",
+        "1549235595744911380"
+      ],
+      "cardId": "6aa8db9ffd42ae5bf660fe1c",
+      "cardUrl": "https://trello.com/c/xAJIr3BZ/11-26138z-663770855",
+      "blacklistType": "conditional",
+      "blacklistReason": "fff",
+      "source": "command",
+      "blacklistNotificationAttemptedAt": "2026-09-15T05:46:08.862Z",
+      "status": "revoked",
+      "createdAt": "2026-09-15T05:46:06.910Z",
+      "cardUpdatedAt": "2026-09-15T05:46:07.873Z",
+      "revocationCardMovedAt": "2026-09-15T05:56:40.588Z",
+      "revokedAt": "2026-09-15T05:56:40.884Z",
+      "revocationNotificationAttemptedAt": "2026-09-15T05:56:40.884Z"
+    },
+    {
+      "key": "1114860005334716422:1370330049",
+      "guildId": "1114860005334716422",
+      "discordUserId": "937942479980859412",
+      "robloxUserId": 1370330049,
+      "robloxUsername": "V2Deathbot",
+      "roleIds": [
+        "1548958021160411216"
+      ],
+      "cardId": "6aa8911e26f644a42208a7e0",
+      "cardUrl": "https://trello.com/c/NJKVvohJ/7-v2deathbot-1370330049",
+      "blacklistType": "conditional",
+      "blacklistReason": "yes",
+      "source": "command",
+      "blacklistNotificationAttemptedAt": "2026-09-15T00:28:16.261Z",
+      "status": "revoked",
+      "createdAt": "2026-09-15T00:28:16.261Z",
+      "cardUpdatedAt": "2026-09-15T00:28:15.385Z",
+      "revocationCardMovedAt": "2026-09-15T00:58:30.577Z",
+      "revokedAt": "2026-09-15T00:58:30.872Z",
+      "revocationNotificationAttemptedAt": "2026-09-15T00:58:30.872Z"
+    },
+    {
+      "key": "1114860005334716422:18906408",
+      "guildId": "1114860005334716422",
+      "discordUserId": "1170780243754242199",
+      "robloxUserId": 18906408,
+      "robloxUsername": "bloxx99",
+      "roleIds": [
+        "1548958021160411216"
+      ],
+      "cardId": "6aa891e914f65aea9bae4418",
+      "cardUrl": "https://trello.com/c/cfwDxlMf/8-bloxx99-18906408",
+      "blacklistType": "permanent",
+      "blacklistReason": "Uploaded his own uniform",
+      "source": "command",
+      "blacklistNotificationAttemptedAt": "2026-09-15T00:31:41.470Z",
+      "status": "revoked",
+      "createdAt": "2026-09-15T00:31:41.470Z",
+      "cardUpdatedAt": "2026-09-15T00:33:53.373Z",
+      "revocationCardMovedAt": "2026-09-15T00:38:39.441Z",
+      "revokedAt": "2026-09-15T00:38:39.658Z",
+      "revocationNotificationAttemptedAt": "2026-09-15T00:38:39.658Z"
+    },
+    {
+      "key": "1114860005334716422:2478999609",
+      "guildId": "1114860005334716422",
+      "discordUserId": "1436793801556492468",
+      "robloxUserId": 2478999609,
+      "robloxUsername": "Goldbrix236",
+      "roleIds": [],
+      "cardId": "6aa894e4c0aef045fd2b5fbe",
+      "cardUrl": "https://trello.com/c/REw3TqCs/9-goldbrix236-2478999609",
+      "blacklistType": "permanent",
+      "blacklistReason": "gay man",
+      "source": "command",
+      "status": "active",
+      "createdAt": "2026-09-15T00:44:20.421Z"
+    },
+    {
+      "key": "1114860005334716422:9775124504",
+      "guildId": "1114860005334716422",
+      "discordUserId": "1359330813577134121",
+      "robloxUserId": 9775124504,
+      "robloxUsername": "dragon_4seddd",
+      "roleIds": [],
+      "cardId": "6aa896bc84217cd867256bd0",
+      "cardUrl": "https://trello.com/c/qjVSnbST/10-dragon4seddd-9775124504",
+      "blacklistType": "conditional",
+      "blacklistReason": "Hi dragon",
+      "source": "command",
+      "status": "revoked",
+      "createdAt": "2026-09-15T00:52:11.831Z",
+      "cardUpdatedAt": "2026-09-15T00:52:13.172Z",
+      "revocationCardMovedAt": "2026-09-15T00:58:26.884Z",
+      "revokedAt": "2026-09-15T00:58:26.886Z",
+      "revocationNotificationAttemptedAt": "2026-09-15T00:58:26.886Z"
+    }
+  ],
+  "notes": [
+    {
+      "id": "1114860005334716422:555727322695860234:1789376311297",
+      "guildId": "1114860005334716422",
+      "actorId": "555727322695860234",
+      "text": "ee",
+      "createdAt": "2026-09-14T08:58:31.297Z"
+    },
+    {
+      "id": "1114860005334716422:555727322695860234:1789376332017",
+      "guildId": "1114860005334716422",
+      "robloxUserId": 1231098394,
+      "robloxUsername": "lumiivqs",
+      "actorId": "555727322695860234",
+      "text": "ee",
+      "createdAt": "2026-09-14T08:58:52.017Z"
+    }
+  ]
+}

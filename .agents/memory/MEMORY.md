@@ -6,3 +6,4 @@
 - [Discord settings interactions](discord-settings-interactions.md) — Menu tests must enforce real acknowledgement, nonce, and UI-label limits rather than permissive command mocks.
 - [Uniform spreadsheet delivery](uniform-sheet-delivery.md) — Saved rows and Discord delivery are separate outcomes; formula-empty cells are not blank data.
 - [Payout reset safety](payout-reset-safety.md) — Calculated totals change after reset; verify recovery against target cells and require every report page before clearing.
+- [Bot persistence constraints](bot-persistence.md) — Legacy composite keys contain NUL; preserve JSON escapes in TEXT and keep only one environment connected to Discord.

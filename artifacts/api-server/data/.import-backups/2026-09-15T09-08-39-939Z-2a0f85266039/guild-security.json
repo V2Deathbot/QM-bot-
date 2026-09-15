@@ -1,0 +1,100 @@
+{
+  "guilds": [
+    {
+      "guildId": "1114860005334716422",
+      "lockdown": {
+        "active": false,
+        "automatic": false,
+        "reason": "",
+        "startedAt": null,
+        "startedBy": null
+      },
+      "destructiveActions": [
+        {
+          "actorId": "555727322695860234",
+          "action": "revoke_blacklist",
+          "at": "2026-09-15T05:56:39.243Z"
+        }
+      ],
+      "observedAdministrators": {
+        "555727322695860234": "1970-01-01T00:00:00.000Z",
+        "937942479980859412": "2026-09-15T00:58:30.829Z",
+        "1170780243754242199": "2026-09-15T05:56:40.782Z"
+      },
+      "identityLedger": [
+        {
+          "discordUserId": "937942479980859412",
+          "robloxUserId": 1231098394,
+          "observedAt": "2026-09-14T08:55:09.521Z",
+          "source": "command"
+        },
+        {
+          "discordUserId": "1170780243754242199",
+          "robloxUserId": 663770855,
+          "observedAt": "2026-09-14T23:07:36.844Z",
+          "source": "command"
+        },
+        {
+          "discordUserId": "937942479980859412",
+          "robloxUserId": 1370330049,
+          "observedAt": "2026-09-15T00:28:15.962Z",
+          "source": "command"
+        },
+        {
+          "discordUserId": "1170780243754242199",
+          "robloxUserId": 18906408,
+          "observedAt": "2026-09-15T00:31:38.975Z",
+          "source": "command"
+        },
+        {
+          "discordUserId": "1436793801556492468",
+          "robloxUserId": 2478999609,
+          "observedAt": "2026-09-15T00:44:22.301Z",
+          "source": "command"
+        },
+        {
+          "discordUserId": "1359330813577134121",
+          "robloxUserId": 9775124504,
+          "observedAt": "2026-09-15T00:52:13.443Z",
+          "source": "command"
+        }
+      ],
+      "maintenance": {
+        "active": false,
+        "reason": "",
+        "startedAt": null,
+        "startedBy": null,
+        "revision": 0
+      },
+      "maintenanceAudit": []
+    },
+    {
+      "guildId": "retry-revoked-command",
+      "lockdown": {
+        "active": false,
+        "automatic": false,
+        "reason": "",
+        "startedAt": null,
+        "startedBy": null
+      },
+      "maintenance": {
+        "active": false,
+        "reason": "",
+        "startedAt": null,
+        "startedBy": null,
+        "revision": 0
+      },
+      "maintenanceAudit": [],
+      "destructiveActions": [],
+      "observedAdministrators": {},
+      "identityLedger": [
+        {
+          "discordUserId": "retry-discord-member",
+          "robloxUserId": 78,
+          "observedAt": "2026-09-14T11:07:34.523Z",
+          "source": "command"
+        }
+      ]
+    }
+  ]
+}

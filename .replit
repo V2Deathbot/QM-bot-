@@ -1,4 +1,4 @@
-modules = ["nodejs-24"]
+modules = ["nodejs-24", "postgresql-16"]
 
 [deployment]
 router = "application"
@@ -32,3 +32,9 @@ TRELLO_LIST_CONDITIONAL = "Conditional Blacklists"
 TRELLO_LIST_GROUP = "Blacklisted Groups"
 TRELLO_LIST_PERMANENT = "Permanent Blacklists"
 TRELLO_LIST_REVOKED = "Revoked Blacklists"
+
+[userenv.development]
+BOT_RUNTIME_ENABLED = "false"
+
+[userenv.production]
+BOT_RUNTIME_ENABLED = "true"

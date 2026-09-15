@@ -29,6 +29,13 @@ import {
 } from "discord.js";
 import { logger } from "../lib/logger";
 import { config, getMissingConfiguration, type BlacklistType } from "./config";
+import { acquireBotRuntimeLease, type BotRuntimeLease } from "./runtime-lease";
+import { isFileBotStorage } from "./persistent-store";
+import {
+  readPersistedRecoveryState,
+  savePersistedRecoveryState,
+  type PersistedRecoveryState,
+} from "./runtime-state-store";
 import {
   checkTrelloReadiness,
   createBlacklistCard,
@@ -211,16 +218,7 @@ export function getRegisteredCommandDefinitions() {
 export type BotRecoveryStatus = "pending" | "successful" | "blocked";
 export type BotRetryOutcome = "pending" | "successful" | "blocked";
 
-interface BotRecoveryState {
-  status: BotRecoveryStatus;
-  lastAttemptAt: string | null;
-  lastSuccessfulAt: string | null;
-  error: string | null;
-  retryCount: number;
-  nextRetryAt: string | null;
-  lastRetryAt: string | null;
-  lastRetryOutcome: BotRetryOutcome | null;
-}
+interface BotRecoveryState extends PersistedRecoveryState {}
 
 const recovery: BotRecoveryState = {
   status: "pending",
@@ -241,6 +239,37 @@ let recoveryAttempt: Promise<BotRefreshResult> | null = null;
 let trelloRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let blacklistSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let shutdownHooksInstalled = false;
+let runtimeLease: BotRuntimeLease | null = null;
+let recoveryPersistence: Promise<void> = Promise.resolve();
+let leadershipLost = false;
+let leadershipGeneration = 0;
+type BotExitHandler = (code: number) => never | void;
+let botExit: BotExitHandler = (code) => process.exit(code);
+
+/** Test-only injection point; production immediately terminates on lease loss. */
+export function setBotExitForTests(handler?: BotExitHandler): void {
+  botExit = handler ?? ((code) => process.exit(code));
+}
+
+/**
+ * The one lease-holder serializes these writes locally; the document row lock
+ * also makes an accidental second process unable to lose retry history.
+ */
+function persistRecoveryState(): void {
+  const snapshot = structuredClone(recovery);
+  const generation = leadershipGeneration;
+  recoveryPersistence = recoveryPersistence
+    .catch(() => undefined)
+    .then(() => {
+      // Do not let an already queued telemetry write survive a lost leadership
+      // lease in an injected test environment. Production exits immediately.
+      if (leadershipLost || generation !== leadershipGeneration) return;
+      return savePersistedRecoveryState(snapshot);
+    });
+  void recoveryPersistence.catch((error) => {
+    logger.error({ err: error }, "Could not persist bot recovery state");
+  });
+}
 type SettingsCategory = "moderation" | "integrations" | "security" | "logs" | "uniforms" | "system";
 
 type SettingsLocation =
@@ -408,11 +437,13 @@ function clearTrelloRetry(): void {
     trelloRetryTimer = null;
   }
   recovery.nextRetryAt = null;
+  persistRecoveryState();
 }
 
 function resetTrelloRetry(): void {
   clearTrelloRetry();
   recovery.retryCount = 0;
+  persistRecoveryState();
 }
 
 function scheduleTrelloRetry(): void {
@@ -424,6 +455,7 @@ function scheduleTrelloRetry(): void {
   );
   recovery.retryCount += 1;
   recovery.nextRetryAt = new Date(Date.now() + delay).toISOString();
+  persistRecoveryState();
 
   trelloRetryTimer = setTimeout(() => {
     trelloRetryTimer = null;
@@ -4421,6 +4453,7 @@ function setRecoveryStatus(
   if (status === "successful") {
     recovery.lastSuccessfulAt = new Date().toISOString();
   }
+  persistRecoveryState();
 }
 
 function refreshResult(): BotRefreshResult {
@@ -4564,6 +4597,9 @@ async function connectDiscord(): Promise<void> {
     client.once(Events.ClientReady, (readyClient) => {
       void (async () => {
         try {
+          if (leadershipLost) {
+            throw new Error("PostgreSQL leadership was lost before Discord became ready.");
+          }
           const moderationEnabled = await registerCommands(readyClient);
             if (moderationEnabled) {
               setRecoveryStatus("successful");
@@ -4779,6 +4815,9 @@ async function connectDiscord(): Promise<void> {
   try {
     await client.login(config.discordToken);
     await ready;
+    if (leadershipLost) {
+      throw new Error("PostgreSQL leadership was lost during Discord connection.");
+    }
   } catch (error) {
     commandsRegistered = false;
     setupCommandRegistered = false;
@@ -4810,6 +4849,10 @@ export interface BotRefreshResult {
 export async function refreshBot(
   trigger: "manual" | "automatic" = "manual",
 ): Promise<BotRefreshResult> {
+  if (leadershipLost) {
+    setRecoveryStatus("blocked", "PostgreSQL leadership was lost; bot restart is required.");
+    return refreshResult();
+  }
   if (recoveryAttempt) {
     return recoveryAttempt;
   }
@@ -4872,6 +4915,10 @@ export async function refreshBot(
       }
 
       if (discordClient?.isReady()) {
+        if (leadershipLost) {
+          setRecoveryStatus("blocked", "PostgreSQL leadership was lost; bot restart is required.");
+          return refreshResult();
+        }
         const moderationEnabled = await registerCommands(
           discordClient as Client<true>,
         );
@@ -4891,15 +4938,21 @@ export async function refreshBot(
         return refreshResult();
       }
 
+      if (leadershipLost) {
+        setRecoveryStatus("blocked", "PostgreSQL leadership was lost; bot restart is required.");
+        return refreshResult();
+      }
       await connectDiscord();
       return refreshResult();
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "The bot could not be started.";
-      setRecoveryStatus("blocked", message);
       if (trigger === "automatic") {
         recovery.lastRetryOutcome = "blocked";
       }
+      // Persist the final automatic state as one ordered snapshot; assigning
+      // the outcome after setRecoveryStatus used to lose it on restart.
+      setRecoveryStatus("blocked", message);
       logger.error({ err: error }, "Blacklist bot recovery failed");
       return refreshResult();
     }
@@ -4913,6 +4966,15 @@ export async function refreshBot(
 }
 
 export async function startBot(): Promise<void> {
+  if (!config.botRuntimeEnabled) {
+    logger.warn(
+      "Bot runtime is disabled. Set BOT_RUNTIME_ENABLED=true only in the single environment that should connect to Discord.",
+    );
+    return;
+  }
+  if (isFileBotStorage()) {
+    throw new Error("BOT_STORAGE_MODE=file is test-only and cannot run a Discord bot.");
+  }
   if (!shutdownHooksInstalled) {
     shutdownHooksInstalled = true;
     const shutdown = () => {
@@ -4920,11 +4982,54 @@ export async function startBot(): Promise<void> {
       clearBlacklistSyncTimer();
       discordClient?.destroy();
       discordClient = null;
+      const lease = runtimeLease;
+      runtimeLease = null;
+      void lease?.release().catch((error) => {
+        logger.error({ err: error }, "Could not release bot runtime leadership lock");
+      });
     };
     process.once("SIGTERM", shutdown);
     process.once("SIGINT", shutdown);
   }
-  const result = await refreshBot();
+  if (!runtimeLease) {
+    leadershipLost = false;
+    leadershipGeneration += 1;
+    runtimeLease = await acquireBotRuntimeLease((error) => {
+      leadershipLost = true;
+      leadershipGeneration += 1;
+      runtimeLease = null;
+      clearTrelloRetry();
+      clearBlacklistSyncTimer();
+      commandsRegistered = false;
+      setupCommandRegistered = false;
+      guildSetupComplete = false;
+      discordClient?.destroy();
+      discordClient = null;
+      logger.error({ err: error }, "Lost PostgreSQL bot leadership lock; Discord client stopped fail-closed");
+      // Do not await cleanup or persistence: a process that lost its DB
+      // session must not reconnect while a replacement leader may be active.
+      botExit(1);
+    });
+  }
+  let result: BotRefreshResult;
+  try {
+    const persistedRecovery = await readPersistedRecoveryState();
+    Object.assign(recovery, persistedRecovery);
+    result = await refreshBot();
+    await recoveryPersistence;
+    if (leadershipLost) {
+      throw new Error("PostgreSQL leadership was lost during bot startup.");
+    }
+  } catch (error) {
+    clearTrelloRetry();
+    clearBlacklistSyncTimer();
+    discordClient?.destroy();
+    discordClient = null;
+    const lease = runtimeLease;
+    runtimeLease = null;
+    await lease?.release().catch(() => undefined);
+    throw error;
+  }
   if (!result.commandsEnabled) {
     logger.warn(
       {

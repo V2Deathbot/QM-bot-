@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "hello": "tsx ./src/hello.ts",
+    "import-bot-data": "tsx ./src/import-bot-data.ts",
+    "test-bot-db-storage": "BOT_IMPORT_ENV=development tsx ./src/test-bot-db-storage.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

@@ -1,9 +1,8 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import path from "node:path";
 import { ReplitConnectors } from "@replit/connectors-sdk";
 import { config } from "./config";
 import { withUniformWorkbookMutation } from "./payout-guard";
 import { payoutLockForWorkbook } from "./payout-store";
+import { mutateBotDocument, resetPersistentStoreForTests } from "./persistent-store";
 
 /**
  * These are the only user-data cells written by the two commands.  They are
@@ -323,44 +322,52 @@ interface SubmissionLedgerEntry {
   invalidatedByPayoutRunId?: string;
 }
 interface SubmissionLedger { entries: SubmissionLedgerEntry[]; }
-let ledgerQueue: Promise<void> = Promise.resolve();
 let destinationQueues = new Map<string, Promise<void>>();
 let ledgerWriteFailureForTests: Error | undefined;
 let ledgerWriteFailureAfterForTests: number | undefined;
-async function readLedger(): Promise<SubmissionLedger> {
-  try {
-    const parsed = JSON.parse(await readFile(config.uniformSubmissionLedgerFile, "utf8")) as { entries?: unknown };
+
+const ledgerOptions = {
+  name: "uniform-submission-ledger",
+  get filePath() { return config.uniformSubmissionLedgerFile; },
+  empty: (): SubmissionLedger => ({ entries: [] }),
+  validate(value: unknown): SubmissionLedger {
+    const parsed = value as { entries?: unknown };
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("Uniform submission ledger has an invalid format.");
+    }
     if (!Array.isArray(parsed.entries)) throw new Error("Uniform submission ledger has an invalid format.");
-    return { entries: parsed.entries.filter((entry): entry is SubmissionLedgerEntry =>
+    const validEntry = (entry: unknown): entry is SubmissionLedgerEntry =>
       Boolean(entry) && typeof entry === "object" &&
       typeof (entry as SubmissionLedgerEntry).key === "string" &&
-      Array.isArray((entry as SubmissionLedgerEntry).values),
-    ) };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { entries: [] };
-    throw error;
-  }
+      typeof (entry as SubmissionLedgerEntry).destination === "string" &&
+      typeof (entry as SubmissionLedgerEntry).submissionId === "string" &&
+      typeof (entry as SubmissionLedgerEntry).targetRange === "string" &&
+      Array.isArray((entry as SubmissionLedgerEntry).values) &&
+      ["reserved", "written"].includes((entry as SubmissionLedgerEntry).state) &&
+      typeof (entry as SubmissionLedgerEntry).notified === "boolean" &&
+      typeof (entry as SubmissionLedgerEntry).createdAt === "string";
+    if (!parsed.entries.every(validEntry)) {
+      throw new Error("Uniform submission ledger contains an invalid record.");
+    }
+    return { entries: parsed.entries };
+  },
+};
+
+export function validateUniformSubmissionLedgerDocument(value: unknown): void {
+  ledgerOptions.validate(value);
 }
-async function writeLedger(ledger: SubmissionLedger): Promise<void> {
-  if (ledgerWriteFailureAfterForTests !== undefined) {
-    if (ledgerWriteFailureAfterForTests-- <= 0) throw ledgerWriteFailureForTests!;
-  }
-  if (ledgerWriteFailureForTests) throw ledgerWriteFailureForTests;
-  const directory = path.dirname(config.uniformSubmissionLedgerFile);
-  const temporary = `${config.uniformSubmissionLedgerFile}.tmp`;
-  await mkdir(directory, { recursive: true });
-  await writeFile(temporary, JSON.stringify(ledger, null, 2), "utf8");
-  await rename(temporary, config.uniformSubmissionLedgerFile);
-}
+
 async function withLedger<T>(operation: (ledger: SubmissionLedger) => Promise<T> | T): Promise<T> {
-  const result = ledgerQueue.then(async () => {
-    const ledger = await readLedger();
+  return mutateBotDocument(ledgerOptions, async (ledger) => {
     const value = await operation(ledger);
-    await writeLedger(ledger);
+    // The fault injection models a failed durable commit. It is deliberately
+    // evaluated inside the transaction before the document update.
+    if (ledgerWriteFailureAfterForTests !== undefined) {
+      if (ledgerWriteFailureAfterForTests-- <= 0) throw ledgerWriteFailureForTests!;
+    }
+    if (ledgerWriteFailureForTests) throw ledgerWriteFailureForTests;
     return value;
   });
-  ledgerQueue = result.then(() => undefined, () => undefined);
-  return result;
 }
 async function serialDestination<T>(destination: string, work: () => Promise<T>): Promise<T> {
   const prior = destinationQueues.get(destination) ?? Promise.resolve();
@@ -400,7 +407,7 @@ export async function withPayoutAwareUniformActivity<T>(
   return withPayoutAwareUniformMutation(config.spreadsheetId, work);
 }
 export function resetUniformSubmissionLedgerForTests(): void {
-  ledgerQueue = Promise.resolve();
+  resetPersistentStoreForTests();
   destinationQueues = new Map();
   ledgerWriteFailureForTests = undefined;
   ledgerWriteFailureAfterForTests = undefined;

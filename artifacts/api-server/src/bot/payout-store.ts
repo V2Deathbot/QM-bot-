@@ -1,6 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import path from "node:path";
 import { config } from "./config";
+import { mutateBotDocument, readBotDocument, resetPersistentStoreForTests } from "./persistent-store";
 
 export type PayoutRunState =
   | "previewed"
@@ -65,54 +64,48 @@ interface PayoutFile {
   generations?: Record<string, number>;
 }
 
-let queue: Promise<void> = Promise.resolve();
-
-async function readStore(): Promise<PayoutFile> {
-  try {
-    const parsed = JSON.parse(await readFile(config.payoutFile, "utf8")) as Partial<PayoutFile>;
+const storeOptions = {
+  name: "payout-runs",
+  get filePath() { return config.payoutFile; },
+  empty: (): PayoutFile => ({ runs: [], locks: [], generations: {} }),
+  validate(value: unknown): PayoutFile {
+    const parsed = value as Partial<PayoutFile>;
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("Payout archive has an invalid format.");
+    }
     if (!Array.isArray(parsed.runs) || !Array.isArray(parsed.locks)) {
       throw new Error("Payout archive has an invalid format.");
     }
-    return {
-      runs: parsed.runs.filter((run): run is PayoutRun =>
+    const validRun = (run: unknown): run is PayoutRun =>
         Boolean(run) && typeof run === "object" && typeof (run as PayoutRun).runId === "string" &&
-        typeof (run as PayoutRun).spreadsheetId === "string" && Array.isArray((run as PayoutRun).roles),
-      ),
-      locks: parsed.locks.filter((lock): lock is { spreadsheetId: string; runId: string; acquiredAt: string } =>
+        typeof (run as PayoutRun).spreadsheetId === "string" &&
+        typeof (run as PayoutRun).guildId === "string" && Array.isArray((run as PayoutRun).roles);
+    const validLock = (lock: unknown): lock is { spreadsheetId: string; runId: string; acquiredAt: string } =>
         Boolean(lock) && typeof lock === "object" && typeof (lock as { spreadsheetId?: unknown }).spreadsheetId === "string" &&
-        typeof (lock as { runId?: unknown }).runId === "string",
-      ),
+        typeof (lock as { runId?: unknown }).runId === "string" &&
+        typeof (lock as { acquiredAt?: unknown }).acquiredAt === "string";
+    if (!parsed.runs.every(validRun) || !parsed.locks.every(validLock)) {
+      throw new Error("Payout archive contains an invalid run or lock.");
+    }
+    return {
+      runs: parsed.runs,
+      locks: parsed.locks,
       generations: parsed.generations && typeof parsed.generations === "object" ? parsed.generations : {},
     };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { runs: [], locks: [] };
-    throw error;
-  }
-}
+  },
+};
 
-async function writeStore(store: PayoutFile): Promise<void> {
-  await mkdir(path.dirname(config.payoutFile), { recursive: true });
-  const temporary = `${config.payoutFile}.tmp`;
-  await writeFile(temporary, JSON.stringify(store, null, 2), "utf8");
-  await rename(temporary, config.payoutFile);
+export function validatePayoutRunsDocument(value: unknown): void {
+  storeOptions.validate(value);
 }
 
 async function mutate<T>(operation: (store: PayoutFile) => T | Promise<T>): Promise<T> {
-  const result = queue.then(async () => {
-    const store = await readStore();
-    const value = await operation(store);
-    await writeStore(store);
-    return value;
-  });
-  queue = result.then(() => undefined, () => undefined);
-  return result;
+  return mutateBotDocument(storeOptions, operation);
 }
 
 /** Serialized read which never creates or rewrites the archive file. */
 async function inspect<T>(operation: (store: PayoutFile) => T | Promise<T>): Promise<T> {
-  const result = queue.then(async () => operation(await readStore()));
-  queue = result.then(() => undefined, () => undefined);
-  return result;
+  return operation(await readBotDocument(storeOptions));
 }
 
 function copyRun(run: PayoutRun): PayoutRun {
@@ -237,5 +230,5 @@ export async function activePayoutRunForGuild(guildId: string): Promise<PayoutRu
 }
 
 export function resetPayoutStoreForTests(): void {
-  queue = Promise.resolve();
+  resetPersistentStoreForTests();
 }

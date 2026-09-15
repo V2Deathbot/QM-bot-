@@ -1,0 +1,74 @@
+{
+  "guilds": [
+    {
+      "guildId": "1114860005334716422",
+      "moderatorRoleId": "1548958021160411216",
+      "auditChannelId": "1548957768386478160",
+      "security": {
+        "perAdminLimit": 30,
+        "globalLimit": 40,
+        "windowMinutes": 1,
+        "automaticLockdown": true,
+        "automaticLockdownThreshold": 8,
+        "confirmationsRequired": true,
+        "protectedUserIds": [],
+        "protectedRoleIds": [],
+        "altDetectionEnabled": true,
+        "robloxAltDetectionEnabled": true,
+        "historicalAssociationWarnings": true,
+        "recentPermissionEscalationProtection": true,
+        "securityAuditAlerts": true
+      },
+      "monitoring": {
+        "manualChangeDetection": true,
+        "desyncDetection": true,
+        "pollingIntervalSeconds": 60
+      },
+      "trello": {
+        "lists": {
+          "appealable": "Appealable Blacklists",
+          "conditional": "Conditional Blacklists",
+          "permanent": "Permanent Blacklists",
+          "revoked": "Revoked Blacklists",
+          "group": "Blacklisted Groups"
+        },
+        "labels": {
+          "blacklisted": "blacklisted",
+          "appealable": "appealable",
+          "conditional": "conditional",
+          "permanent": "permanent",
+          "group": "group blacklist",
+          "revoked": "revoked"
+        }
+      },
+      "audit": {
+        "trelloAlerts": true,
+        "blacklistLogs": true,
+        "roleEnforcementLogs": true,
+        "joinLeaveBlacklistLogs": true
+      },
+      "identity": {
+        "sameRobloxDifferentDiscord": true,
+        "sameDiscordDifferentRoblox": true,
+        "historicalAssociationWarnings": true,
+        "autoPunishPossibleAlts": false
+      },
+      "updatedBy": "555727322695860234",
+      "updatedAt": "2026-09-15T02:02:26.380Z",
+      "uniforms": {
+        "authorizedRoleIds": [],
+        "authorizedMemberIds": [],
+        "logChannelId": "1549233954136006737",
+        "moderatedChannelId": "1549233954136006737",
+        "spreadsheet": {
+          "spreadsheetId": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98",
+          "logTab": "Uniform Logging",
+          "moderatedTab": "Moderated Uniforms",
+          "logRange": "A2:E",
+          "moderatedRange": "A2:D",
+          "createMissingTabs": false
+        }
+      }
+    }
+  ]
+}

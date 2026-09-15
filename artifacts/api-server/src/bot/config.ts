@@ -1,6 +1,15 @@
+import os from "node:os";
+import path from "node:path";
+
 export type BlacklistType = "appealable" | "conditional" | "permanent";
 
 export const config = {
+  /**
+   * This must be explicitly enabled for exactly one environment. During the
+   * dev-to-production cutover leave development false before enabling the
+   * production bot: their separate databases cannot share an advisory lock.
+   */
+  botRuntimeEnabled: process.env["BOT_RUNTIME_ENABLED"] === "true",
   discordToken: process.env["DISCORD_BOT_TOKEN"],
   discordGuildId: process.env["DISCORD_GUILD_ID"],
   trelloApiKey: process.env["TRELLO_API_KEY"],
@@ -43,6 +52,12 @@ export const config = {
   /** Durable payout snapshots and reset state. Kept separate from delivery audit history. */
   payoutFile:
     process.env["PAYOUT_ARCHIVE_FILE"] ?? "data/payout-runs.json",
+  /** Test-only file fallback for recovery telemetry. */
+  runtimeStateFile:
+    process.env["BOT_RUNTIME_STATE_FILE"] ??
+    (process.env["BOT_STORAGE_MODE"] === "file"
+      ? path.join(os.tmpdir(), `discord-bot-runtime-state-${process.pid}.json`)
+      : "data/bot-runtime-state.json"),
 } as const;
 
 function parseDelay(value: string | undefined, fallback: number): number {
@@ -75,6 +90,7 @@ export function getMissingConfiguration(): string[] {
 export function getConfigurationStatus() {
   return {
     configured: getMissingConfiguration().length === 0,
+    botRuntimeEnabled: config.botRuntimeEnabled,
     missing: getMissingConfiguration(),
     discordGuildConfigured: Boolean(config.discordGuildId),
     trelloLists: config.trelloListNames,

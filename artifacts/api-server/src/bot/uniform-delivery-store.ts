@@ -1,7 +1,6 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import path from "node:path";
 import { config } from "./config";
+import { mutateBotDocument, readBotDocument, resetPersistentStoreForTests } from "./persistent-store";
 
 export type UniformDiscordNonceKind = "notice" | "customer" | "purchased" | "assistance" | "sold" | "relog";
 
@@ -89,14 +88,17 @@ export interface UniformDeliveryRecord {
 }
 
 interface DeliveryFile { records: UniformDeliveryRecord[]; }
-let queue: Promise<void> = Promise.resolve();
 
-async function readStore(): Promise<DeliveryFile> {
-  try {
-    const value = JSON.parse(await readFile(config.uniformDeliveryFile, "utf8")) as { records?: unknown };
-    if (!Array.isArray(value.records)) throw new Error("Uniform delivery record file has an invalid format.");
-    return {
-      records: value.records.filter((record): record is UniformDeliveryRecord =>
+const storeOptions = {
+  name: "uniform-deliveries",
+  get filePath() { return config.uniformDeliveryFile; },
+  empty: (): DeliveryFile => ({ records: [] }),
+  validate(value: unknown): DeliveryFile {
+    const parsed = value as { records?: unknown };
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.records)) {
+      throw new Error("Uniform delivery record file has an invalid format.");
+    }
+    const validRecord = (record: unknown): record is UniformDeliveryRecord =>
         Boolean(record) && typeof record === "object" &&
         typeof (record as UniformDeliveryRecord).submissionId === "string" &&
         typeof (record as UniformDeliveryRecord).guildId === "string" &&
@@ -106,35 +108,27 @@ async function readStore(): Promise<DeliveryFile> {
         typeof (record as UniformDeliveryRecord).uploadLogChannelId === "string" &&
         ((record as UniformDeliveryRecord).command === "log" ||
           (record as UniformDeliveryRecord).command === "moderated") &&
-        Array.isArray((record as UniformDeliveryRecord).assets),
-      ),
+        Array.isArray((record as UniformDeliveryRecord).assets);
+    if (!parsed.records.every(validRecord)) {
+      throw new Error("Uniform delivery record document contains an invalid record.");
+    }
+    return {
+      records: parsed.records,
     };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { records: [] };
-    throw error;
-  }
-}
+  },
+};
 
-async function writeStore(store: DeliveryFile): Promise<void> {
-  await mkdir(path.dirname(config.uniformDeliveryFile), { recursive: true });
-  const temporary = `${config.uniformDeliveryFile}.tmp`;
-  await writeFile(temporary, JSON.stringify(store, null, 2), "utf8");
-  await rename(temporary, config.uniformDeliveryFile);
+export function validateUniformDeliveriesDocument(value: unknown): void {
+  storeOptions.validate(value);
 }
 
 async function mutate<T>(operation: (store: DeliveryFile) => T | Promise<T>): Promise<T> {
-  const result = queue.then(async () => {
-    const store = await readStore();
-    const value = await operation(store);
-    await writeStore(store);
-    return value;
-  });
-  queue = result.then(() => undefined, () => undefined);
-  return result;
+  return mutateBotDocument(storeOptions, operation);
 }
 
 export async function getUniformDelivery(submissionId: string): Promise<UniformDeliveryRecord | undefined> {
-  return mutate((store) => store.records.find((record) => record.submissionId === submissionId));
+  const store = await readBotDocument(storeOptions);
+  return store.records.find((record) => record.submissionId === submissionId);
 }
 
 /** Only durable records, never username matching, are candidates for /relog. */
@@ -142,13 +136,14 @@ export async function findUniformDeliveriesForChannel(
   guildId: string,
   channelId: string,
 ): Promise<UniformDeliveryRecord[]> {
-  return mutate((store) => store.records.filter((record) =>
+  const store = await readBotDocument(storeOptions);
+  return store.records.filter((record) =>
     record.guildId === guildId &&
     record.destinationChannelId === channelId &&
     record.sheetState === "saved" &&
       !record.invalidatedByPayoutRunId &&
     Boolean(record.customerMessageId || record.relog),
-  ));
+  );
 }
 
 /** Create only after Sheets has committed. Existing records make delivery retries idempotent. */
@@ -204,9 +199,10 @@ function canRecoverLegacyNonceRejection(record: UniformDeliveryRecord): boolean 
 export async function findLegacyNonceRejectedDelivery(
   guildId: string,
 ): Promise<UniformDeliveryRecord | undefined> {
-  return mutate((store) => store.records.find((record) =>
+  const store = await readBotDocument(storeOptions);
+  return store.records.find((record) =>
     record.guildId === guildId && !record.invalidatedByPayoutRunId && canRecoverLegacyNonceRejection(record),
-  ));
+  );
 }
 
 /**
@@ -259,5 +255,5 @@ export async function claimUniformDeliveryAction(
 }
 
 export function resetUniformDeliveryStoreForTests(): void {
-  queue = Promise.resolve();
+  resetPersistentStoreForTests();
 }
