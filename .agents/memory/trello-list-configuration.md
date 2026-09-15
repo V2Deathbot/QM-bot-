@@ -14,3 +14,9 @@ Tests must set their environment overrides before importing modules that depend 
 **Why:** Configuration is read when its module is evaluated, so importing the app before test setup can cache deployment values and write to the wrong snapshot file.
 
 **How to apply:** Use dynamic imports after test environment setup for routes or bot modules that import the configuration.
+
+Trello board routes may use a short link while cards report the canonical board ID.
+
+**Why:** Literal comparison between those valid identifiers rejects cards fetched from the configured board.
+
+**How to apply:** Resolve canonical identity from the configured board's list records before exact-card mutations, while still rejecting genuinely cross-board cards.
