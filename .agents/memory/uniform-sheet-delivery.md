@@ -13,4 +13,10 @@ Check spreadsheet content using formula rendering before considering cells empty
 
 **Why:** A formula displaying an empty string is still user data and must not be overwritten by automatic headers.
 
-**How to apply:** Include formula-empty cells in header safety tests. Merge configuration changes against the latest saved record after slow provider validation, not a previously read whole configuration.
+**How to apply:** Include formula-empty cells in occupied-row safety tests. Merge configuration changes against the latest saved record after slow provider validation, not a previously read whole configuration.
+
+Do not put operational bookkeeping or automatically generated headers in the uniform worksheets.
+
+**Why:** The user supplies preformatted worksheets with a separate Sold checkbox column and explicitly wants only participant usernames and the uniform link. Extra metadata breaks that layout.
+
+**How to apply:** Keep delivery tracking outside Sheets. Preserve headers and adjacent columns; never insert entire rows to log uniforms.

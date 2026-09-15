@@ -1,130 +1,204 @@
 import assert from "node:assert/strict";
-import { test, afterEach } from "node:test";
-import {
+import { mkdtemp, readFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, test } from "node:test";
+
+const directory = await mkdtemp(path.join(os.tmpdir(), "uniform-sheet-tests-"));
+process.env.UNIFORM_SUBMISSION_LEDGER_FILE = path.join(directory, "submission-ledger.json");
+
+const {
   appendUniformRows,
   markUniformRowsNotified,
   normalizeSpreadsheetId,
+  normalizeUniformSpreadsheetConfig,
+  normalizeUniformDataRange,
   quoteSheetTab,
   resetGoogleSheetsProxyForTests,
+  setUniformSubmissionLedgerWriteFailureForTests,
   setGoogleSheetsProxyForTests,
-  UNIFORM_SHEET_HEADERS,
-  UNIFORM_STORAGE_HEADERS,
-  UNIFORM_DETAIL_COLUMN_COUNT,
   validateSpreadsheetConfiguration,
-  type UniformSheetRow,
-} from "../src/bot/google-sheets.ts";
+} = await import("../src/bot/google-sheets.ts");
 
 afterEach(() => resetGoogleSheetsProxyForTests());
 
 function response(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
+  return new Response(JSON.stringify(payload), { status, headers: { "content-type": "application/json" } });
 }
 
-function values() {
-  return { values: [Array.from(UNIFORM_SHEET_HEADERS)] };
-}
+const base = {
+  spreadsheetId: "sheet-id",
+  logTab: "Uniform Logs",
+  moderatedTab: "Moderated Logs",
+  logRange: "A2:E",
+  moderatedRange: "A2:D",
+};
 
-test("normalizes spreadsheet URLs and quotes worksheet names for A1 paths", () => {
+test("normalizes spreadsheet URLs, quotes tabs, and validates user data rectangles", () => {
+  assert.equal(normalizeSpreadsheetId("https://docs.google.com/spreadsheets/d/abc_123/edit#gid=1"), "abc_123");
+  assert.equal(quoteSheetTab("Owner's Sheet"), "'Owner''s Sheet'");
+  assert.equal(normalizeUniformDataRange("c5:g", 5, "/log"), "C5:G");
+  assert.equal(normalizeUniformDataRange("C5:G99", 5, "/log"), "C5:G99");
+  assert.throws(() => normalizeUniformDataRange("A1:E", 5, "/log"), /below the header/i);
+  assert.throws(() => normalizeUniformDataRange("A2:D", 5, "/log"), /exactly 5/i);
+  assert.throws(() => normalizeUniformDataRange("Other!A2:E", 5, "/log"), /A1 rectangle/i);
   assert.equal(
-    normalizeSpreadsheetId("https://docs.google.com/spreadsheets/d/abc_123/edit#gid=1"),
-    "abc_123",
-  );
-  assert.equal(normalizeSpreadsheetId("abc_123"), "abc_123");
-  assert.equal(quoteSheetTab("Owner's Uniform Logs"), "'Owner''s Uniform Logs'");
-  assert.throws(
-    () => normalizeSpreadsheetId("https://evil.example/spreadsheets/d/abc_123"),
-    /docs\.google\.com/i,
+    normalizeUniformSpreadsheetConfig({ ...base, createMissingTabs: true }).createMissingTabs,
+    false,
+    "an obsolete persisted flag is ignored; it never enables creation",
   );
 });
 
-test("appends ten detailed rows once with RAW input and the fixed schema", async () => {
-  const calls: Array<{ path: string; options?: { method?: string; body?: unknown } }> = [];
-  setGoogleSheetsProxyForTests(async (path, options) => {
-    calls.push({ path, options });
-    if (options?.method === "GET") return response(values());
-    return response({ updates: { updatedRows: 10 } });
-  });
-  const rows = Array.from({ length: 10 }, (_, index) =>
-    Array.from({ length: UNIFORM_DETAIL_COLUMN_COUNT }, (_value, column) =>
-      `${column === 16 ? "interaction-1" : index}`,
-    ) as UniformSheetRow,
-  );
-  const result = await appendUniformRows({
-    config: {
-      spreadsheetId: "sheet-id",
-      logTab: "Owner's Uniform Logs",
-      moderatedTab: "Moderated Logs",
-    },
-    logKind: "log",
-    rows,
-    submissionId: "interaction-1",
-  });
-
-  assert.deepEqual(result, { alreadyWritten: false, count: 10 });
-  assert.equal(calls.length, 2, "one duplicate check and one append");
-  assert.match(decodeURIComponent(calls[0]!.path), /values\/'Owner''s Uniform Logs'!A:S\?valueRenderOption=FORMULA$/);
-  assert.match(calls[1]!.path, /:append\?valueInputOption=RAW&insertDataOption=INSERT_ROWS$/);
-  assert.equal(calls[1]!.options?.method, "POST");
-  const body = calls[1]!.options?.body as { majorDimension: string; values: unknown[][] };
-  assert.equal(body.majorDimension, "ROWS");
-  assert.equal(body.values.length, 10);
-  assert.deepEqual(body.values[0]!.length, UNIFORM_STORAGE_HEADERS.length);
-  assert.equal(body.values[0]![UNIFORM_DETAIL_COLUMN_COUNT], "PENDING");
-});
-
-test("rejects an incompatible existing header before any write", async () => {
-  const methods: string[] = [];
-  setGoogleSheetsProxyForTests(async (path, options) => {
-    methods.push(options?.method ?? "GET");
-    if (path.includes("?fields=")) {
-      return response({
-        sheets: [
-          { properties: { title: "Uniform Logs" } },
-          { properties: { title: "Moderated Logs" } },
-        ],
-      });
-    }
-    if (decodeURIComponent(path).includes("'Uniform Logs'")) return response(values());
-    return response({ values: [["not", "our", "schema"]] });
-  });
-  await assert.rejects(
-    validateSpreadsheetConfiguration({
-      spreadsheetId: "sheet-id",
-      logTab: "Uniform Logs",
-      moderatedTab: "Moderated Logs",
-    }),
-    /incompatible headers/i,
-  );
-  assert.deepEqual(methods, ["GET", "GET", "GET"]);
-  assert.equal(methods.some((method) => method !== "GET"), false);
-});
-
-test("requests FORMULA values and rejects a formula-rendered blank without writing", async () => {
+test("configuration only reads existing tabs and never creates headers or worksheets", async () => {
   const calls: Array<{ path: string; method?: string }> = [];
-  setGoogleSheetsProxyForTests(async (path, options) => {
-    calls.push({ path, method: options?.method });
-    if (path.includes("?fields=")) {
-      return response({
-        sheets: [
-          { properties: { title: "Uniform Logs" } },
-          { properties: { title: "Moderated Logs" } },
-        ],
-      });
-    }
-    return response({ values: [["=\"\""]] });
+  setGoogleSheetsProxyForTests(async (pathname, options) => {
+    calls.push({ path: pathname, method: options?.method });
+    return response({ sheets: [
+      { properties: { title: "Uniform Logs", gridProperties: { rowCount: 1000, columnCount: 6 } } },
+      { properties: { title: "Moderated Logs", gridProperties: { rowCount: 1000, columnCount: 6 } } },
+    ] });
   });
+  const saved = await validateSpreadsheetConfiguration(base);
+  assert.equal(saved.logRange, "A2:E");
+  assert.equal(saved.moderatedRange, "A2:D");
+  assert.deepEqual(calls.map((call) => call.method), ["GET"]);
+});
 
+test("writes only five selected /log cells after selected-column data, preserving header and Sold", async () => {
+  const calls: Array<{ path: string; options?: { method?: string; body?: unknown } }> = [];
+  const soldCheckboxes = new Map([[2, false], [5, true]]);
+  setGoogleSheetsProxyForTests(async (pathname, options) => {
+    calls.push({ path: pathname, options });
+    if (options?.method === "GET") {
+      // Selected A:E data: the blank second row does not matter, and an
+      // unrelated F Sold checkbox is deliberately outside this response.
+      return response({ values: [["qm", "seqm", "pub", "customer", "link"], [], ["later", "", "", "", ""]] });
+    }
+    return response({ updates: { updatedCells: 5 } });
+  });
+  const result = await appendUniformRows({
+    config: base, logKind: "log", submissionId: "five-cells-only",
+    rows: [["QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/1"]],
+  });
+  assert.deepEqual(result, { alreadyWritten: false, count: 1 });
+  assert.equal(calls.length, 2);
+  assert.match(decodeURIComponent(calls[0]!.path), /'Uniform Logs'!A2:E\?valueRenderOption=FORMULA$/);
+  assert.match(decodeURIComponent(calls[1]!.path), /'Uniform Logs'!A5:E5\?valueInputOption=RAW$/);
+  assert.equal(calls[1]!.options?.method, "PUT");
+  const body = calls[1]!.options?.body as { range: string; values: unknown[][] };
+  assert.equal(body.range, "'Uniform Logs'!A5:E5");
+  assert.deepEqual(body.values, [["QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/1"]]);
+  assert.deepEqual([...soldCheckboxes], [[2, false], [5, true]], "the F Sold checkbox column is never read or written");
+  assert.equal(calls.some((call) => /!.*F\d/.test(decodeURIComponent(call.path))), false);
+});
+
+test("finds occupied selected cells beyond row 21 before reserving its exact rectangle", async () => {
+  const calls: Array<{ path: string; options?: { method?: string; body?: unknown } }> = [];
+  setGoogleSheetsProxyForTests(async (pathname, options) => {
+    calls.push({ path: pathname, options });
+    if (options?.method === "GET") {
+      return response({ values: Array.from({ length: 21 }, (_value, index) =>
+        index === 20 ? ["occupied"] : [],
+      ) });
+    }
+    return response({});
+  });
+  await appendUniformRows({
+    config: base, logKind: "log", submissionId: "after-row-21",
+    rows: [["a", "b", "c", "d", "e"]],
+  });
+  assert.match(decodeURIComponent(calls[1]!.path), /'Uniform Logs'!A23:E23\?valueInputOption=RAW$/);
+});
+
+test("supports offsets and writes four /moderated cells without using append/INSERT_ROWS", async () => {
+  const calls: Array<{ path: string; options?: { method?: string; body?: unknown } }> = [];
+  setGoogleSheetsProxyForTests(async (pathname, options) => {
+    calls.push({ path: pathname, options });
+    if (options?.method === "GET") return response({ values: Array.from({ length: 20 }, () => []) });
+    return response({});
+  });
+  await appendUniformRows({
+    config: { ...base, logRange: "C5:G", moderatedRange: "C5:F" },
+    logKind: "moderated", submissionId: "offset-moderated",
+    rows: [["Uploader", "Publisher", "Customer", "https://www.roblox.com/catalog/2"]],
+  });
+  assert.match(decodeURIComponent(calls[1]!.path), /'Moderated Logs'!C5:F5\?valueInputOption=RAW$/);
+  const body = calls[1]!.options?.body as { values: unknown[][] };
+  assert.equal(body.values[0]!.length, 4);
+  assert.equal(calls.some((call) => call.path.includes(":append") || call.path.includes("INSERT_ROWS")), false);
+});
+
+test("rejects bounded range exhaustion before issuing an update", async () => {
+  const calls: Array<{ method?: string }> = [];
+  setGoogleSheetsProxyForTests(async (_pathname, options) => {
+    calls.push({ method: options?.method });
+    return response({ values: [["one", "", "", "", ""], ["two", "", "", "", ""]] });
+  });
   await assert.rejects(
-    validateSpreadsheetConfiguration({
-      spreadsheetId: "sheet-id",
-      logTab: "Uniform Logs",
-      moderatedTab: "Moderated Logs",
+    appendUniformRows({
+      config: { ...base, logRange: "A2:E3" }, logKind: "log", submissionId: "full-range",
+      rows: [["a", "b", "c", "d", "e"]],
     }),
-    /incompatible headers/i,
+    /range is full/i,
   );
-  assert.equal(calls.some(({ method }) => method !== "GET"), false);
-  assert.ok(calls.some(({ path }) => path.includes("valueRenderOption=FORMULA")));
+  assert.deepEqual(calls.map((call) => call.method), ["GET"]);
+});
+
+test("persists notification state locally without adding spreadsheet columns", async () => {
+  let writes = 0;
+  setGoogleSheetsProxyForTests(async (_pathname, options) => {
+    if (options?.method === "GET") return response({ values: [] });
+    writes++;
+    return response({});
+  });
+  await appendUniformRows({
+    config: base, logKind: "log", submissionId: "local-notification",
+    rows: [["a", "b", "c", "d", "e"]],
+  });
+  assert.deepEqual(await markUniformRowsNotified(base, "log", "local-notification"), { alreadyNotified: false, count: 1 });
+  assert.deepEqual(await markUniformRowsNotified(base, "log", "local-notification"), { alreadyNotified: true, count: 1 });
+  assert.equal(writes, 1);
+  const ledger = await readFile(process.env.UNIFORM_SUBMISSION_LEDGER_FILE!, "utf8");
+  assert.match(ledger, /"notified": true/);
+});
+
+test("reports local notification bookkeeping failure without changing worksheet cells, then can resume", async () => {
+  let writes = 0;
+  setGoogleSheetsProxyForTests(async (_pathname, options) => {
+    if (options?.method === "GET") return response({ values: [] });
+    writes++;
+    return response({});
+  });
+  await appendUniformRows({
+    config: base, logKind: "moderated", submissionId: "notification-bookkeeping-failure",
+    rows: [["Uploader", "Publisher", "Customer", "https://www.roblox.com/catalog/3"]],
+  });
+  setUniformSubmissionLedgerWriteFailureForTests(new Error("local ledger temporarily unavailable"));
+  await assert.rejects(
+    markUniformRowsNotified(base, "moderated", "notification-bookkeeping-failure"),
+    /local ledger temporarily unavailable/i,
+  );
+  assert.equal(writes, 1, "notification tracking never writes a spreadsheet status column");
+  setUniformSubmissionLedgerWriteFailureForTests();
+  assert.deepEqual(
+    await markUniformRowsNotified(base, "moderated", "notification-bookkeeping-failure"),
+    { alreadyNotified: false, count: 1 },
+  );
+});
+
+test("verifies an unknown write response using its persisted reserved target without a blind second update", async () => {
+  let values: unknown[][] = [];
+  let updateCalls = 0;
+  setGoogleSheetsProxyForTests(async (_pathname, options) => {
+    if (options?.method === "GET") return response({ values });
+    updateCalls++;
+    values = [["QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/9"]];
+    throw new Error("connector response timed out after Sheets committed");
+  });
+  const result = await appendUniformRows({
+    config: base, logKind: "log", submissionId: "unknown-write-response",
+    rows: [["QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/9"]],
+  });
+  assert.deepEqual(result, { alreadyWritten: true, count: 0 });
+  assert.equal(updateCalls, 1, "unknown responses are verified, not retried blindly");
 });

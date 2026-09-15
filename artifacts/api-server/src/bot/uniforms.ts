@@ -37,6 +37,7 @@ import {
   appendUniformRows,
   markUniformRowsNotified,
   normalizeUniformSpreadsheetConfig,
+  normalizeUniformDataRange,
   validateSpreadsheetConfiguration,
   type UniformSheetRow,
 } from "./google-sheets";
@@ -58,12 +59,6 @@ export const uniformCommands = [
     .setDescription("Log a completed uniform upload.")
     .addStringOption((option) =>
       option
-        .setName("customer")
-        .setDescription("Exact Roblox username for the customer.")
-        .setRequired(true),
-    )
-    .addStringOption((option) =>
-      option
         .setName("qm")
         .setDescription("Exact Roblox username for the Quartermaster.")
         .setRequired(true),
@@ -78,6 +73,12 @@ export const uniformCommands = [
       option
         .setName("publisher")
         .setDescription("Exact Roblox username for the publisher.")
+        .setRequired(true),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("customer")
+        .setDescription("Exact Roblox username for the customer.")
         .setRequired(true),
     )
     .addStringOption((option) =>
@@ -118,12 +119,6 @@ export const uniformCommands = [
     .setDescription("Log a moderated uniform upload.")
     .addStringOption((option) =>
       option
-        .setName("customer")
-        .setDescription("Exact Roblox username for the customer.")
-        .setRequired(true),
-    )
-    .addStringOption((option) =>
-      option
         .setName("uploader")
         .setDescription("Exact Roblox username for the uploader.")
         .setRequired(true),
@@ -132,6 +127,12 @@ export const uniformCommands = [
       option
         .setName("publisher")
         .setDescription("Exact Roblox username for the publisher.")
+        .setRequired(true),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("customer")
+        .setDescription("Exact Roblox username for the customer.")
         .setRequired(true),
     )
     .addStringOption((option) =>
@@ -150,7 +151,8 @@ export const uniformSpreadsheetInputIds = [
   "spreadsheet_id",
   "log_tab",
   "moderated_tab",
-  "create_missing_tabs",
+  "log_range",
+  "moderated_range",
 ] as const;
 
 /**
@@ -484,32 +486,28 @@ function sheetValue(value: string | number | null | undefined): string {
 export function uniformSheetRows(
   submission: UniformSubmission,
   interaction: Pick<ChatInputCommandInteraction, "id" | "user" | "guildId">,
-  at: Date,
+  _at: Date,
 ): UniformSheetRow[] {
   if (!interaction.id) {
     throw new Error("The Discord interaction has no submission ID.");
   }
-  const timestamp = at.toISOString();
   const users = submission.users;
-  return submission.assets.map((asset) => [
-    timestamp,
-    submission.command,
-    sheetValue(users.customer.name),
-    sheetValue(users.customer.id),
-    sheetValue(users.qm?.name),
-    sheetValue(users.qm?.id),
-    sheetValue(users.seqm?.name),
-    sheetValue(users.seqm?.id),
-    sheetValue(users.uploader?.name),
-    sheetValue(users.uploader?.id),
-    sheetValue(users.publisher.name),
-    sheetValue(users.publisher.id),
-    sheetValue(asset.id),
-    sheetValue(asset.url),
-    sheetValue(interaction.user.id),
-    sheetValue(interaction.guildId),
-    sheetValue(interaction.id),
-  ]);
+  // The visible worksheet has a user-established schema. Do not add IDs,
+  // dates, command type, notification state, or any other metadata to it.
+  return submission.assets.map((asset) => submission.command === "log"
+    ? [
+        sheetValue(users.qm?.name),
+        sheetValue(users.seqm?.name),
+        sheetValue(users.publisher.name),
+        sheetValue(users.customer.name),
+        sheetValue(asset.url),
+      ]
+    : [
+        sheetValue(users.uploader?.name),
+        sheetValue(users.publisher.name),
+        sheetValue(users.customer.name),
+        sheetValue(asset.url),
+      ]);
 }
 
 function configuredSpreadsheet(
@@ -704,6 +702,10 @@ export async function handleUniformCommand(
       enforceNonce: true,
     });
   } catch (error) {
+    // The durable local ledger records the sheet write but not a sent notice.
+    // Permit a later delivery to resume notification; Discord's nonce keeps a
+    // supported retry from producing a second public message.
+    activeUniformSubmissions.delete(duplicateKey);
     throw new UniformNotificationError(command, error);
   }
   try {
@@ -857,7 +859,7 @@ export function uniformSettingsEmbed(
       {
         name: "Google Sheets",
         value: settings.spreadsheet
-          ? `${safePresentationText(settings.spreadsheet.spreadsheetId)}\n/log: ${safePresentationText(settings.spreadsheet.logTab)} · /moderated: ${safePresentationText(settings.spreadsheet.moderatedTab)}`
+          ? `${safePresentationText(settings.spreadsheet.spreadsheetId)}\n/log: ${safePresentationText(settings.spreadsheet.logTab)} · ${safePresentationText(settings.spreadsheet.logRange ?? "A2:E")}\n/moderated: ${safePresentationText(settings.spreadsheet.moderatedTab)} · ${safePresentationText(settings.spreadsheet.moderatedRange ?? "A2:D")}`
           : "Not configured — submissions require Spreadsheet Configuration",
         inline: false,
       },
@@ -952,12 +954,21 @@ export async function handleUniformSettingsComponent(
           ),
           new ActionRowBuilder<TextInputBuilder>().addComponents(
             new TextInputBuilder()
-              .setCustomId("create_missing_tabs")
-              .setLabel("Create missing tabs? Type YES (otherwise NO)")
+              .setCustomId("log_range")
+              .setLabel("/log data range (exactly 5 columns)")
               .setStyle(TextInputStyle.Short)
-              .setValue(spreadsheet?.createMissingTabs ? "YES" : "NO")
+              .setValue(spreadsheet?.logRange ?? "A2:E")
               .setRequired(true)
-              .setMaxLength(3),
+              .setMaxLength(40),
+          ),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId("moderated_range")
+              .setLabel("/moderated data range (exactly 4 columns)")
+              .setStyle(TextInputStyle.Short)
+              .setValue(spreadsheet?.moderatedRange ?? "A2:D")
+              .setRequired(true)
+              .setMaxLength(40),
           ),
         ),
     );
@@ -1073,15 +1084,16 @@ export async function handleUniformSpreadsheetSettingsModal(
   interaction: ModalSubmitInteraction,
   setup: GuildSetup,
 ): Promise<GuildSetup> {
-  const createInput = uniformModalValue(interaction, "create_missing_tabs").trim().toLowerCase();
-  if (createInput !== "yes" && createInput !== "no") {
-    throw new Error('Create missing tabs must be exactly "YES" or "NO".');
-  }
   const spreadsheet = {
     spreadsheetId: uniformModalValue(interaction, "spreadsheet_id"),
     logTab: uniformModalValue(interaction, "log_tab") || "Uniform Logs",
     moderatedTab: uniformModalValue(interaction, "moderated_tab") || "Moderated Logs",
-    createMissingTabs: createInput === "yes",
+    logRange: normalizeUniformDataRange(
+      uniformModalValue(interaction, "log_range"), 5, "The /log data range",
+    ),
+    moderatedRange: normalizeUniformDataRange(
+      uniformModalValue(interaction, "moderated_range"), 4, "The /moderated data range",
+    ),
   };
   const updated = await saveUniformSpreadsheetSettings(
     interaction.guild!,
@@ -1093,13 +1105,15 @@ export async function handleUniformSpreadsheetSettingsModal(
     content: "",
     embeds: [presentationEmbed(
       "Spreadsheet Configuration Saved",
-      "Google Sheets connectivity and both dedicated worksheet headers were validated before saving. Uniform submissions will write detailed RAW rows before posting one short Discord notice.",
+      "Google Sheets tabs and data ranges were validated before saving. Submissions write only their configured 5 or 4 user-data cells with RAW values; headers and surrounding sheet data are never changed.",
       "success",
       undefined,
       [
         { name: "Spreadsheet", value: safePresentationText(updated.uniforms?.spreadsheet?.spreadsheetId ?? "") },
         { name: "/log tab", value: safePresentationText(updated.uniforms?.spreadsheet?.logTab ?? "Uniform Logs"), inline: true },
         { name: "/moderated tab", value: safePresentationText(updated.uniforms?.spreadsheet?.moderatedTab ?? "Moderated Logs"), inline: true },
+        { name: "/log range", value: safePresentationText(updated.uniforms?.spreadsheet?.logRange ?? "A2:E"), inline: true },
+        { name: "/moderated range", value: safePresentationText(updated.uniforms?.spreadsheet?.moderatedRange ?? "A2:D"), inline: true },
       ],
     )],
     allowedMentions: noMentions,

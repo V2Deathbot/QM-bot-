@@ -25,6 +25,7 @@ process.env.TRELLO_BOARD_ID = "security-test-board";
 process.env.BOT_SETUP_FILE = path.join(directory, "setup.json");
 process.env.BOT_SECURITY_FILE = path.join(directory, "security.json");
 process.env.ROLE_SNAPSHOT_FILE = path.join(directory, "snapshots.json");
+process.env.UNIFORM_SUBMISSION_LEDGER_FILE = path.join(directory, "uniform-submission-ledger.json");
 
 const { config } = await import("../src/bot/config.ts");
 const { saveGuildSetup } = await import("../src/bot/setup-store.ts");
@@ -783,12 +784,12 @@ test("registers exactly six commands with the requested moderation and uniform o
   ]);
   assert.deepEqual(revoke?.options?.map((option) => option.name), ["username"]);
   assert.deepEqual(log?.options?.map((option) => option.name), [
-    "customer", "qm", "seqm", "publisher",
+    "qm", "seqm", "publisher", "customer",
     "shirtid1", "shirtid2", "shirtid3", "shirtid4", "shirtid5",
     "shirtid6", "shirtid7", "shirtid8", "shirtid9", "shirtid10",
   ]);
   assert.deepEqual(moderated?.options?.map((option) => option.name), [
-    "customer", "uploader", "publisher", "shirtid",
+    "uploader", "publisher", "customer", "shirtid",
   ]);
 });
 
@@ -993,19 +994,23 @@ test("configures Spreadsheet Configuration with stable nonce-bound fields and pr
     "spreadsheet_id",
     "log_tab",
     "moderated_tab",
-    "create_missing_tabs",
+    "log_range",
+    "moderated_range",
   ]);
-  assert.deepEqual(modalTextInputValues(shown), ["", "Uniform Logs", "Moderated Logs", "NO"]);
+  assert.deepEqual(modalTextInputValues(shown), ["", "Uniform Logs", "Moderated Logs", "A2:E", "A2:D"]);
   assert.match(shown.customId, /^setup-modal:uniforms-spreadsheet:[a-f0-9]{32}$/);
 
   await dispatchRaw(modal("setup-owner", shown.customId, {
     spreadsheet_id: "https://docs.google.com/spreadsheets/d/sheet-id/edit",
     log_tab: "Uniform Logs",
     moderated_tab: "Moderated Logs",
-    create_missing_tabs: "NO",
+    log_range: "A2:E",
+    moderated_range: "A2:D",
   }));
   let saved = await store.getGuildSetup(guild.id);
   assert.equal(saved?.uniforms?.spreadsheet?.spreadsheetId, "sheet-id");
+  assert.equal(saved?.uniforms?.spreadsheet?.logRange, "A2:E");
+  assert.equal(saved?.uniforms?.spreadsheet?.moderatedRange, "A2:D");
   assert.equal(saved?.uniforms?.logChannelId, "12345678901234567");
   assert.deepEqual(saved?.uniforms?.authorizedRoleIds, ["12345678901234569"]);
   assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["12345678901234570"]);
@@ -1020,7 +1025,8 @@ test("configures Spreadsheet Configuration with stable nonce-bound fields and pr
     spreadsheet_id: "sheet-id",
     log_tab: "Uniform Logs",
     moderated_tab: "Moderated Logs",
-    create_missing_tabs: "NO",
+    log_range: "A2:E",
+    moderated_range: "A2:D",
   }));
   assert.match(replies.at(-1) ?? "", /Administrator|permission/i);
   saved = await store.getGuildSetup(guild.id);

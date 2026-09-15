@@ -92,7 +92,11 @@ export interface UniformSpreadsheetSettings {
   spreadsheetId: string;
   logTab: string;
   moderatedTab: string;
-  /** Missing tabs are created only when explicitly enabled by an administrator. */
+  /** Data-only destination for /log. Defaults to A2:E for legacy settings. */
+  logRange?: string;
+  /** Data-only destination for /moderated. Defaults to A2:D for legacy settings. */
+  moderatedRange?: string;
+  /** Obsolete; configurations which still enable this fail clearly on use. */
   createMissingTabs?: boolean;
 }
 
@@ -107,6 +111,8 @@ export function uniformSettingsFor(setup: GuildSetup): UniformSettings {
         ...setup.uniforms.spreadsheet,
         logTab: setup.uniforms.spreadsheet.logTab || "Uniform Logs",
         moderatedTab: setup.uniforms.spreadsheet.moderatedTab || "Moderated Logs",
+        logRange: setup.uniforms.spreadsheet.logRange || "A2:E",
+        moderatedRange: setup.uniforms.spreadsheet.moderatedRange || "A2:D",
       }
     : undefined;
   return {
