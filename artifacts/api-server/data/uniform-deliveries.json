@@ -315,7 +315,7 @@
           "lumiivqs",
           "lumiivqs",
           "V2Deathbot",
-          "https://www.roblox.com/catalog/34564324"
+          "https://www.roblox.com/catalog/23456789765"
         ],
         [
           "lumiivqs",
@@ -335,8 +335,8 @@
       "sheetState": "saved",
       "assets": [
         {
-          "id": 34564324,
-          "url": "https://www.roblox.com/catalog/34564324"
+          "id": 23456789765,
+          "url": "https://www.roblox.com/catalog/23456789765"
         },
         {
           "id": 4567654,
@@ -351,14 +351,28 @@
       "logNoticeState": "sent",
       "customerDeliveryState": "sent",
       "createdAt": "2026-09-15T05:43:33.540Z",
-      "customerMessageId": "1549294591591710741",
-      "action": {
-        "kind": "assistance",
-        "reason": "ee",
+      "relog": {
         "state": "sent",
-        "nonce": "u-assistance-73b69ea273fb"
+        "auditState": "sent",
+        "rowIndex": 0,
+        "newAsset": {
+          "id": 23456789765,
+          "url": "https://www.roblox.com/catalog/23456789765"
+        },
+        "oldCustomerMessageId": "1549294591591710741",
+        "nonce": "u-relog-bcd8aefbef068593",
+        "startedAt": "2026-09-15T06:35:23.450Z"
       },
-      "terminal": "assistance"
+      "customerMessageRevision": 1,
+      "customerMessageId": "1549307634627383376",
+      "action": {
+        "kind": "purchased",
+        "state": "sent",
+        "nonce": "u-purchased-755f6d5dcddac",
+        "auditState": "sent"
+      },
+      "terminal": "purchased",
+      "auditMessageId": "1549307777862733825"
     },
     {
       "submissionId": "1549306560545689641",
