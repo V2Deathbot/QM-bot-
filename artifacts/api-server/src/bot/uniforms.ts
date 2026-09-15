@@ -7,6 +7,7 @@ import {
   ModalBuilder,
   PermissionFlagsBits,
   SlashCommandBuilder,
+  StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
   UserSelectMenuBuilder,
@@ -33,6 +34,7 @@ import {
 import {
   getUniformDelivery,
   claimUniformDeliveryAction,
+  findUniformDeliveriesForChannel,
   findLegacyNonceRejectedDelivery,
   recoverLegacyNonceRejectedDelivery,
   saveUniformDelivery,
@@ -50,9 +52,14 @@ import {
 } from "./presentation";
 import {
   appendUniformRows,
+  LOG_UNIFORM_COLUMN_COUNT,
+  MODERATED_UNIFORM_COLUMN_COUNT,
+  markUniformRowsSold,
   markUniformRowsNotified,
   normalizeUniformSpreadsheetConfig,
   normalizeUniformDataRange,
+  replaceUniformRowLink,
+  verifyUniformSubmissionRows,
   validateSpreadsheetConfiguration,
   type UniformSheetRow,
 } from "./google-sheets";
@@ -166,9 +173,22 @@ export const uniformCommands = [
       option.setName("channel").setDescription("Customer delivery channel.").setRequired(true)
         .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
     ),
+  // Keep /relog intentionally narrow. The original delivery and asset are
+  // selected from durable channel-bound records, not supplied as usernames.
+  new SlashCommandBuilder()
+    .setName("relog")
+    .setDescription("Replace a delivered uniform link for a customer.")
+    .addChannelOption((option) =>
+      option.setName("channel").setDescription("Original customer delivery channel.").setRequired(true)
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
+    )
+    .addStringOption((option) =>
+      option.setName("newlink").setDescription("Replacement Roblox asset ID or URL.").setRequired(true),
+    ),
 ] as const;
 
 export const uniformCommandNames = new Set(["log", "moderated"]);
+export const uniformRelogCommandName = "relog";
 
 export type UniformCommandName = "log" | "moderated";
 
@@ -302,10 +322,21 @@ interface PendingUniformConfirmation {
   expiresAt: number;
 }
 const pendingUniformConfirmations = new Map<string, PendingUniformConfirmation>();
+interface PendingRelogConfirmation {
+  nonce: string;
+  guildId: string;
+  actorId: string;
+  channelId: string;
+  newAsset: UniformAsset;
+  choices: Array<{ submissionId: string; rowIndex: number }>;
+  expiresAt: number;
+}
+const pendingRelogConfirmations = new Map<string, PendingRelogConfirmation>();
 
 export function resetUniformSubmissionStateForTests(): void {
   activeUniformSubmissions.clear();
   pendingUniformConfirmations.clear();
+  pendingRelogConfirmations.clear();
 }
 
 export interface UniformAsset {
@@ -803,6 +834,322 @@ export async function handleUniformCommand(
   });
 }
 
+function relogChoiceLabel(record: UniformDeliveryRecord, rowIndex: number): string {
+  const asset = record.assets[rowIndex];
+  return `${record.command === "log" ? "Log" : "Moderated"} · ${record.customerName} · asset ${rowIndex + 1}${asset ? ` (${asset.id})` : ""}`
+    .slice(0, 100);
+}
+
+async function relogAuthorized(
+  guild: Guild,
+  actorId: string,
+  record: UniformDeliveryRecord,
+): Promise<boolean> {
+  const member = await currentMember(guild, actorId);
+  if (guild.ownerId === member.id || member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  // A /log relog belongs to the SEQM originally selected for this specific
+  // delivery. /moderated has no SEQM or Sold column, so only its original
+  // actor (or an Administrator above) can replace its delivery.
+  return record.command === "log" ? record.seqmId === member.id : record.actorId === member.id;
+}
+
+function relogPending(nonce: string, interaction: { guildId: string | null; user: { id: string } }): PendingRelogConfirmation {
+  const pending = pendingRelogConfirmations.get(nonce);
+  if (!pending || pending.expiresAt < Date.now()) {
+    pendingRelogConfirmations.delete(nonce);
+    throw new Error("This relog selection has expired. Run /relog again.");
+  }
+  if (pending.guildId !== interaction.guildId || pending.actorId !== interaction.user.id) {
+    throw new Error("Only the person who started this relog can select its original delivery.");
+  }
+  return pending;
+}
+
+function relogSelectionPayload(pending: PendingRelogConfirmation, records: UniformDeliveryRecord[]) {
+  const options = pending.choices.map(({ submissionId, rowIndex }) => {
+    const record = records.find((candidate) => candidate.submissionId === submissionId)!;
+    return {
+      label: relogChoiceLabel(record, rowIndex),
+      description: `Recorded delivery ${submissionId}`.slice(0, 100),
+      value: `${submissionId}:${rowIndex}`,
+    };
+  });
+  return {
+    embeds: [presentationEmbed(
+      "Select Original Uniform Delivery",
+      "More than one recorded delivery or asset matches this channel. Select the exact original asset to replace. No spreadsheet cells or customer messages have changed.",
+      "info",
+      undefined,
+      [{ name: "Replacement asset", value: `[Open Roblox asset](${pending.newAsset.url})` }],
+    )],
+    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`uniform:relog-select:${pending.nonce}`)
+        .setPlaceholder("Select original delivery and asset")
+        .setMinValues(1)
+        .setMaxValues(1)
+        .addOptions(options),
+    )],
+    allowedMentions: noMentions,
+  };
+}
+
+function relogSuccessPayload(record: UniformDeliveryRecord) {
+  return {
+    embeds: [presentationEmbed(
+      "Uniform Link Replaced",
+      `The original spreadsheet row was updated in place and a fresh customer delivery was posted to <#${record.destinationChannelId}>. No new spreadsheet row or upload-log notice was created.`,
+      "success",
+      undefined,
+      [{ name: "Submission ID", value: displayId(record.submissionId), inline: true }],
+    )],
+    components: [],
+    allowedMentions: noMentions,
+  };
+}
+
+async function startRelog(
+  record: UniformDeliveryRecord,
+  rowIndex: number,
+  newAsset: UniformAsset,
+): Promise<UniformDeliveryRecord> {
+  if (record.relog?.state === "sent" &&
+      record.relog.rowIndex === rowIndex &&
+      record.relog.newAsset.url === newAsset.url) {
+    // A replayed interaction/command is already complete. Its durable message
+    // ID and revision are authoritative; do not create another customer ping.
+    return record;
+  }
+  if (record.relog && record.relog.state !== "sent") {
+    if (record.relog.rowIndex === rowIndex && record.relog.newAsset.url === newAsset.url) {
+      throw new Error("This relog is already in progress. Use Retry Delivery only after a definite Discord delivery failure.");
+    }
+    throw new Error("A prior relog for this delivery is unresolved. No replacement was guessed or sent.");
+  }
+  if (!record.customerMessageId) {
+    throw new Error("The recorded customer delivery message ID is missing. No spreadsheet cells or messages were changed.");
+  }
+  return updateUniformDelivery(record.submissionId, (item) => {
+    if (item.relog && item.relog.state !== "sent") {
+      throw new Error("A relog is already in progress for this delivery.");
+    }
+    if (item.action && item.action.state !== "sent") {
+      throw new Error("A customer action is already in progress or unresolved. No relog was started.");
+    }
+    if (!item.customerMessageId) {
+      throw new Error("The recorded customer delivery message ID is missing. No spreadsheet cells or messages were changed.");
+    }
+    const oldCustomerMessageId = item.customerMessageId;
+    item.relog = {
+      state: "claimed",
+      rowIndex,
+      newAsset,
+      oldCustomerMessageId,
+      nonce: `u-relog-${randomBytes(8).toString("hex")}`,
+      startedAt: new Date().toISOString(),
+    };
+    // Invalidate old controls before the sheet operation. Customer controls
+    // bind to this durable message ID, not merely the submission ID.
+    delete item.customerMessageId;
+    item.customerMessageRevision = (item.customerMessageRevision ?? 0) + 1;
+    delete item.terminal;
+    delete item.action;
+  });
+}
+
+async function selectAndStartRelog(
+  record: UniformDeliveryRecord,
+  rowIndex: number,
+  newAsset: UniformAsset,
+  guild: Guild,
+): Promise<UniformDeliveryRecord> {
+  if (!Array.isArray(record.rows) || !Array.isArray(record.assets) ||
+      !Number.isInteger(rowIndex) || rowIndex < 0 || rowIndex >= record.assets.length ||
+      rowIndex >= record.rows.length ||
+      record.assets[rowIndex]?.url !== record.rows[rowIndex]?.at(-1)) {
+    throw new Error("The selected original asset has no trusted spreadsheet row metadata. No cells were changed.");
+  }
+  // Refuse old records that do not have the original immutable ledger target
+  // before invalidating their customer controls.
+  const ledgerRows = await verifyUniformSubmissionRows(
+    record.spreadsheet, record.command, record.submissionId,
+  );
+  if (record.rows.length !== ledgerRows.length ||
+      record.rows.some((row, index) => row.length !== ledgerRows[index]?.length ||
+        row.some((cell, column) => cell !== ledgerRows[index]![column]))) {
+    throw new Error("The recorded delivery no longer matches its original spreadsheet rows. No cells or messages were changed.");
+  }
+  const current = await startRelog(record, rowIndex, newAsset);
+  return continueRelog(current, guild);
+}
+
+async function continueRelog(record: UniformDeliveryRecord, guild: Guild): Promise<UniformDeliveryRecord> {
+  let current = await getUniformDelivery(record.submissionId) ?? record;
+  const relog = current.relog;
+  if (!relog) throw new Error("This recorded relog is unavailable.");
+  if (relog.state === "sent") return current;
+  if (relog.state === "customer-claimed" || relog.state === "unresolved") {
+    if (relog.state === "customer-claimed") {
+      await updateUniformDelivery(current.submissionId, (item) => {
+        if (item.relog?.state === "customer-claimed") item.relog.state = "unresolved";
+      });
+    }
+    throw new Error("The replacement customer delivery outcome is unresolved. No duplicate message will be sent.");
+  }
+  if (relog.state === "claimed") {
+    if (relog.rowIndex < 0) throw new Error("The relog has no selected original asset. No cells were changed.");
+    await replaceUniformRowLink({
+      config: current.spreadsheet,
+      logKind: current.command,
+      submissionId: current.submissionId,
+      rowIndex: relog.rowIndex,
+      newLink: relog.newAsset.url,
+    });
+    current = await updateUniformDelivery(current.submissionId, (item) => {
+      const operation = item.relog;
+      if (!operation || operation.state !== "claimed") {
+        throw new Error("The relog operation changed before the sheet update was recorded.");
+      }
+      const row = item.rows[operation.rowIndex];
+      if (!row || row.length !== (item.command === "log" ? LOG_UNIFORM_COLUMN_COUNT : MODERATED_UNIFORM_COLUMN_COUNT)) {
+        throw new Error("The recorded relog row is incomplete. No customer message was sent.");
+      }
+      row[row.length - 1] = operation.newAsset.url;
+      item.assets[operation.rowIndex] = operation.newAsset;
+      operation.state = "sheet-updated";
+    });
+  }
+  current = await getUniformDelivery(record.submissionId) ?? current;
+  if (current.relog?.state === "pending" || current.relog?.state === "sheet-updated") {
+    current = await sendRelogDelivery(current, guild);
+  }
+  return current;
+}
+
+async function sendRelogDelivery(record: UniformDeliveryRecord, guild: Guild): Promise<UniformDeliveryRecord> {
+  const operation = record.relog;
+  if (!operation || (operation.state !== "sheet-updated" && operation.state !== "pending")) {
+    throw new Error("This replacement delivery is not ready to send.");
+  }
+  const destination = await requireUniformChannel(guild, record.destinationChannelId, record.command);
+  let current = await updateUniformDelivery(record.submissionId, (item) => {
+    if (!item.relog || (item.relog.state !== "sheet-updated" && item.relog.state !== "pending")) {
+      throw new Error("This replacement delivery is not ready to send.");
+    }
+    item.relog.state = "customer-claimed";
+  });
+  try {
+    const message = await destination.send({
+      content: `<@${current.customerId}>`,
+      embeds: [customerDeliveryEmbed(current)],
+      components: customerDeliveryButtons(current),
+      allowedMentions: { parse: [], users: [current.customerId] },
+      nonce: current.relog!.nonce,
+      enforceNonce: true,
+    });
+    const messageId = sentMessageId(message);
+    if (!messageId) throw new Error("Discord did not return a message ID for the replacement customer delivery.");
+    current = await updateUniformDelivery(record.submissionId, (item) => {
+      if (!item.relog || item.relog.state !== "customer-claimed") {
+        throw new Error("The replacement delivery state changed before its message ID was recorded.");
+      }
+      item.customerMessageId = messageId;
+      item.customerDeliveryState = "sent";
+      item.relog.state = "sent";
+    });
+  } catch (error) {
+    const failure = error instanceof UniformDiscordDeliveryError
+      ? error
+      : discordDeliveryFailure("customer delivery", error);
+    await updateUniformDelivery(record.submissionId, (item) => {
+      if (item.relog?.state === "customer-claimed") item.relog.state = failure.retryable ? "pending" : "unresolved";
+    }).catch(() => undefined);
+    throw failure;
+  }
+  return current;
+}
+
+export async function handleUniformRelogCommand(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  const selected = interaction.options.getChannel("channel", true);
+  await requireUniformChannel(interaction.guild!, selected.id, "log");
+  const newAsset = parseUniformAssetInput(optionString(interaction, "newlink", true) ?? "");
+  const records = await findUniformDeliveriesForChannel(interaction.guildId!, selected.id);
+  const authorized: UniformDeliveryRecord[] = [];
+  for (const record of records) {
+    if (await relogAuthorized(interaction.guild!, interaction.user.id, record)) authorized.push(record);
+  }
+  const choices = authorized.flatMap((record) =>
+    record.assets.map((_asset, rowIndex) => ({ submissionId: record.submissionId, rowIndex })),
+  );
+  if (!choices.length) {
+    throw new Error("No authorized recorded customer delivery with trusted original metadata was found in that channel.");
+  }
+  if (choices.length > 25) {
+    throw new Error("More than 25 recorded assets match this channel. No replacement was guessed; ask an Administrator to narrow the channel records.");
+  }
+  if (choices.length === 1) {
+    const choice = choices[0]!;
+    try {
+      const result = await selectAndStartRelog(
+        authorized.find((record) => record.submissionId === choice.submissionId)!,
+        choice.rowIndex, newAsset, interaction.guild!,
+      );
+      await interaction.editReply(relogSuccessPayload(result));
+    } catch (error) {
+      const current = await getUniformDelivery(choice.submissionId).catch(() => undefined);
+      if (!current?.relog) throw error;
+      throw new UniformDeliveryRecoveryError(
+        choice.submissionId,
+        error instanceof Error ? error.message : "The replacement delivery could not be completed.",
+        retryControlFor(current),
+      );
+    }
+    return;
+  }
+  const nonce = randomBytes(16).toString("hex");
+  const pending: PendingRelogConfirmation = {
+    nonce, guildId: interaction.guildId!, actorId: interaction.user.id,
+    channelId: selected.id, newAsset, choices, expiresAt: Date.now() + uniformConfirmationLifetimeMs,
+  };
+  pendingRelogConfirmations.set(nonce, pending);
+  await interaction.editReply(relogSelectionPayload(pending, authorized));
+}
+
+export async function handleUniformRelogSelection(
+  interaction: StringSelectMenuInteraction,
+): Promise<void> {
+  const [, , nonce] = interaction.customId.split(":");
+  if (!nonce) throw new Error("That relog selection is unavailable.");
+  const pending = relogPending(nonce, interaction);
+  const [submissionId, rowText] = interaction.values[0]?.split(":") ?? [];
+  const rowIndex = Number(rowText);
+  if (!submissionId || !Number.isInteger(rowIndex) ||
+      !pending.choices.some((choice) => choice.submissionId === submissionId && choice.rowIndex === rowIndex)) {
+    throw new Error("That relog selection is unavailable.");
+  }
+  const record = await getUniformDelivery(submissionId);
+  if (!record || record.guildId !== pending.guildId || record.destinationChannelId !== pending.channelId ||
+      !await relogAuthorized(interaction.guild!, interaction.user.id, record)) {
+    throw new Error("This recorded delivery is no longer available for relog.");
+  }
+  pendingRelogConfirmations.delete(nonce);
+  await interaction.deferUpdate();
+  try {
+    const result = await selectAndStartRelog(record, rowIndex, pending.newAsset, interaction.guild!);
+    await interaction.editReply(relogSuccessPayload(result));
+  } catch (error) {
+    const current = await getUniformDelivery(submissionId).catch(() => undefined);
+    if (!current?.relog) throw error;
+    await interaction.editReply(uniformDeliveryRecoveryResponse(new UniformDeliveryRecoveryError(
+      submissionId,
+      error instanceof Error ? error.message : "The replacement delivery could not be completed.",
+      retryControlFor(current),
+    )));
+  }
+}
+
 function uniformConfirmationComponents(nonce: string, command: UniformCommandName, ready: boolean) {
   const rows: Array<ActionRowBuilder<UserSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>> = [
     new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
@@ -913,6 +1260,11 @@ function hasRetryableDelivery(record: UniformDeliveryRecord | undefined): boolea
  * Discord operation is unresolved, however, no automatic replay is safe.
  */
 function canRetryDelivery(record: UniformDeliveryRecord | undefined): boolean {
+  if (record?.relog) {
+    return record.relog.state === "claimed" ||
+      record.relog.state === "sheet-updated" ||
+      record.relog.state === "pending";
+  }
   return Boolean(
     record &&
     (record.sheetState === "prepared" || record.sheetState === "saved") &&
@@ -1162,7 +1514,13 @@ export async function handleUniformRetryButton(
     const latest = await getGuildSetup(record.guildId);
     if (!latest) throw new Error("This server no longer has a valid bot setup.");
     const settings = uniformSettingsFor(latest);
-    if (record.actorId === interaction.user.id) {
+    if (record.relog) {
+      if (!await relogAuthorized(interaction.guild!, interaction.user.id, record)) {
+        throw new Error(record.command === "log"
+          ? "Only the assigned Senior Quartermaster or a current Administrator can retry this relog."
+          : "Only the original moderated actor or a current Administrator can retry this relog.");
+      }
+    } else if (record.actorId === interaction.user.id) {
       await requireUniformSubmitter(interaction.guild!, record.actorId, settings);
     } else {
       const member = await currentMember(interaction.guild!, interaction.user.id);
@@ -1176,8 +1534,13 @@ export async function handleUniformRetryButton(
     authorizationVerified = true;
     await fetchedMember(interaction.guild!, record.customerId);
     if (record.command === "log") await fetchedMember(interaction.guild!, record.seqmId);
-    await requireUniformChannel(interaction.guild!, record.uploadLogChannelId, record.command);
     await requireUniformChannel(interaction.guild!, record.destinationChannelId, record.command);
+    if (record.relog) {
+      const delivered = await continueRelog(record, interaction.guild!);
+      await interaction.editReply(relogSuccessPayload(delivered));
+      return;
+    }
+    await requireUniformChannel(interaction.guild!, record.uploadLogChannelId, record.command);
     if (record.sheetState !== "saved") {
       await appendUniformRows({ config: record.spreadsheet, logKind: record.command, rows: record.rows, submissionId: record.submissionId });
       await updateUniformDelivery(record.submissionId, (item) => { item.sheetState = "saved"; });
@@ -1223,13 +1586,28 @@ function escapedAssistanceReason(value: string): string {
   // markdown, links, or a mention. presentation text also removes controls.
   return safePresentationText(value, 1000).replace(/[\\`*_~|[\]()]/g, "\\$&");
 }
-async function boundDelivery(interaction: ButtonInteraction | ModalSubmitInteraction, submissionId: string): Promise<UniformDeliveryRecord> {
+interface DeliveryActionExpectation {
+  customerMessageId: string;
+  customerMessageRevision: number;
+}
+
+async function boundDelivery(
+  interaction: ButtonInteraction | ModalSubmitInteraction,
+  submissionId: string,
+  expected?: DeliveryActionExpectation,
+): Promise<UniformDeliveryRecord> {
   const record = await getUniformDelivery(submissionId);
   if (!record || record.guildId !== interaction.guildId || record.destinationChannelId !== interaction.channelId) {
     throw new Error("This uniform delivery control is no longer valid.");
   }
   if (interaction.user.id !== record.customerId) throw new Error("Only the selected customer can use this uniform delivery control.");
   if ("message" in interaction && (!interaction.message || record.customerMessageId !== interaction.message.id)) {
+    throw new Error("This uniform delivery control is not attached to its recorded customer message.");
+  }
+  if (expected && (
+    record.customerMessageId !== expected.customerMessageId ||
+    (record.customerMessageRevision ?? 0) !== expected.customerMessageRevision
+  )) {
     throw new Error("This uniform delivery control is not attached to its recorded customer message.");
   }
   await fetchedMember(interaction.guild!, record.customerId);
@@ -1251,19 +1629,31 @@ export async function handleUniformCustomerButton(interaction: ButtonInteraction
   }
   if (action === "assist") {
     await interaction.showModal(
-      new ModalBuilder().setCustomId(`uniform:assist-modal:${submissionId}`).setTitle("Request Senior Quartermaster Assistance")
+      new ModalBuilder()
+        .setCustomId(
+          `uniform:assist-modal:${submissionId}:${interaction.message.id}:${record.customerMessageRevision ?? 0}`,
+        )
+        .setTitle("Request Senior Quartermaster Assistance")
         .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder().setCustomId("reason").setLabel("How can we help?").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1000),
         )),
     );
     return;
   }
-  const claimed = await claimUniformDeliveryAction(submissionId, "purchased");
+  const claimed = await claimUniformDeliveryAction(submissionId, "purchased", undefined, {
+    customerMessageId: interaction.message.id,
+    customerMessageRevision: record.customerMessageRevision ?? 0,
+  });
   if (claimed.action?.kind !== "purchased" || claimed.action.state !== "claimed") {
     throw new Error("This customer outcome is already claimed or unresolved. It will not be sent again automatically.");
   }
   await interaction.deferUpdate();
   try {
+    // A /log acknowledgement is not successful unless its immutable original
+    // ledger rows were marked in the fixed Sold column first.
+    if (record.command === "log") {
+      await markUniformRowsSold(record.spreadsheet, record.command, submissionId);
+    }
     const channel = await requireUniformChannel(interaction.guild!, record.destinationChannelId, record.command);
     await channel.send({
       content: record.command === "log" ? `<@${record.seqmId}>` : "A customer has confirmed their purchase.",
@@ -1286,15 +1676,19 @@ export async function handleUniformCustomerButton(interaction: ButtonInteraction
 }
 
 export async function handleUniformAssistanceModal(interaction: ModalSubmitInteraction): Promise<void> {
-  const [, , submissionId] = interaction.customId.split(":");
-  if (!submissionId) throw new Error("That assistance request is unavailable.");
-  const record = await boundDelivery(interaction, submissionId);
+  const [, , submissionId, customerMessageId, revisionText] = interaction.customId.split(":");
+  const customerMessageRevision = Number(revisionText);
+  if (!submissionId || !customerMessageId || !Number.isSafeInteger(customerMessageRevision) || customerMessageRevision < 0) {
+    throw new Error("That assistance request is unavailable. Open Request Assistance again from the current delivery message.");
+  }
+  const expected = { customerMessageId, customerMessageRevision };
+  const record = await boundDelivery(interaction, submissionId, expected);
   if (record.terminal) throw new Error("This uniform delivery has already been completed.");
   if (record.action) throw new Error("This customer outcome is already claimed or unresolved. It will not be sent again automatically.");
   let reason = "";
   try { reason = interaction.fields.getTextInputValue("reason").trim(); } catch { /* reply below */ }
   if (!reason || reason.length > 1000) throw new Error("An assistance reason of up to 1000 characters is required.");
-  const claimed = await claimUniformDeliveryAction(submissionId, "assistance", reason);
+  const claimed = await claimUniformDeliveryAction(submissionId, "assistance", reason, expected);
   if (claimed.action?.kind !== "assistance" || claimed.action.state !== "claimed") {
     throw new Error("This customer outcome is already claimed or unresolved. It will not be sent again automatically.");
   }

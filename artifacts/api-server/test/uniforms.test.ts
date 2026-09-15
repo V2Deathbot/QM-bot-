@@ -20,7 +20,7 @@ const {
 const { setGoogleSheetsProxyForTests, resetGoogleSheetsProxyForTests } =
   await import("../src/bot/google-sheets.ts");
 const {
-  getUniformDelivery, recoverLegacyNonceRejectedDelivery, resetUniformDeliveryStoreForTests,
+  claimUniformDeliveryAction, getUniformDelivery, recoverLegacyNonceRejectedDelivery, resetUniformDeliveryStoreForTests,
   saveUniformDelivery, uniformDiscordNonce,
 } = await import("../src/bot/uniform-delivery-store.ts");
 const { getGuildSetup, saveGuildSetup, defaultUniformSettings } =
@@ -304,8 +304,8 @@ test("uses deterministic Discord-safe nonces for 19- and 20-digit delivery IDs",
   assert.equal(uniformDiscordNonce("notice", nineteenDigits), uniformDiscordNonce("notice", nineteenDigits));
 
   await saveUniformDelivery({
-    submissionId: twentyDigits, guildId: guild.id, command: "log", actorId: "submitter",
-    customerId: "customer-discord", seqmId: "seqm-discord", destinationChannelId: "customer-channel",
+    submissionId: twentyDigits, guildId: guild.id, command: "moderated", actorId: "submitter",
+    customerId: "customer-discord", seqmId: "", destinationChannelId: "customer-channel",
     uploadLogChannelId: "log", spreadsheet: setup.uniforms!.spreadsheet!, rows: [],
     sheetState: "saved", customerName: "Customer", assets: [{ id: 98, url: "https://www.roblox.com/catalog/98" }],
     logNoticeState: "sent", customerDeliveryState: "sent", customerMessageId: "twenty-digit-message", createdAt: new Date().toISOString(),
@@ -474,7 +474,7 @@ test("/moderated asks only for the customer and does not write before Submit", a
   assert.equal(sends.length, 0);
 });
 
-test("customer controls bind the saved message, survive store reload, and do not duplicate purchase pings", async () => {
+test("legacy /log controls without original ledger rows fail before a purchase ping", async () => {
   await saveUniformDelivery({
     submissionId: "customer-purchase", guildId: guild.id, command: "log", actorId: "submitter",
     customerId: "customer-discord", seqmId: "seqm-discord", destinationChannelId: "customer-channel",
@@ -487,22 +487,40 @@ test("customer controls bind the saved message, survive store reload, and do not
     customId: "uniform:purchase:customer-purchase", guild, guildId: guild.id, channelId: "customer-channel",
     message: { id: "customer-message" }, user: { id: "other-user" },
   } as never), /Only the selected customer/i);
-  const edits: unknown[] = [];
   const click = {
     customId: "uniform:purchase:customer-purchase", guild, guildId: guild.id, channelId: "customer-channel",
     message: { id: "customer-message" }, user: { id: "customer-discord" },
-    deferUpdate: async () => undefined, editReply: async (payload: unknown) => { edits.push(payload); },
-    update: async (payload: unknown) => { edits.push(payload); },
+    deferUpdate: async () => undefined, editReply: async () => undefined,
+    update: async () => undefined,
   };
-  await handleUniformCustomerButton(click as never);
-  assert.equal(sends.length, 1);
-  const delivered = (sends[0] as { payload: { content: string; allowedMentions: { users: string[] } } }).payload;
-  assert.equal(delivered.content, "<@seqm-discord>");
-  assert.deepEqual(delivered.allowedMentions.users, ["seqm-discord"]);
-  assert.equal((await getUniformDelivery("customer-purchase"))?.terminal, "purchased");
-  await handleUniformCustomerButton(click as never);
-  assert.equal(sends.length, 1);
-  assert.equal((edits[0] as { components: unknown[] }).components.length, 1);
+  await assert.rejects(handleUniformCustomerButton(click as never), /Trusted original spreadsheet row metadata/i);
+  assert.equal(sends.length, 0);
+  assert.equal((await getUniformDelivery("customer-purchase"))?.terminal, undefined);
+  assert.equal((await getUniformDelivery("customer-purchase"))?.action?.state, "unresolved");
+});
+
+test("atomically rejects an old customer message action after relog revision changes", async () => {
+  await saveUniformDelivery({
+    submissionId: "relog-cas", guildId: guild.id, command: "moderated", actorId: "submitter",
+    customerId: "customer-discord", seqmId: "", destinationChannelId: "customer-channel",
+    uploadLogChannelId: "moderated", spreadsheet: setup.uniforms!.spreadsheet!, rows: [],
+    sheetState: "saved", customerName: "Customer", assets: [{ id: 101, url: "https://www.roblox.com/catalog/101" }],
+    logNoticeState: "sent", customerDeliveryState: "sent", customerMessageId: "replacement-message",
+    customerMessageRevision: 1,
+    relog: {
+      state: "sent", rowIndex: 0, newAsset: { id: 101, url: "https://www.roblox.com/catalog/101" },
+      oldCustomerMessageId: "old-message", nonce: "u-relog-test", startedAt: new Date().toISOString(),
+    },
+    createdAt: new Date().toISOString(),
+  });
+  await assert.rejects(
+    claimUniformDeliveryAction("relog-cas", "purchased", undefined, {
+      customerMessageId: "old-message", customerMessageRevision: 0,
+    }),
+    /no longer attached/i,
+  );
+  assert.equal((await getUniformDelivery("relog-cas"))?.action, undefined);
+  assert.equal(sends.length, 0);
 });
 
 test("moderated assistance opens an initial modal and posts an escaped request without a SEQM ping", async () => {
@@ -523,7 +541,7 @@ test("moderated assistance opens an initial modal and posts an escaped request w
   let originalDisabled = false;
   const replies: unknown[] = [];
   await handleUniformAssistanceModal({
-    customId: "uniform:assist-modal:customer-assist", guild, guildId: guild.id, channelId: "customer-channel",
+    customId: "uniform:assist-modal:customer-assist:assist-message:0", guild, guildId: guild.id, channelId: "customer-channel",
     user: { id: "customer-discord" }, fields: { getTextInputValue: () => "@everyone [spoof](https://bad.example)" },
     deferReply: async () => undefined,
     channel: { messages: { fetch: async () => ({ edit: async () => { originalDisabled = true; } }) } },

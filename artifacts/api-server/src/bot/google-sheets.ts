@@ -55,6 +55,44 @@ export interface MarkUniformRowsNotifiedResult {
   count: number;
 }
 
+export interface ReplaceUniformRowLinkInput {
+  config: UniformSpreadsheetConfig;
+  logKind: "log" | "moderated";
+  submissionId: string;
+  /** Zero-based asset/row index in this submission's original ledger entry. */
+  rowIndex: number;
+  newLink: string;
+}
+
+export interface ReplaceUniformRowLinkResult {
+  alreadyUpdated: boolean;
+  targetRange: string;
+}
+
+export interface MarkUniformRowsSoldResult {
+  alreadyMarked: boolean;
+  count: number;
+}
+
+export async function verifyUniformSubmissionRows(
+  configInput: UniformSpreadsheetConfig,
+  logKind: "log" | "moderated",
+  submissionId: string,
+): Promise<string[][]> {
+  const config = normalizeUniformSpreadsheetConfig(configInput);
+  const width = logKind === "log" ? LOG_UNIFORM_COLUMN_COUNT : MODERATED_UNIFORM_COLUMN_COUNT;
+  const { tab, range, destination } = destinationFor(config, logKind);
+  return serialDestination(destination, async () => {
+    const entry = await completedLedgerEntry(destination, submissionId);
+    const target = targetForEntry(entry, width);
+    if (target.startColumn !== range.startColumn || target.endColumn !== range.endColumn ||
+        !await verifyReservation(config, tab, entry)) {
+      throw new Error("The original spreadsheet row no longer matches its recorded usernames and link. No cells were changed.");
+    }
+    return entry.values.map((row) => [...row]);
+  });
+}
+
 export type SheetsProxy = (
   path: string,
   options?: { method?: string; body?: unknown; headers?: Record<string, string> },
@@ -226,6 +264,7 @@ interface SubmissionLedger { entries: SubmissionLedgerEntry[]; }
 let ledgerQueue: Promise<void> = Promise.resolve();
 let destinationQueues = new Map<string, Promise<void>>();
 let ledgerWriteFailureForTests: Error | undefined;
+let ledgerWriteFailureAfterForTests: number | undefined;
 async function readLedger(): Promise<SubmissionLedger> {
   try {
     const parsed = JSON.parse(await readFile(config.uniformSubmissionLedgerFile, "utf8")) as { entries?: unknown };
@@ -241,6 +280,9 @@ async function readLedger(): Promise<SubmissionLedger> {
   }
 }
 async function writeLedger(ledger: SubmissionLedger): Promise<void> {
+  if (ledgerWriteFailureAfterForTests !== undefined) {
+    if (ledgerWriteFailureAfterForTests-- <= 0) throw ledgerWriteFailureForTests!;
+  }
   if (ledgerWriteFailureForTests) throw ledgerWriteFailureForTests;
   const directory = path.dirname(config.uniformSubmissionLedgerFile);
   const temporary = `${config.uniformSubmissionLedgerFile}.tmp`;
@@ -272,10 +314,20 @@ export function resetUniformSubmissionLedgerForTests(): void {
   ledgerQueue = Promise.resolve();
   destinationQueues = new Map();
   ledgerWriteFailureForTests = undefined;
+  ledgerWriteFailureAfterForTests = undefined;
 }
 /** Test-only fault injection for the local notification bookkeeping path. */
 export function setUniformSubmissionLedgerWriteFailureForTests(error?: Error): void {
   ledgerWriteFailureForTests = error;
+  ledgerWriteFailureAfterForTests = undefined;
+}
+/** Test-only: fail a later local commit, after `writesBeforeFailure` commits. */
+export function setUniformSubmissionLedgerWriteFailureAfterForTests(
+  writesBeforeFailure: number,
+  error: Error,
+): void {
+  ledgerWriteFailureForTests = error;
+  ledgerWriteFailureAfterForTests = writesBeforeFailure;
 }
 
 function destinationFor(config: SpreadsheetValidationResult, kind: "log" | "moderated"): { tab: string; range: DataRange; destination: string } {
@@ -300,6 +352,158 @@ async function readRange(spreadsheetId: string, tab: string, range: string): Pro
 async function verifyReservation(config: SpreadsheetValidationResult, tab: string, entry: SubmissionLedgerEntry): Promise<boolean> {
   const actual = await readRange(config.spreadsheetId, tab, entry.targetRange);
   return equalsValues(actual, entry.values);
+}
+
+function targetForEntry(entry: SubmissionLedgerEntry, width: number): DataRange {
+  if (!/^[A-Z]+[1-9]\d*:[A-Z]+[1-9]\d*$/.test(entry.targetRange)) {
+    throw new Error("The recorded spreadsheet row reference is invalid. No cells were changed.");
+  }
+  const target = parseDataRange(entry.targetRange);
+  if (target.endColumn - target.startColumn + 1 !== width ||
+      target.endRow === undefined ||
+      target.endRow - target.startRow + 1 !== entry.values.length) {
+    throw new Error("The recorded spreadsheet row reference is incomplete or incompatible. No cells were changed.");
+  }
+  return target;
+}
+
+async function completedLedgerEntry(
+  destination: string,
+  submissionId: string,
+): Promise<SubmissionLedgerEntry> {
+  const key = recordKey(destination, submissionId);
+  const entry = await withLedger((ledger) => ledger.entries.find((candidate) => candidate.key === key));
+  if (!entry || entry.state !== "written") {
+    throw new Error("Trusted original spreadsheet row metadata is unavailable. No cells were changed.");
+  }
+  return entry;
+}
+
+async function updateLedgerValues(
+  destination: string,
+  submissionId: string,
+  values: string[][],
+): Promise<void> {
+  const key = recordKey(destination, submissionId);
+  await withLedger((ledger) => {
+    const entry = ledger.entries.find((candidate) => candidate.key === key);
+    if (!entry || entry.state !== "written") {
+      throw new Error("Trusted original spreadsheet row metadata is unavailable. No cells were changed.");
+    }
+    entry.values = values.map((row) => [...row]);
+  });
+}
+
+/**
+ * Replaces a single asset link at the immutable row recorded when the original
+ * submission was written. It deliberately never uses append semantics or a
+ * username lookup: a moved/manual-edited row is refused before any write.
+ */
+export async function replaceUniformRowLink(
+  input: ReplaceUniformRowLinkInput,
+): Promise<ReplaceUniformRowLinkResult> {
+  const config = normalizeUniformSpreadsheetConfig(input.config);
+  const width = input.logKind === "log" ? LOG_UNIFORM_COLUMN_COUNT : MODERATED_UNIFORM_COLUMN_COUNT;
+  const { tab, range, destination } = destinationFor(config, input.logKind);
+  if (!input.submissionId.trim() || !Number.isInteger(input.rowIndex) || input.rowIndex < 0 ||
+      !input.newLink || /[\u0000-\u001f\u007f]/.test(input.newLink)) {
+    throw new Error("The relog request is invalid. No cells were changed.");
+  }
+  return serialDestination(destination, async () => {
+    const entry = await completedLedgerEntry(destination, input.submissionId);
+    const target = targetForEntry(entry, width);
+    if (input.rowIndex >= entry.values.length ||
+        target.startColumn !== range.startColumn || target.endColumn !== range.endColumn) {
+      throw new Error("The recorded spreadsheet row is incompatible with its frozen configuration. No cells were changed.");
+    }
+    const expected = entry.values.map((row) => [...row]);
+    const linkColumn = target.endColumn;
+    const intended = expected.map((row) => [...row]);
+    intended[input.rowIndex]![width - 1] = input.newLink;
+    const cellRange = `${columnLetters(linkColumn)}${target.startRow + input.rowIndex}`;
+    const actual = await readRange(config.spreadsheetId, tab, entry.targetRange);
+    const matchesOriginal = equalsValues(actual, expected);
+    const matchesIntended = equalsValues(actual, intended);
+    if (matchesIntended) {
+      // A process can stop after Sheets committed the intended replacement but
+      // before the ledger save. Only this exact full-row intended state is
+      // reconciled; any other manual/moved change remains a hard failure.
+      if (!matchesOriginal) await updateLedgerValues(destination, input.submissionId, intended);
+      return {
+        alreadyUpdated: true,
+        targetRange: cellRange,
+      };
+    }
+    if (!matchesOriginal) {
+      throw new Error("The original spreadsheet row no longer matches its recorded usernames and link. No cells were changed.");
+    }
+    try {
+      await jsonResponse(await proxy(
+        `${rangePath(config.spreadsheetId, tab, cellRange)}?valueInputOption=RAW`,
+        { method: "PUT", headers: { "Content-Type": "application/json" }, body: {
+          range: `${quoteSheetTab(tab)}!${cellRange}`, majorDimension: "ROWS", values: [[input.newLink]],
+        } },
+      ), "uniform relog update");
+    } catch (error) {
+      // The request may have reached Sheets. Verify the exact ledger target,
+      // never retry a write whose outcome is unknown.
+      const changed = await readRange(config.spreadsheetId, tab, entry.targetRange)
+        .then((value) => equalsValues(value, intended))
+        .catch(() => false);
+      if (!changed) throw error;
+    }
+    await updateLedgerValues(destination, input.submissionId, intended);
+    return { alreadyUpdated: false, targetRange: cellRange };
+  });
+}
+
+/**
+ * /log owns A:E by default; the customer-owned Sold checkbox is fixed at F.
+ * Configurations whose data rectangle contains F are unsafe and are rejected
+ * rather than guessing a neighbouring column.
+ */
+export async function markUniformRowsSold(
+  configInput: UniformSpreadsheetConfig,
+  logKind: "log" | "moderated",
+  submissionId: string,
+): Promise<MarkUniformRowsSoldResult> {
+  if (logKind !== "log") {
+    throw new Error("Moderated uniform logs do not have a Sold column. No cells were changed.");
+  }
+  const config = normalizeUniformSpreadsheetConfig(configInput);
+  const { tab, range, destination } = destinationFor(config, logKind);
+  return serialDestination(destination, async () => {
+    const entry = await completedLedgerEntry(destination, submissionId);
+    const target = targetForEntry(entry, LOG_UNIFORM_COLUMN_COUNT);
+    if (target.startColumn !== range.startColumn || target.endColumn !== range.endColumn) {
+      throw new Error("The recorded spreadsheet row is incompatible with its frozen configuration. No cells were changed.");
+    }
+    if (range.startColumn <= 6 && range.endColumn >= 6) {
+      throw new Error("The configured /log data range overlaps Sold column F. No cells were changed.");
+    }
+    if (!await verifyReservation(config, tab, entry)) {
+      throw new Error("The original spreadsheet row no longer matches its recorded usernames and link. No cells were changed.");
+    }
+    const soldRange = `F${target.startRow}:F${target.endRow}`;
+    try {
+      await jsonResponse(await proxy(
+        `${rangePath(config.spreadsheetId, tab, soldRange)}?valueInputOption=RAW`,
+        { method: "PUT", headers: { "Content-Type": "application/json" }, body: {
+          range: `${quoteSheetTab(tab)}!${soldRange}`, majorDimension: "ROWS",
+          values: entry.values.map(() => [true]),
+        } },
+      ), "Sold checkbox update");
+    } catch (error) {
+      const actual = await readRange(config.spreadsheetId, tab, soldRange).catch(() => []);
+      const marked = entry.values.every((_row, index) => {
+        const value = actual[index]?.[0];
+        return value === true || String(value).toUpperCase() === "TRUE";
+      });
+      if (!marked) throw error;
+      return { alreadyMarked: true, count: entry.values.length };
+    }
+    return { alreadyMarked: false, count: entry.values.length };
+  });
 }
 
 export async function appendUniformRows(input: AppendUniformRowsInput): Promise<AppendUniformRowsResult> {

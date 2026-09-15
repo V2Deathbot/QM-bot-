@@ -48,6 +48,21 @@ export interface UniformDeliveryRecord {
   logNoticeState: "pending" | "claimed" | "sent" | "unresolved";
   customerDeliveryState: "pending" | "claimed" | "sent" | "unresolved";
   customerMessageId?: string;
+  /** Incremented before a replacement delivery invalidates prior controls. */
+  customerMessageRevision?: number;
+  /**
+   * A replacement is a separate durable outbox from the initial delivery.
+   * Its fixed nonce and selected original row make restart/retry handling
+   * safe without appending sheet rows or reusing the old customer message.
+   */
+  relog?: {
+    state: "claimed" | "sheet-updated" | "pending" | "customer-claimed" | "sent" | "unresolved";
+    rowIndex: number;
+    newAsset: { id: number; url: string };
+    oldCustomerMessageId?: string;
+    nonce: string;
+    startedAt: string;
+  };
   /**
    * A one-time, manually confirmed migration marker for a delivery rejected
    * before Discord accepted the legacy overlong notice nonce.
@@ -79,6 +94,8 @@ async function readStore(): Promise<DeliveryFile> {
         typeof (record as UniformDeliveryRecord).seqmId === "string" &&
         typeof (record as UniformDeliveryRecord).destinationChannelId === "string" &&
         typeof (record as UniformDeliveryRecord).uploadLogChannelId === "string" &&
+        ((record as UniformDeliveryRecord).command === "log" ||
+          (record as UniformDeliveryRecord).command === "moderated") &&
         Array.isArray((record as UniformDeliveryRecord).assets),
       ),
     };
@@ -108,6 +125,19 @@ async function mutate<T>(operation: (store: DeliveryFile) => T | Promise<T>): Pr
 
 export async function getUniformDelivery(submissionId: string): Promise<UniformDeliveryRecord | undefined> {
   return mutate((store) => store.records.find((record) => record.submissionId === submissionId));
+}
+
+/** Only durable records, never username matching, are candidates for /relog. */
+export async function findUniformDeliveriesForChannel(
+  guildId: string,
+  channelId: string,
+): Promise<UniformDeliveryRecord[]> {
+  return mutate((store) => store.records.filter((record) =>
+    record.guildId === guildId &&
+    record.destinationChannelId === channelId &&
+    record.sheetState === "saved" &&
+    Boolean(record.customerMessageId || record.relog),
+  ));
 }
 
 /** Create only after Sheets has committed. Existing records make delivery retries idempotent. */
@@ -175,8 +205,20 @@ export async function claimUniformDeliveryAction(
   submissionId: string,
   kind: "purchased" | "assistance",
   reason?: string,
+  expected?: { customerMessageId: string; customerMessageRevision: number },
 ): Promise<UniformDeliveryRecord> {
   return updateUniformDelivery(submissionId, (record) => {
+    if (
+      expected &&
+      (record.customerMessageId !== expected.customerMessageId ||
+        (record.customerMessageRevision ?? 0) !== expected.customerMessageRevision)
+    ) {
+      throw new Error("This uniform delivery control is no longer attached to its recorded customer message.");
+    }
+    // A replacement invalidates the prior message before its Sheet/send work
+    // begins. Do not let an already-open old button interleave an action with
+    // that replacement.
+    if (record.relog && record.relog.state !== "sent") return;
     if (record.terminal || record.action) return;
     record.action = {
       kind, ...(reason ? { reason } : {}), state: "claimed",

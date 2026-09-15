@@ -9,13 +9,16 @@ process.env.UNIFORM_SUBMISSION_LEDGER_FILE = path.join(directory, "submission-le
 
 const {
   appendUniformRows,
+  markUniformRowsSold,
   markUniformRowsNotified,
   normalizeSpreadsheetId,
   normalizeUniformSpreadsheetConfig,
   normalizeUniformDataRange,
   quoteSheetTab,
+  replaceUniformRowLink,
   resetGoogleSheetsProxyForTests,
   setUniformSubmissionLedgerWriteFailureForTests,
+  setUniformSubmissionLedgerWriteFailureAfterForTests,
   setGoogleSheetsProxyForTests,
   validateSpreadsheetConfiguration,
 } = await import("../src/bot/google-sheets.ts");
@@ -201,4 +204,106 @@ test("verifies an unknown write response using its persisted reserved target wit
   });
   assert.deepEqual(result, { alreadyWritten: true, count: 0 });
   assert.equal(updateCalls, 1, "unknown responses are verified, not retried blindly");
+});
+
+test("replaces the exact ledger row link in place and marks only its real Sold F cells", async () => {
+  const calls: Array<{ path: string; options?: { method?: string; body?: unknown } }> = [];
+  let values: unknown[][] = [];
+  const original = [
+    ["QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/31"],
+    ["QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/32"],
+  ];
+  setGoogleSheetsProxyForTests(async (pathname, options) => {
+    calls.push({ path: pathname, options });
+    if (options?.method === "GET") return response({ values });
+    const decoded = decodeURIComponent(pathname);
+    const body = options?.body as { values: unknown[][] };
+    if (decoded.includes("!A2:E3")) values = body.values;
+    if (decoded.includes("!E3")) values[1]![4] = body.values[0]![0];
+    return response({});
+  });
+  await appendUniformRows({
+    config: base, logKind: "log", submissionId: "exact-sold-and-relog",
+    rows: original.map((row) => [...row]),
+  });
+  await replaceUniformRowLink({
+    config: base, logKind: "log", submissionId: "exact-sold-and-relog", rowIndex: 1,
+    newLink: "https://www.roblox.com/catalog/99",
+  });
+  await markUniformRowsSold(base, "log", "exact-sold-and-relog");
+  const writes = calls.filter((call) => call.options?.method === "PUT");
+  assert.equal(writes.length, 3, "append, one in-place relog cell, and one Sold range only");
+  assert.match(decodeURIComponent(writes[1]!.path), /'Uniform Logs'!E3\?valueInputOption=RAW$/);
+  assert.match(decodeURIComponent(writes[2]!.path), /'Uniform Logs'!F2:F3\?valueInputOption=RAW$/);
+  assert.deepEqual((writes[2]!.options?.body as { values: unknown[][] }).values, [[true], [true]]);
+  assert.deepEqual(values, [
+    original[0],
+    ["QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/99"],
+  ]);
+});
+
+test("refuses relog conflicts and unsafe offset Sold writes before changing cells", async () => {
+  const calls: Array<{ path: string; options?: { method?: string } }> = [];
+  setGoogleSheetsProxyForTests(async (pathname, options) => {
+    calls.push({ path: pathname, options });
+    if (options?.method === "GET") return response({ values: [] });
+    return response({});
+  });
+  await appendUniformRows({
+    config: base, logKind: "log", submissionId: "unsafe-sold-offset",
+    rows: [["QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/1"]],
+  });
+  await assert.rejects(
+    replaceUniformRowLink({
+      config: base, logKind: "log", submissionId: "unsafe-sold-offset", rowIndex: 0,
+      newLink: "https://www.roblox.com/catalog/2",
+    }),
+    /no longer matches/i,
+  );
+  await assert.rejects(
+    (async () => {
+      const offset = { ...base, logRange: "C5:G" };
+      await appendUniformRows({
+        config: offset, logKind: "log", submissionId: "unsafe-sold-offset-f-column",
+        rows: [["QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/3"]],
+      });
+      await markUniformRowsSold(offset, "log", "unsafe-sold-offset-f-column");
+    })(),
+    /overlaps Sold column F/i,
+  );
+  assert.equal(calls.filter((call) => call.options?.method === "PUT").length, 2);
+});
+
+test("reconciles a Sheets-committed relog after its local ledger save fails", async () => {
+  let values: unknown[][] = [];
+  let replacementWrites = 0;
+  setGoogleSheetsProxyForTests(async (pathname, options) => {
+    if (options?.method === "GET") return response({ values });
+    const decoded = decodeURIComponent(pathname);
+    const body = options?.body as { values: unknown[][] };
+    if (decoded.includes("!A2:E2")) values = body.values;
+    if (decoded.includes("!E2")) {
+      replacementWrites += 1;
+      values[0]![4] = body.values[0]![0];
+    }
+    return response({});
+  });
+  await appendUniformRows({
+    config: base, logKind: "log", submissionId: "reconcile-ledger-after-sheet",
+    rows: [["QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/1"]],
+  });
+  setUniformSubmissionLedgerWriteFailureAfterForTests(1, new Error("simulated post-Sheets ledger crash"));
+  await assert.rejects(
+    replaceUniformRowLink({
+      config: base, logKind: "log", submissionId: "reconcile-ledger-after-sheet", rowIndex: 0,
+      newLink: "https://www.roblox.com/catalog/2",
+    }),
+    /post-Sheets ledger crash/i,
+  );
+  setUniformSubmissionLedgerWriteFailureForTests();
+  await replaceUniformRowLink({
+    config: base, logKind: "log", submissionId: "reconcile-ledger-after-sheet", rowIndex: 0,
+    newLink: "https://www.roblox.com/catalog/2",
+  });
+  assert.equal(replacementWrites, 1, "reconciliation verifies exact intended cells instead of writing again");
 });

@@ -104,6 +104,8 @@ import {
   handleUniformSettingsComponent,
   handleUniformSettingsModal,
   handleUniformRecoveryModal,
+  handleUniformRelogCommand,
+  handleUniformRelogSelection,
   handleUniformSpreadsheetSettingsModal,
   handleUniformSubmitButton,
   handleUniformRetryButton,
@@ -113,6 +115,7 @@ import {
   renderUniformSettings,
   uniformDeliveryRecoveryResponse,
   uniformCommandNames,
+  uniformRelogCommandName,
   uniformCommands,
 } from "./uniforms";
 
@@ -3589,6 +3592,19 @@ async function handleInteraction(
     }
     return;
   }
+  if (interaction.commandName === uniformRelogCommandName) {
+    try {
+      await handleUniformRelogCommand(interaction);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The relog failed unexpectedly.";
+      await interaction.editReply(
+        error instanceof UniformDeliveryRecoveryError
+          ? uniformDeliveryRecoveryResponse(error)
+          : errorResponse(`Could not replace the uniform link: ${message}`, "Uniform Relog Failed"),
+      );
+    }
+    return;
+  }
 
   try {
     await validateGuildSetup(interaction.guild, setup);
@@ -4020,6 +4036,17 @@ async function connectDiscord(): Promise<void> {
       })().catch((error) => replyInteractionError(interaction, error));
     } else if (interaction.isStringSelectMenu()) {
       void (async () => {
+        if (interaction.customId.startsWith("uniform:relog-select:")) {
+          if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
+            await interaction.reply({
+              ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"),
+              ephemeral: true,
+            });
+            return;
+          }
+          await handleUniformRelogSelection(interaction);
+          return;
+        }
         if (interaction.customId.startsWith("settings:")) {
           await handleSettingsComponent(interaction);
           return;

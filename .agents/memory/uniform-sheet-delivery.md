@@ -26,3 +26,9 @@ Test Discord message idempotency keys with realistic snowflake lengths and the p
 **Why:** Appending readable stage suffixes to real interaction IDs exceeded that limit, rejecting delivery after Sheets had saved successfully; short mocked IDs hid the failure.
 
 **How to apply:** Distinguish definitive provider rejection from an uncertain transport outcome. Only the latter warrants blocking retries pending delivery verification.
+
+For in-place spreadsheet corrections, recover against both the exact original row and the exact intended replacement row.
+
+**Why:** Sheets can commit a correction before local bookkeeping is saved. Checking only the original values would then block recovery of a successful correction.
+
+**How to apply:** Keep the intended change durable before writing. Verify the entire affected row, not just its link, and never guess original rows from customer names.
