@@ -13,6 +13,7 @@ import {
   listApprovedSnapshotsForMember,
   listActiveSnapshots,
   listRestorableSnapshots,
+  listSnapshotsForMember,
   saveRoleSnapshot,
   withGuildBlacklistLifecycleLock,
   withMemberRoleLock,
@@ -25,7 +26,12 @@ import {
   restoreAssignableRoles,
 } from "./role-actions";
 import { trelloMappingsFor, type GuildSetup } from "./setup-store";
-import { revokeBlacklistCardById } from "./trello";
+import {
+  createBlacklistCard,
+  findBlacklistCardsByRobloxId,
+  reactivateBlacklistCardById,
+  revokeBlacklistCardById,
+} from "./trello";
 import {
   noMentions,
   presentationEmbed,
@@ -70,6 +76,18 @@ interface ReconcileCounts {
   restored: number;
   skipped: number;
   failures: number;
+}
+
+async function savedRoleIdsForMember(
+  guildId: string,
+  discordUserId: string,
+): Promise<string[]> {
+  const snapshots = await listSnapshotsForMember(guildId, discordUserId);
+  return [...new Set(
+    snapshots
+      .filter((snapshot) => ["pending", "active", "revocation_pending"].includes(snapshot.status))
+      .flatMap((snapshot) => snapshot.roleIds),
+  )];
 }
 
 const emptyCounts = (): BlacklistSyncCounts => ({
@@ -324,18 +342,36 @@ async function enforceApprovedSnapshot(
   member: GuildMember,
   setup: GuildSetup,
   snapshot: RoleSnapshot,
+  options: { recoverCard?: boolean } = {},
 ): Promise<ReconcileCounts> {
   if (snapshot.discordUserId !== member.id || snapshot.source !== "command") {
     return { enforced: 0, restored: 0, skipped: 1, failures: 0 };
   }
   return withMemberRoleLock(guild.id, member.id, async () => {
-    const current = await findRoleSnapshot(guild.id, snapshot.robloxUserId);
+    let current = await findRoleSnapshot(guild.id, snapshot.robloxUserId);
     if (
       !current ||
       current.discordUserId !== member.id ||
       !["pending", "active", "revocation_pending"].includes(current.status)
     ) {
       return { enforced: 0, restored: 0, skipped: 1, failures: 0 };
+    }
+    let recoveryFailure = false;
+    if (options.recoverCard !== false && current.status === "pending" && !current.cardId) {
+      try {
+        const card = await recoverPendingSnapshotCard(current, setup);
+        current = {
+          ...current,
+          cardId: card.id,
+          cardUrl: card.url,
+          cardUpdatedAt: card.dateLastActivity,
+        };
+        await saveRoleSnapshot(current);
+      } catch {
+        // Provider failure or an ambiguous exact-ID match must never unwind an
+        // already approved restriction. Keep pending and retry recovery later.
+        recoveryFailure = true;
+      }
     }
     const removed = await removeAssignableRoles(member, "Approved Roblox blacklist");
     if (setup.blacklistRoleId && !member.roles.cache.has(setup.blacklistRoleId)) {
@@ -348,15 +384,61 @@ async function enforceApprovedSnapshot(
     }
     // A revocation_pending snapshot remains pending while its exact Trello
     // move is retried; never accidentally promote it back to active.
-    if (current.status === "pending") {
+    if (current.status === "pending" && current.cardId) {
       await saveRoleSnapshot({ ...current, status: "active" });
     }
     return {
       enforced: removed.changed.length ? 1 : 0,
       restored: 0,
       skipped: removed.skipped.length ? 1 : 0,
-      failures: 0,
+      failures: recoveryFailure ? 1 : 0,
     };
+  });
+}
+
+/**
+ * Reconcile a cardless command-approved snapshot exactly once per attempt.
+ * Every candidate is keyed by the numeric Roblox identity; multiple open
+ * records are ambiguous and must remain pending rather than being attached
+ * to an arbitrary card. A successful create/reuse is persisted by the caller
+ * before the pending snapshot can become active.
+ */
+async function recoverPendingSnapshotCard(
+  snapshot: RoleSnapshot,
+  setup: GuildSetup,
+): Promise<Awaited<ReturnType<typeof createBlacklistCard>>> {
+  const mappings = trelloMappingsFor(setup);
+  const candidates = await findBlacklistCardsByRobloxId(snapshot.robloxUserId, mappings);
+  if (candidates.length > 1) {
+    throw new Error(
+      `Multiple Trello cards match approved Roblox account ${snapshot.robloxUserId}; recovery is ambiguous.`,
+    );
+  }
+  const candidate = candidates[0];
+  if (candidate) {
+    if (candidate.listType === "revoked") {
+      return reactivateBlacklistCardById(candidate.id, {
+        robloxId: snapshot.robloxUserId,
+        robloxUsername: snapshot.robloxUsername,
+        type: snapshot.blacklistType as Parameters<typeof reactivateBlacklistCardById>[1]["type"],
+        reason: snapshot.blacklistReason ?? "Approved blacklist recovery",
+        mappings,
+      });
+    }
+    return candidate;
+  }
+  if (
+    snapshot.blacklistType !== "permanent" &&
+    snapshot.blacklistType !== "appealable" &&
+    snapshot.blacklistType !== "conditional"
+  ) {
+    throw new Error("Approved blacklist snapshot has no recoverable blacklist type.");
+  }
+  return createBlacklistCard({
+    name: `${snapshot.robloxUsername} | ${snapshot.robloxUserId}`,
+    type: snapshot.blacklistType,
+    reason: snapshot.blacklistReason ?? "Approved blacklist recovery",
+    mappings,
   });
 }
 
@@ -375,10 +457,20 @@ async function restoreRevokedCard(
     ) {
       return { enforced: 0, restored: 0, skipped: 0, failures: 0 };
     }
+    const otherRestrictions = (await listApprovedSnapshotsForMember(
+      guild.id,
+      current.discordUserId,
+    )).filter((candidate) => candidate.key !== current.key);
+    if (otherRestrictions.length > 0) {
+      // This card is revoked, but another approved restriction still owns the
+      // account's restrictive role sink. Leave both roles and the sink role
+      // untouched until the last restriction is revoked.
+      return { enforced: 0, restored: 0, skipped: 1, failures: 0 };
+    }
 
     const restored = await restoreAssignableRoles(
       member,
-      current.roleIds,
+      await savedRoleIdsForMember(guild.id, current.discordUserId),
       "Synchronized Roblox blacklist revoked",
     );
     if (setup.blacklistRoleId && member.roles.cache.has(setup.blacklistRoleId)) {
@@ -496,7 +588,23 @@ export async function finishApprovedRevocation(
     if (!current || current.discordUserId !== member.id || current.status !== "revocation_pending" || !current.revocationCardMovedAt) {
       return { completed: false, restored: [], skipped: [] };
     }
-    const restored = await restoreAssignableRoles(member, current.roleIds, "Approved Roblox blacklist revoked");
+    const otherRestrictions = (await listApprovedSnapshotsForMember(
+      guild.id,
+      current.discordUserId,
+    )).filter((candidate) => candidate.key !== current.key);
+    if (otherRestrictions.length > 0) {
+      await saveRoleSnapshot({
+        ...current,
+        status: "revoked",
+        revokedAt: new Date().toISOString(),
+      });
+      return { completed: true, restored: [], skipped: [] };
+    }
+    const restored = await restoreAssignableRoles(
+      member,
+      await savedRoleIdsForMember(guild.id, current.discordUserId),
+      "Approved Roblox blacklist revoked",
+    );
     const blacklistRoleId = setup.blacklistRoleId;
     let blacklistRemoved = !blacklistRoleId || !member.roles.cache.has(blacklistRoleId);
     if (!blacklistRemoved) {
@@ -575,6 +683,18 @@ export async function processApprovedRevocation(
     // If this persistence fails, the next retry repeats the idempotent exact
     // card operation and never restores Discord roles in the meantime.
     await saveRoleSnapshot(current);
+  }
+  const otherRestrictions = (await listApprovedSnapshotsForMember(
+    guild.id,
+    current.discordUserId,
+  )).filter((candidate) => candidate.key !== current.key);
+  if (otherRestrictions.length > 0) {
+    await saveRoleSnapshot({
+      ...current,
+      status: "revoked",
+      revokedAt: new Date().toISOString(),
+    });
+    return { moved: true, completed: true, restored: [], skipped: [] };
   }
   if (!member || member.id !== current.discordUserId) {
     return { moved: true, completed: false, restored: [], skipped: [] };
@@ -1055,6 +1175,27 @@ async function enforceApprovedSnapshots(
   for (const snapshot of await listRestorableSnapshots(guild.id)) {
     if (snapshot.source !== "command") continue;
     const member = members.get(snapshot.discordUserId);
+    let approved = snapshot;
+    let cardRecoveryAttempted = false;
+    if (snapshot.status === "pending" && !snapshot.cardId) {
+      cardRecoveryAttempted = true;
+      try {
+        const card = await recoverPendingSnapshotCard(snapshot, setup);
+        approved = {
+          ...snapshot,
+          cardId: card.id,
+          cardUrl: card.url,
+          cardUpdatedAt: card.dateLastActivity,
+          status: "active",
+        };
+        await saveRoleSnapshot(approved);
+      } catch {
+        // A nonmember remains durably approved and will be retried on the
+        // next scheduled scan. A member is still enforced below, but no
+        // member-role path may issue a second provider recovery attempt.
+        totals.failures += 1;
+      }
+    }
     if (snapshot.status === "revocation_pending") {
       try {
         // Until Trello completion is durably marked, this is still an active
@@ -1077,10 +1218,16 @@ async function enforceApprovedSnapshots(
       continue;
     }
     if (!member) {
-      totals.skipped += 1;
+      if (approved === snapshot) totals.skipped += 1;
       continue;
     }
-    const result = await enforceApprovedSnapshot(guild, member, setup, snapshot);
+    const result = await enforceApprovedSnapshot(
+      guild,
+      member,
+      setup,
+      approved,
+      { recoverCard: !cardRecoveryAttempted },
+    );
     totals.enforced += result.enforced;
     totals.skipped += result.skipped;
     totals.failures += result.failures;

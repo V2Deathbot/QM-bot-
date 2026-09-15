@@ -219,6 +219,22 @@ export async function listApprovedSnapshotsForMember(
     .map((snapshot) => ({ ...snapshot, roleIds: [...snapshot.roleIds] }));
 }
 
+/** All command snapshots for an account, including completed revocations. */
+export async function listSnapshotsForMember(
+  guildId: string,
+  discordUserId: string,
+): Promise<RoleSnapshot[]> {
+  const current = await load();
+  return current.snapshots
+    .filter(
+      (snapshot) =>
+        snapshot.guildId === guildId &&
+        snapshot.discordUserId === discordUserId &&
+        snapshot.source === "command",
+    )
+    .map((snapshot) => ({ ...snapshot, roleIds: [...snapshot.roleIds] }));
+}
+
 export async function saveBlacklistNote(note: BlacklistNote): Promise<void> {
   await mutateFile((current) => {
     current.notes ??= [];

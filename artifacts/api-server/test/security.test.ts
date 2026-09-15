@@ -30,8 +30,8 @@ const { config } = await import("../src/bot/config.ts");
 const { saveGuildSetup } = await import("../src/bot/setup-store.ts");
 const { getSecurityState, mutateSecurityState } =
   await import("../src/bot/security-store.ts");
-const { findActiveSnapshot, saveRoleSnapshot } = await import("../src/bot/role-store.ts");
-const { refreshBot } = await import("../src/bot/index.ts");
+const { findActiveSnapshot, findRoleSnapshot, saveRoleSnapshot } = await import("../src/bot/role-store.ts");
+const { getRegisteredCommandDefinitions, refreshBot } = await import("../src/bot/index.ts");
 
 type MemberRecord = {
   administrator: boolean;
@@ -58,6 +58,7 @@ type Member = {
 };
 
 const members = new Map<string, MemberRecord>();
+const validatedExternalUsers = new Set<string>();
 const replies: string[] = [];
 const auditEvents: unknown[] = [];
 const trelloWrites: string[] = [];
@@ -66,6 +67,8 @@ const shownModals: Array<{ userId: string; customId: string }> = [];
 let providerRequests = 0;
 let roleMutationCalls = 0;
 let trelloCards: Array<Record<string, unknown>> = [];
+let robloxLookup = { id: 9001, name: "Builder", displayName: "Builder" };
+let trelloCreateFailure = false;
 let client: Client | undefined;
 let componentMessageSequence = 0;
 let latestComponentMessageId = "component-message-0";
@@ -142,7 +145,15 @@ const guildRoles = new Collection<string, {
 const guild = {
   id: "security-guild",
   ownerId: "owner",
-  client: { user: { id: "security-bot" } },
+  client: {
+    user: { id: "security-bot" },
+    users: {
+      fetch: async (id: string) => {
+        if (!validatedExternalUsers.has(id)) throw new Error("Discord user not found");
+        return { id };
+      },
+    },
+  },
   members: {
     me: {
       id: "security-bot",
@@ -151,7 +162,10 @@ const guild = {
     },
     fetch: async (input?: string | { user: string; force: boolean }) => {
       const id = typeof input === "string" ? input : input?.user;
-      if (id) return memberFor(id);
+      if (id) {
+        if (!members.has(id)) throw new Error("Discord member not found");
+        return memberFor(id);
+      }
       return new Collection([...members.keys()].map((memberId) => [memberId, memberFor(memberId)]));
     },
     list: async () => new Collection([...members.keys()].map((memberId) => [memberId, memberFor(memberId)])),
@@ -187,6 +201,7 @@ function command(
   discordUserId?: string,
 ) {
   const localReplies: unknown[] = [];
+  let deferCalls = 0;
   const messageId = `component-message-${++componentMessageSequence}`;
   return {
     inGuild: () => true,
@@ -207,7 +222,7 @@ function command(
         name === "discord_user" && discordUserId ? { id: discordUserId } : null,
       getRole: () => null,
     },
-    deferReply: async () => undefined,
+    deferReply: async () => { deferCalls += 1; },
     editReply: async (value: unknown) => {
       latestComponentMessageId = messageId;
       localReplies.push(value);
@@ -219,6 +234,7 @@ function command(
       recordReply(value);
     },
     localReplies,
+    get deferCalls() { return deferCalls; },
   };
 }
 
@@ -292,7 +308,7 @@ function select(userId: string, customId: string, values: string[], messageId = 
 
 function modal(userId: string, customId: string, values: Record<string, string>) {
   const localReplies: unknown[] = [];
-  return {
+  const interaction = {
     isChatInputCommand: () => false,
     isButton: () => false,
     isStringSelectMenu: () => false,
@@ -305,12 +321,14 @@ function modal(userId: string, customId: string, values: Record<string, string>)
     replied: false,
     fields: { getTextInputValue: (name: string) => values[name] ?? "" },
     reply: async (value: unknown) => {
+      interaction.replied = true;
       localReplies.push(value);
       recordReply(value);
     },
     editReply: async (value: unknown) => { localReplies.push(value); },
     localReplies,
   };
+  return interaction;
 }
 
 async function settle(): Promise<void> {
@@ -366,6 +384,10 @@ async function setSecurity(overrides: Record<string, unknown>): Promise<void> {
 }
 
 function lastConfirmationId(interaction: ReturnType<typeof command>): string {
+  return confirmationIdFromReplies(interaction);
+}
+
+function confirmationIdFromReplies(interaction: { localReplies: unknown[] }): string {
   const payload = interaction.localReplies.find(
     (reply): reply is { components: Array<{ components: Array<{ data: { custom_id: string } }> }> } =>
       typeof reply === "object" && reply !== null && "components" in reply,
@@ -572,11 +594,11 @@ globalThis.fetch = async (input, init) => {
   const url = new URL(input.toString());
   if (url.pathname === "/v1/usernames/users") {
     return new Response(JSON.stringify({
-      data: [{ id: 9001, name: "Builder", displayName: "Builder" }],
+      data: [robloxLookup],
     }));
   }
-  if (url.pathname === "/v1/users/9001") {
-    return new Response(JSON.stringify({ id: 9001, name: "Builder", displayName: "Builder" }));
+  if (url.pathname === `/v1/users/${robloxLookup.id}`) {
+    return new Response(JSON.stringify(robloxLookup));
   }
   if (url.pathname.endsWith("/lists")) {
     return new Response(JSON.stringify(
@@ -587,12 +609,29 @@ globalThis.fetch = async (input, init) => {
     if ((init?.method ?? "GET") === "POST") {
       trelloWrites.push(url.pathname);
       trelloCardCreations.push(url.pathname);
+      if (trelloCreateFailure) {
+        return new Response(JSON.stringify({ error: "Trello unavailable" }), { status: 503 });
+      }
       return new Response(JSON.stringify({
         id: `card-${trelloCardCreations.length}`,
         url: "https://trello.test/card",
       }));
     }
     return new Response(JSON.stringify(trelloCards));
+  }
+  if (url.pathname.startsWith("/1/cards/") && (init?.method ?? "GET") === "GET") {
+    const cardId = url.pathname.split("/").at(-1);
+    const card = trelloCards.find((candidate) => candidate.id === cardId);
+    return new Response(JSON.stringify(card ?? {}), { status: card ? 200 : 404 });
+  }
+  if (url.pathname.startsWith("/1/cards/") && (init?.method ?? "GET") === "PUT") {
+    const cardId = url.pathname.split("/").at(-1);
+    const card = trelloCards.find((candidate) => candidate.id === cardId);
+    if (!card) return new Response(JSON.stringify({}), { status: 404 });
+    const body = init?.body as URLSearchParams;
+    if (body.get("idList")) card.idList = body.get("idList");
+    if (body.get("idLabels")) card.idLabels = body.get("idLabels")!.split(",");
+    return new Response(JSON.stringify(card));
   }
   if (url.pathname.endsWith("/labels")) {
     return new Response(JSON.stringify([
@@ -625,6 +664,24 @@ test.before(async () => {
   members.set("setup-other", { administrator: true });
   await setSecurity({});
   await refreshBot();
+});
+
+test("registers exactly four commands with the requested moderation options", () => {
+  const definitions = getRegisteredCommandDefinitions();
+  assert.deepEqual(definitions.map((command) => command.name), [
+    "settings",
+    "blacklist",
+    "revoke_blacklist",
+    "blacklist_lookup",
+  ]);
+  const blacklist = definitions.find((command) => command.name === "blacklist");
+  const revoke = definitions.find((command) => command.name === "revoke_blacklist");
+  assert.deepEqual(blacklist?.options?.map((option) => option.name), [
+    "username",
+    "type",
+    "reason",
+  ]);
+  assert.deepEqual(revoke?.options?.map((option) => option.name), ["username"]);
 });
 
 test.after(() => {
@@ -817,6 +874,446 @@ test("a confirmation remains bound to its original member when usernames change 
   assert.equal(snapshot?.discordUserId, "target-original");
 });
 
+test("unresolved identities use private button/modal continuation and bind nonmember blacklist/revoke state", async () => {
+  const previousLookup = robloxLookup;
+  robloxLookup = { id: 9100, name: "UnresolvedBuilder", displayName: "UnresolvedBuilder" };
+  const externalId = "12345678901234567";
+  validatedExternalUsers.add(externalId);
+  trelloCards = [];
+  await setSecurity({ confirmationsRequired: true });
+  const beforeCreates = trelloCardCreations.length;
+  const beforeRoles = roleMutationCalls;
+  const beforeActions = (await getSecurityState(guild.id)).destructiveActions.length;
+
+  try {
+    const pending = command("admin-a", "blacklist", {
+      username: "ignored-by-provider-fixture",
+      type: "permanent",
+      reason: "unresolved account",
+    });
+    await dispatch(pending);
+    assert.equal(pending.deferCalls, 1, "slash command must be acknowledged by deferReply");
+    assert.equal(trelloCardCreations.length, beforeCreates, "opening identity prompt must not write Trello");
+    assert.equal(roleMutationCalls, beforeRoles, "opening identity prompt must not mutate roles");
+    assert.equal((await findActiveSnapshot(guild.id, 9100)), undefined);
+    assert.equal(
+      (await getSecurityState(guild.id)).destructiveActions.length,
+      beforeActions,
+      "opening identity prompt must not reserve a destructive-action rate slot",
+    );
+    const promptPayload = latestComponentPayload(pending);
+    const promptId = componentRows(promptPayload)
+      .map((component) => component.data?.custom_id ?? component.custom_id)
+      .find((id): id is string => Boolean(id?.startsWith("identity-prompt:")));
+    assert.ok(promptId, "unresolved identity must render a continuation button");
+    assert.match(replies.at(-1) ?? "", /Discord Account Needed/i);
+    assert.match(replies.at(-1) ?? "", /numeric user ID/i);
+
+    const promptButton = button("admin-a", promptId!);
+    const duplicatePromptButton = button("admin-a", promptId!);
+    client!.emit("interactionCreate", promptButton);
+    client!.emit("interactionCreate", duplicatePromptButton);
+    await settle();
+    assert.equal(shownModals.filter((modal) => modal.customId.startsWith("identity-modal:")).length, 1);
+    assert.equal(promptButton.replied, false, "button must open a modal, not acknowledge with a message");
+    const modalId = shownModals.at(-1)?.customId;
+    assert.ok(modalId?.startsWith("identity-modal:"), "identity button must open the account modal");
+
+    const invalid = modal("admin-a", modalId!, { discord_identity: "not-a-discord-account" });
+    await dispatchRaw(invalid);
+    assert.equal(invalid.replied, true, "invalid account input must receive a private modal response");
+    assert.match(replies.at(-1) ?? "", /numeric Discord user ID|No unambiguous/i);
+    assert.equal(trelloCardCreations.length, beforeCreates);
+    assert.equal((await findActiveSnapshot(guild.id, 9100)), undefined);
+
+    const resolved = modal("admin-a", modalId!, { discord_identity: externalId });
+    await dispatchRaw(resolved);
+    const confirmation = confirmationIdFromReplies(resolved);
+    const confirmationText = resolved.localReplies.map(presentationReplyText).join("\n");
+    assert.match(confirmationText, /UnresolvedBuilder/);
+    assert.match(confirmationText, new RegExp(externalId));
+    assert.match(confirmationText, /nonmember/i);
+    assert.equal(trelloCardCreations.length, beforeCreates);
+    assert.equal((await findActiveSnapshot(guild.id, 9100)), undefined);
+
+    const confirmed = button("admin-a", confirmation);
+    await dispatchRaw(confirmed);
+    assert.equal(confirmed.deferred, true, "confirmation must use deferUpdate acknowledgement");
+    const active = await findActiveSnapshot(guild.id, 9100);
+    assert.equal(active?.discordUserId, externalId);
+    assert.deepEqual(active?.roleIds, [], "nonmember snapshots must not invent role IDs");
+    assert.equal(active?.status, "active");
+    assert.equal(trelloCardCreations.length, beforeCreates + 1);
+    assert.equal(roleMutationCalls, beforeRoles);
+    assert.equal((await getSecurityState(guild.id)).destructiveActions.length, beforeActions + 1);
+
+    const cardId = active?.cardId;
+    assert.ok(cardId);
+    trelloCards = [{
+      id: cardId,
+      name: "UnresolvedBuilder | 9100",
+      desc: "- unresolved account",
+      idList: "list-2",
+      idLabels: [],
+      url: "https://trello.test/nonmember",
+      dateLastActivity: "2026-09-14T00:00:00.000Z",
+      closed: false,
+    }];
+    const revoke = command("admin-a", "revoke_blacklist", { username: "ignored-by-provider-fixture" });
+    await dispatch(revoke);
+    const revokeConfirmation = lastConfirmationId(revoke);
+    assert.equal(trelloCards[0]?.idList, "list-2", "revoke confirmation must not mutate Trello");
+    const revokeButton = button("admin-a", revokeConfirmation);
+    await dispatchRaw(revokeButton);
+    const revocationPending = await findRoleSnapshot(guild.id, 9100);
+    assert.equal(revocationPending?.discordUserId, externalId);
+    assert.equal(revocationPending?.status, "revocation_pending");
+    assert.equal(revocationPending?.cardId, cardId);
+    assert.equal(trelloCards[0]?.idList, "list-3");
+    assert.equal(roleMutationCalls, beforeRoles);
+  } finally {
+    robloxLookup = previousLookup;
+    validatedExternalUsers.delete(externalId);
+    trelloCards = [];
+  }
+});
+
+test("active revocation confirmation refuses a replacement Trello card", async () => {
+  const robloxId = 9400;
+  const cardId = "bound-active-card";
+  robloxLookup = { id: robloxId, name: "BoundBuilder", displayName: "BoundBuilder" };
+  members.set("bound-member", {
+    administrator: false,
+    username: "BoundBuilder",
+    globalName: "BoundBuilder",
+    nickname: "BoundBuilder",
+  });
+  await setSecurity({ confirmationsRequired: true });
+  await saveRoleSnapshot({
+    key: `${guild.id}:${robloxId}`,
+    guildId: guild.id,
+    discordUserId: "bound-member",
+    robloxUserId: robloxId,
+    robloxUsername: "BoundBuilder",
+    roleIds: [],
+    cardId,
+    cardUrl: "https://trello.test/bound-active-card",
+    source: "command",
+    status: "active",
+    createdAt: new Date().toISOString(),
+  });
+  trelloCards = [{
+    id: cardId,
+    name: `BoundBuilder | ${robloxId}`,
+    desc: "- original",
+    idList: "list-2",
+    idLabels: [],
+    url: "https://trello.test/bound-active-card",
+    dateLastActivity: "2026-09-14T00:00:00.000Z",
+    closed: false,
+  }];
+
+  try {
+    const pending = command("admin-a", "revoke_blacklist", { username: "ignored" });
+    await dispatch(pending);
+    const confirmation = lastConfirmationId(pending);
+    trelloCards = [{
+      id: "replacement-card",
+      name: `BoundBuilder | ${robloxId}`,
+      desc: "- replacement",
+      idList: "list-2",
+      idLabels: [],
+      url: "https://trello.test/replacement-card",
+      dateLastActivity: "2026-09-14T01:00:00.000Z",
+      closed: false,
+    }];
+    await dispatchRaw(button("admin-a", confirmation));
+    assert.equal(trelloCards[0]?.id, "replacement-card");
+    assert.equal(trelloCards[0]?.idList, "list-2");
+    assert.equal((await findRoleSnapshot(guild.id, robloxId))?.status, "active");
+  } finally {
+    trelloCards = [];
+    robloxLookup = { id: 9001, name: "Builder", displayName: "Builder" };
+    await setSecurity({ confirmationsRequired: false });
+  }
+});
+
+test("identity-prompt revocation binds a no-snapshot card before rejecting replacement cards", async () => {
+  const previousLookup = robloxLookup;
+  const robloxId = 9700;
+  const externalId = "12345678901234568";
+  robloxLookup = { id: robloxId, name: "PromptRevokeBuilder", displayName: "PromptRevokeBuilder" };
+  validatedExternalUsers.add(externalId);
+  trelloCards = [{
+    id: "prompt-bound-card",
+    name: `PromptRevokeBuilder | ${robloxId}`,
+    desc: "- existing approval",
+    idList: "list-2",
+    idLabels: [],
+    url: "https://trello.test/prompt-bound-card",
+    dateLastActivity: "2026-09-14T02:00:00.000Z",
+    closed: false,
+  }];
+  await setSecurity({ confirmationsRequired: true });
+  try {
+    const pending = command("admin-a", "revoke_blacklist", { username: "ignored" });
+    await dispatch(pending);
+    const promptId = componentRows(latestComponentPayload(pending))
+      .map((component) => component.data?.custom_id ?? component.custom_id)
+      .find((id): id is string => Boolean(id?.startsWith("identity-prompt:")));
+    assert.ok(promptId);
+    await dispatchRaw(button("admin-a", promptId!));
+    const modalId = shownModals.at(-1)?.customId;
+    assert.ok(modalId?.startsWith("identity-modal:"));
+    const resolved = modal("admin-a", modalId!, { discord_identity: externalId });
+    await dispatchRaw(resolved);
+    const confirmation = confirmationIdFromReplies(resolved);
+
+    trelloCards = [{
+      id: "prompt-replacement-card",
+      name: `PromptRevokeBuilder | ${robloxId}`,
+      desc: "- replacement",
+      idList: "list-2",
+      idLabels: [],
+      url: "https://trello.test/prompt-replacement-card",
+      dateLastActivity: "2026-09-14T03:00:00.000Z",
+      closed: false,
+    }];
+    await dispatchRaw(button("admin-a", confirmation));
+    assert.equal(trelloCards[0]?.id, "prompt-replacement-card");
+    assert.equal(trelloCards[0]?.idList, "list-2");
+    assert.equal(await findRoleSnapshot(guild.id, robloxId), undefined);
+  } finally {
+    trelloCards = [];
+    robloxLookup = previousLookup;
+    validatedExternalUsers.delete(externalId);
+    await setSecurity({ confirmationsRequired: false });
+  }
+});
+
+test("same Discord account restrictions retain the union of saved roles", async () => {
+  const firstRoblox = 9500;
+  const secondRoblox = 9501;
+  members.set("multi-binding-member", {
+    administrator: false,
+    username: "Builder",
+    globalName: "Builder",
+    nickname: "Builder",
+    roleIds: ["role-1", "role-2"],
+  });
+  await setSecurity({ confirmationsRequired: false });
+  const previousLookup = robloxLookup;
+  trelloCards = [];
+  try {
+    robloxLookup = { id: firstRoblox, name: "FirstBoundBuilder", displayName: "FirstBoundBuilder" };
+    await dispatch(command(
+      "admin-a",
+      "blacklist",
+      { username: "ignored", type: "permanent", reason: "first restriction" },
+      "multi-binding-member",
+    ));
+    members.set("multi-binding-member", {
+      administrator: false,
+      username: "Builder",
+      globalName: "Builder",
+      nickname: "Builder",
+      roleIds: [],
+    });
+    robloxLookup = { id: secondRoblox, name: "SecondBoundBuilder", displayName: "SecondBoundBuilder" };
+    await dispatch(command(
+      "admin-a",
+      "blacklist",
+      { username: "ignored", type: "appealable", reason: "second restriction" },
+      "multi-binding-member",
+    ));
+    assert.deepEqual((await findRoleSnapshot(guild.id, firstRoblox))?.roleIds, ["role-1", "role-2"]);
+    assert.deepEqual((await findRoleSnapshot(guild.id, secondRoblox))?.roleIds, ["role-1", "role-2"]);
+  } finally {
+    trelloCards = [];
+    robloxLookup = previousLookup;
+    await setSecurity({ confirmationsRequired: false });
+  }
+});
+
+test("confirmation tokens are atomically claimed before duplicate continuations can reserve a slot", async () => {
+  const previousLookup = robloxLookup;
+  const robloxId = 9600;
+  robloxLookup = { id: robloxId, name: "TokenBuilder", displayName: "TokenBuilder" };
+  members.set("token-member", {
+    administrator: false,
+    username: "TokenBuilder",
+    globalName: "TokenBuilder",
+    nickname: "TokenBuilder",
+    roleIds: [],
+  });
+  trelloCards = [];
+  await setSecurity({ confirmationsRequired: true });
+  try {
+    const pending = command(
+      "admin-a",
+      "blacklist",
+      { username: "ignored", type: "permanent", reason: "claim token" },
+      "token-member",
+    );
+    await dispatch(pending);
+    const confirmation = lastConfirmationId(pending);
+    const beforeActions = (await getSecurityState(guild.id)).destructiveActions.length;
+    const first = button("admin-a", confirmation);
+    const duplicate = button("admin-a", confirmation);
+    client!.emit("interactionCreate", first);
+    client!.emit("interactionCreate", duplicate);
+    await settle();
+    assert.equal(first.deferred, true);
+    assert.equal(duplicate.deferred, false);
+    assert.equal(
+      (await getSecurityState(guild.id)).destructiveActions.length,
+      beforeActions + 1,
+    );
+    assert.equal((await findRoleSnapshot(guild.id, robloxId))?.status, "active");
+  } finally {
+    trelloCards = [];
+    robloxLookup = previousLookup;
+    await setSecurity({ confirmationsRequired: false });
+  }
+});
+
+test("identity prompt rejects foreign, expired, demoted, maintenance, and lockdown continuations", async () => {
+  const previousLookup = robloxLookup;
+  robloxLookup = { id: 9200, name: "ContinuationBuilder", displayName: "ContinuationBuilder" };
+  await setSecurity({ confirmationsRequired: true });
+  try {
+    const pending = command("admin-a", "blacklist", {
+      username: "ignored",
+      type: "appealable",
+      reason: "continuation binding",
+    });
+    await dispatch(pending);
+    const promptId = componentRows(latestComponentPayload(pending))
+      .map((component) => component.data?.custom_id ?? component.custom_id)
+      .find((id): id is string => Boolean(id?.startsWith("identity-prompt:")));
+    assert.ok(promptId);
+    const modalCountBeforeForeign = shownModals.length;
+    const foreign = button("admin-b", promptId!);
+    await dispatchRaw(foreign);
+    assert.equal(shownModals.length, modalCountBeforeForeign);
+    assert.match(replies.at(-1) ?? "", /expired or belongs to another administrator/i);
+
+    const originalNow = Date.now;
+    Date.now = () => originalNow() + 11 * 60_000;
+    try {
+      await dispatchRaw(button("admin-a", promptId!));
+      assert.match(replies.at(-1) ?? "", /expired/i);
+    } finally {
+      Date.now = originalNow;
+    }
+
+    const demotionPending = command("admin-a", "blacklist", {
+      username: "ignored",
+      type: "appealable",
+      reason: "demotion binding",
+    });
+    await dispatch(demotionPending);
+    const demotionPromptId = componentRows(latestComponentPayload(demotionPending))
+      .map((component) => component.data?.custom_id ?? component.custom_id)
+      .find((id): id is string => Boolean(id?.startsWith("identity-prompt:")));
+    assert.ok(demotionPromptId);
+    members.set("admin-a", { administrator: false });
+    try {
+      await dispatchRaw(button("admin-a", demotionPromptId!));
+      assert.match(replies.at(-1) ?? "", /current Discord Administrator/i);
+    } finally {
+      members.set("admin-a", { administrator: true });
+    }
+
+    const maintenancePending = command("admin-a", "blacklist", {
+      username: "ignored",
+      type: "appealable",
+      reason: "maintenance binding",
+    });
+    await dispatch(maintenancePending);
+    const maintenancePromptId = componentRows(latestComponentPayload(maintenancePending))
+      .map((component) => component.data?.custom_id ?? component.custom_id)
+      .find((id): id is string => Boolean(id?.startsWith("identity-prompt:")));
+    assert.ok(maintenancePromptId);
+    await mutateSecurityState(guild.id, (state) => {
+      state.maintenance.active = true;
+      state.maintenance.reason = "identity continuation maintenance";
+    });
+    try {
+      await dispatchRaw(button("admin-a", maintenancePromptId!));
+      assert.match(replies.at(-1) ?? "", /maintenance/i);
+    } finally {
+      await setSecurity({ confirmationsRequired: true });
+    }
+
+    const lockdownPending = command("admin-a", "blacklist", {
+      username: "ignored",
+      type: "appealable",
+      reason: "lockdown binding",
+    });
+    await dispatch(lockdownPending);
+    const lockdownPromptId = componentRows(latestComponentPayload(lockdownPending))
+      .map((component) => component.data?.custom_id ?? component.custom_id)
+      .find((id): id is string => Boolean(id?.startsWith("identity-prompt:")));
+    assert.ok(lockdownPromptId);
+    await mutateSecurityState(guild.id, (state) => {
+      state.lockdown.active = true;
+      state.lockdown.reason = "identity continuation lockdown";
+    });
+    try {
+      await dispatchRaw(button("admin-a", lockdownPromptId!));
+      assert.match(replies.at(-1) ?? "", /lockdown/i);
+    } finally {
+      await setSecurity({ confirmationsRequired: true });
+    }
+  } finally {
+    robloxLookup = previousLookup;
+    await setSecurity({ confirmationsRequired: false });
+  }
+});
+
+test("nonmember provider failure leaves the approved empty snapshot pending for recovery", async () => {
+  const previousLookup = robloxLookup;
+  robloxLookup = { id: 9300, name: "ProviderFailureBuilder", displayName: "ProviderFailureBuilder" };
+  const externalId = "12345678901234568";
+  validatedExternalUsers.add(externalId);
+  trelloCreateFailure = true;
+  const beforeRoles = roleMutationCalls;
+  await setSecurity({ confirmationsRequired: false });
+  try {
+    const pendingCommand = command("admin-a", "blacklist", {
+      username: "ignored",
+      type: "permanent",
+      reason: "provider failure",
+    });
+    await dispatch(pendingCommand);
+    const promptId = componentRows(latestComponentPayload(
+      pendingCommand,
+    ))
+      .map((component) => component.data?.custom_id ?? component.custom_id)
+      .find((id): id is string => Boolean(id?.startsWith("identity-prompt:")));
+    assert.ok(promptId);
+    await dispatchRaw(button("admin-a", promptId!));
+    const modalId = shownModals.at(-1)?.customId;
+    assert.ok(modalId);
+    const resolved = modal("admin-a", modalId!, { discord_identity: externalId });
+    await dispatchRaw(resolved);
+    const confirmation = confirmationIdFromReplies(resolved);
+    await dispatchRaw(button("admin-a", confirmation));
+    const pending = await findRoleSnapshot(guild.id, 9300);
+    assert.equal(pending?.discordUserId, externalId);
+    assert.deepEqual(pending?.roleIds, []);
+    assert.equal(pending?.status, "pending");
+    assert.equal(pending?.cardId, undefined);
+    assert.equal(roleMutationCalls, beforeRoles, "provider failure must leave Discord roles untouched");
+  } finally {
+    trelloCreateFailure = false;
+    robloxLookup = previousLookup;
+    validatedExternalUsers.delete(externalId);
+    await setSecurity({ confirmationsRequired: false });
+  }
+});
+
 test("a target holding a configured protected role is denied before any Trello write", async () => {
   await setSecurity({
     confirmationsRequired: false,
@@ -835,6 +1332,29 @@ test("a target holding a configured protected role is denied before any Trello w
     "blacklist",
     { user: "Builder", type: "appealable", reason: "protected role" },
     "protected-target",
+  ));
+  assert.equal(trelloCardCreations.length, before);
+  assert.match(replies.at(-1) ?? "", /protected by server security settings/i);
+});
+
+test("a configured protected user ID is denied before any provider mutation", async () => {
+  await setSecurity({
+    confirmationsRequired: false,
+    protectedUserIds: ["protected-id"],
+    protectedRoleIds: [],
+  });
+  members.set("protected-id", {
+    administrator: false,
+    username: "Builder",
+    globalName: "Builder",
+    nickname: "Builder",
+  });
+  const before = trelloCardCreations.length;
+  await dispatch(command(
+    "admin-a",
+    "blacklist",
+    { username: "Builder", type: "appealable", reason: "protected ID" },
+    "protected-id",
   ));
   assert.equal(trelloCardCreations.length, before);
   assert.match(replies.at(-1) ?? "", /protected by server security settings/i);

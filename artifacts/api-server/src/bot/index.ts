@@ -37,6 +37,7 @@ import {
 } from "./trello";
 import {
   findPendingOrActiveSnapshot,
+  listSnapshotsForMember,
   saveRoleSnapshot,
   saveBlacklistNote,
   withGuildBlacklistLifecycleLock,
@@ -104,7 +105,7 @@ const moderationCommands = [
     .setDescription("Blacklist a Roblox user and remove their server roles.")
     .addStringOption((option) =>
       option
-        .setName("user")
+        .setName("username")
         .setDescription("The Roblox username, not the display name.")
         .setRequired(true),
     )
@@ -124,11 +125,6 @@ const moderationCommands = [
         .setName("reason")
         .setDescription("Why the Roblox user is being blacklisted.")
         .setRequired(true),
-    )
-    .addUserOption((option) =>
-      option
-        .setName("discord_user")
-        .setDescription("Optional: ping the matching Discord member directly."),
     ),
   new SlashCommandBuilder()
     .setName("revoke_blacklist")
@@ -138,11 +134,6 @@ const moderationCommands = [
         .setName("username")
         .setDescription("The exact Roblox username.")
         .setRequired(true),
-    )
-    .addUserOption((option) =>
-      option
-        .setName("discord_user")
-        .setDescription("Optional: ping the Discord member directly."),
     ),
   new SlashCommandBuilder()
     .setName("blacklist_lookup")
@@ -156,6 +147,14 @@ const setupOnlyCommands = [settingsCommand].map((command) => command.toJSON());
 const enabledCommands = [settingsCommand, ...moderationCommands].map((command) =>
   command.toJSON(),
 );
+
+/** Snapshot of the exact command contract sent to Discord. */
+export function getRegisteredCommandDefinitions() {
+  return enabledCommands.map((command) => ({
+    ...command,
+    options: command.options?.map((option) => ({ ...option })),
+  }));
+}
 
 export type BotRecoveryStatus = "pending" | "successful" | "blocked";
 export type BotRetryOutcome = "pending" | "successful" | "blocked";
@@ -210,13 +209,37 @@ interface SetupSession {
   navigation?: SettingsLocation[];
 }
 const setupSessions = new Map<string, SetupSession>();
+interface ModerationTarget {
+  discordUserId: string;
+  robloxUserId: number;
+  robloxUsername: string;
+  /** Whether the bound Discord account is currently a guild member. */
+  memberPresent?: boolean;
+  cardId?: string;
+}
+
+interface DiscordIdentityPrompt {
+  userId: string;
+  guildId: string;
+  command: "blacklist" | "revoke_blacklist";
+  original: ChatInputCommandInteraction;
+  robloxUserId: number;
+  robloxUsername: string;
+  expiresAt: number;
+  nonce: string;
+  phase?: "button" | "modal" | "resolving";
+  cardId?: string;
+}
+
+const identityPrompts = new Map<string, DiscordIdentityPrompt>();
 const confirmations = new Map<string, {
   userId: string;
   guildId: string;
   command: "blacklist" | "group_blacklist" | "revoke_blacklist" | "security_unlock";
   original: ChatInputCommandInteraction;
-  target?: { discordUserId: string; robloxUserId: number; robloxUsername: string; cardId?: string };
+  target?: ModerationTarget;
   expiresAt: number;
+  claimed?: boolean;
 }>();
 const maintenanceConfirmations = new Map<string, {
   userId: string;
@@ -226,6 +249,7 @@ const maintenanceConfirmations = new Map<string, {
   reason: string;
   expiresAt: number;
   original: ChatInputCommandInteraction | ModalSubmitInteraction;
+  claimed?: boolean;
 }>();
 
 const destructiveCommands = new Set(["blacklist", "group_blacklist", "revoke_blacklist"]);
@@ -247,6 +271,9 @@ async function maintenanceActive(guildId: string): Promise<boolean> {
 function invalidateGuildInteractiveState(guildId: string): void {
   for (const [id, session] of setupSessions) {
     if (session.guildId === guildId) setupSessions.delete(id);
+  }
+  for (const [id, prompt] of identityPrompts) {
+    if (prompt.guildId === guildId) identityPrompts.delete(id);
   }
   for (const [id, pending] of confirmations) {
     if (pending.guildId === guildId) confirmations.delete(id);
@@ -484,15 +511,24 @@ async function protectTarget(
   member: GuildMember,
   setup: GuildSetup,
 ): Promise<void> {
+  return protectTargetIdentity(guild, member.id, member, setup);
+}
+
+async function protectTargetIdentity(
+  guild: Guild,
+  discordUserId: string,
+  member: GuildMember | undefined,
+  setup: GuildSetup,
+): Promise<void> {
   const settings = securitySettingsFor(setup);
-  const protectedTarget = member.id === guild.ownerId ||
-    member.id === guild.members.me?.id ||
-    settings.protectedUserIds.includes(member.id) ||
-    member.roles.cache.some((role) => settings.protectedRoleIds.includes(role.id));
+  const protectedTarget = discordUserId === guild.ownerId ||
+    discordUserId === guild.members.me?.id ||
+    settings.protectedUserIds.includes(discordUserId) ||
+    Boolean(member?.roles.cache.some((role) => settings.protectedRoleIds.includes(role.id)));
   if (!protectedTarget) return;
   await auditBestEffort(guild, setup, {
     action: "Protected blacklist target denied", status: "failed", actorId: guild.client.user?.id ?? setup.updatedBy,
-    target: `<@${member.id}> (${member.id})`,
+    target: `<@${discordUserId}> (${discordUserId})`,
   });
   throw new Error("This target is protected by server security settings.");
 }
@@ -509,33 +545,164 @@ async function validateBlacklistRoleForAction(
   }
 }
 
+class DiscordIdentityRequiredError extends Error {
+  cardId?: string;
+
+  constructor(message: string, cardId?: string) {
+    super(message);
+    this.name = "DiscordIdentityRequiredError";
+    this.cardId = cardId;
+  }
+}
+
+function moderationRobloxUsername(interaction: ChatInputCommandInteraction): string {
+  const username = interaction.options.getString("username") ??
+    interaction.options.getString("user");
+  if (!username) throw new Error("A Roblox username is required.");
+  return username;
+}
+
+function memberIdentityNames(member: GuildMember): Set<string> {
+  const user = member.user as typeof member.user & { tag?: string };
+  return new Set(
+    [user.username, user.globalName, member.nickname, user.tag]
+      .filter((value): value is string => Boolean(value))
+      .map((value) => value.trim().toLowerCase()),
+  );
+}
+
+function identityMatches(member: GuildMember, input: string): boolean {
+  return memberIdentityNames(member).has(input.trim().toLowerCase());
+}
+
+function memberResults(value: unknown): GuildMember[] {
+  if (!value || typeof value !== "object") return [];
+  const candidate = value as {
+    id?: string;
+    values?: () => Iterable<GuildMember>;
+  };
+  if (typeof candidate.id === "string") return [value as GuildMember];
+  if (typeof candidate.values === "function") return [...candidate.values()];
+  return [];
+}
+
 async function resolveMember(
   interaction: ChatInputCommandInteraction,
   robloxUsername: string,
 ): Promise<GuildMember> {
-  const directUser = interaction.options.getUser("discord_user");
-  if (directUser) return interaction.guild!.members.fetch(directUser.id);
-
-  const members = await fetchGuildMembers(interaction.guild!);
   const normalized = robloxUsername.trim().toLowerCase();
-  const matches = members.filter((member) =>
-    [member.user.username, member.user.globalName, member.nickname]
-      .filter(Boolean)
-      .some((value) => value!.trim().toLowerCase() === normalized),
+  const guild = interaction.guild!;
+  // The option is intentionally not registered anymore. This compatibility
+  // path only accepts stale interaction fixtures/old payloads during command
+  // rollout; newly registered slash commands can only use the identity prompt.
+  try {
+    const legacyUser = interaction.options.getUser("discord_user");
+    if (legacyUser?.id) {
+      const fetched = await guild.members.fetch(legacyUser.id);
+      const member = memberResults(fetched).find((candidate) => candidate.id === legacyUser.id);
+      if (member) return member;
+    }
+  } catch {
+    // Ignore absent legacy options and use cached/server identity resolution.
+  }
+  const cached = guild.members.cache
+    ? [...guild.members.cache.values()].filter((member) => identityMatches(member, normalized))
+    : [];
+  let matches = cached;
+
+  // Discord has no global username lookup. A query fetch is limited to
+  // server identities and avoids a full member scan on every continuation.
+  if (matches.length === 0 && typeof guild.members.fetch === "function") {
+    try {
+      const fetched = await guild.members.fetch({ query: robloxUsername.trim(), limit: 10 });
+      matches = memberResults(fetched).filter((member) => identityMatches(member, normalized));
+    } catch {
+      // The account prompt below gives administrators the numeric-ID path when
+      // Discord cannot search the server identity.
+    }
+  }
+
+  if (matches.length === 0) {
+    throw new DiscordIdentityRequiredError(
+      `I could not match Roblox username "${robloxUsername}" to a Discord member. Provide a Discord tag/username or numeric user ID to continue.`,
+    );
+  }
+  if (matches.length > 1) {
+    throw new DiscordIdentityRequiredError(
+      `More than one Discord member matches "${robloxUsername}". Provide the matching Discord tag or numeric user ID to continue.`,
+    );
+  }
+
+  return matches[0]!;
+}
+
+interface ResolvedDiscordIdentity {
+  userId: string;
+  member?: GuildMember;
+}
+
+function discordIdFromInput(input: string): string | undefined {
+  const mention = /^<@!?(\d{5,25})>$/.exec(input.trim());
+  if (mention) return mention[1];
+  if (/^\d{5,25}$/.test(input.trim())) return input.trim();
+  return undefined;
+}
+
+async function resolveDiscordIdentity(
+  guild: Guild,
+  rawInput: string,
+): Promise<ResolvedDiscordIdentity> {
+  const input = rawInput.trim();
+  if (!input || input.length > 100 || /[\u0000-\u001f\u007f]/.test(input)) {
+    throw new Error("Provide a Discord tag, username, or numeric user ID.");
+  }
+  const explicitId = discordIdFromInput(input);
+  if (explicitId) {
+    const users = guild.client?.users;
+    if (!users || typeof users.fetch !== "function") {
+      throw new Error("Discord account lookup is unavailable. Retry with a numeric ID later.");
+    }
+    let user: { id?: string };
+    try {
+      user = await users.fetch(explicitId);
+    } catch {
+      throw new Error(`Discord user ID ${explicitId} could not be fetched. Check the ID and retry.`);
+    }
+    if (!user || user.id !== explicitId) {
+      throw new Error(`Discord user ID ${explicitId} could not be validated. Check the ID and retry.`);
+    }
+    let member: GuildMember | undefined;
+    try {
+      const fetched = await guild.members.fetch(explicitId);
+      member = memberResults(fetched).find((candidate) => candidate.id === explicitId);
+    } catch {
+      // A valid Discord user need not be a member of this server.
+    }
+    return { userId: explicitId, member };
+  }
+
+  const normalized = input.toLowerCase();
+  const cached = guild.members.cache
+    ? [...guild.members.cache.values()].filter((member) => identityMatches(member, normalized))
+    : [];
+  let matches = cached;
+  if (matches.length === 0 && typeof guild.members.fetch === "function") {
+    try {
+      const fetched = await guild.members.fetch({ query: input, limit: 10 });
+      matches = memberResults(fetched).filter((member) => identityMatches(member, normalized));
+    } catch {
+      // No server identity was available for this username/tag.
+    }
+  }
+  if (matches.length === 1) return { userId: matches[0]!.id, member: matches[0] };
+  if (matches.length > 1) {
+    throw new Error(
+      `That Discord username/tag matches more than one server identity. Retry with the numeric Discord user ID.`,
+    );
+  }
+  throw new Error(
+    "Discord cannot globally look up arbitrary usernames. No unambiguous server identity matched; retry with the numeric Discord user ID.",
   );
-
-  if (matches.size === 0) {
-    throw new Error(
-      `I could not match Roblox username "${robloxUsername}" to a Discord member. Use the optional discord_user field to ping them directly.`,
-    );
-  }
-  if (matches.size > 1) {
-    throw new Error(
-      `More than one Discord member matches "${robloxUsername}". Use the optional discord_user field to ping the correct member.`,
-    );
-  }
-
-  return matches.first()!;
 }
 
 function setupSessionId(guildId: string, userId: string): string {
@@ -2068,31 +2235,46 @@ async function createConfirmation(
   interaction: ChatInputCommandInteraction,
   command: "blacklist" | "group_blacklist" | "revoke_blacklist" | "security_unlock",
 ): Promise<void> {
-  let target: { discordUserId: string; robloxUserId: number; robloxUsername: string; cardId?: string } | undefined;
+  let target: ModerationTarget | undefined;
   if (command === "blacklist" || command === "revoke_blacklist") {
-    const username = interaction.options.getString(command === "blacklist" ? "user" : "username", true);
-    const robloxUser = await findRobloxUser(username);
-    const snapshot = command === "revoke_blacklist"
-      ? await findPendingOrActiveSnapshot(interaction.guild!.id, robloxUser.id)
-      : undefined;
-    const member = snapshot
-      ? undefined
-      : await resolveMember(interaction, robloxUser.name);
-    target = {
-      discordUserId: snapshot?.discordUserId ?? member!.id,
-      robloxUserId: robloxUser.id,
-      robloxUsername: robloxUser.name,
-    };
-    if (command === "revoke_blacklist") {
-      const setup = await getGuildSetup(interaction.guild!.id);
-      if (!setup) throw new Error("Complete setup before revoking a blacklist.");
-      if (snapshot?.status === "revocation_pending" && snapshot.cardId) {
-        target.cardId = snapshot.cardId;
-      } else {
-        const card = await findBlacklistCardByRobloxId(robloxUser.id, trelloMappingsFor(setup));
-        if (!card || card.listType === "revoked") throw new Error("No active Trello blacklist card was found for this Roblox user.");
-        target.cardId = card.id;
-      }
+    try {
+      target = await resolveModerationTarget(interaction, command);
+    } catch (error) {
+      if (!(error instanceof DiscordIdentityRequiredError)) throw error;
+      const robloxUser = await findRobloxUser(moderationRobloxUsername(interaction));
+      const id = crypto.randomUUID().replaceAll("-", "");
+      const nonce = crypto.randomUUID().replaceAll("-", "");
+      identityPrompts.set(id, {
+        userId: interaction.user.id,
+        guildId: interaction.guild!.id,
+        command,
+        original: interaction,
+        robloxUserId: robloxUser.id,
+        robloxUsername: robloxUser.name,
+        expiresAt: Date.now() + setupSessionLifetimeMs,
+        nonce,
+        ...(error.cardId ? { cardId: error.cardId } : {}),
+      });
+      await interaction.editReply({
+        content: "",
+        embeds: [outcomeEmbed(
+          "Discord Account Needed",
+          `${error.message}\n\nNo provider mutation, role change, or rate-limit reservation has been made. Use the button to provide a validated Discord identity.`,
+          "warning",
+          [
+            { name: "Roblox User", value: `${safePresentationText(robloxUser.name)} (${displayId(robloxUser.id)})` },
+            { name: "Target", value: "Discord member or verified nonmember account" },
+          ],
+        )],
+        allowedMentions: noMentions,
+        components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`identity-prompt:${id}:${nonce}`)
+            .setLabel("Provide Discord Account")
+            .setStyle(ButtonStyle.Primary),
+        )],
+      });
+      return;
     }
   }
   const id = crypto.randomUUID().replaceAll("-", "");
@@ -2101,12 +2283,219 @@ async function createConfirmation(
     content: "",
     embeds: [outcomeEmbed("Confirm Action", `Review the requested /${command} operation. Your current Administrator permission will be checked again before execution.`, "warning", target ? [
       { name: "Roblox User", value: `${safePresentationText(target.robloxUsername)} (${displayId(target.robloxUserId)})` },
-      { name: "Discord Member", value: displayId(target.discordUserId) },
+      {
+        name: "Discord Account",
+        value: `<@${target.discordUserId}> (${displayId(target.discordUserId)})\n${target.memberPresent ? "Current server member" : "Validated nonmember account"}`,
+      },
     ] : undefined)],
     allowedMentions: noMentions,
     components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`confirm:${id}`).setLabel("Confirm").setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId(`cancel:${id}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
+    )],
+  });
+}
+
+async function resolveModerationTarget(
+  interaction: ChatInputCommandInteraction,
+  command: "blacklist" | "revoke_blacklist",
+): Promise<ModerationTarget> {
+  const robloxUser = await findRobloxUser(moderationRobloxUsername(interaction));
+  const snapshot = command === "revoke_blacklist"
+    ? await findPendingOrActiveSnapshot(interaction.guild!.id, robloxUser.id)
+    : undefined;
+  let cardId = snapshot?.cardId;
+  if (command === "revoke_blacklist" && !cardId) {
+    const configuredSetup = await getGuildSetup(interaction.guild!.id);
+    const cards = await findBlacklistCardsByRobloxId(
+      robloxUser.id,
+      configuredSetup ? trelloMappingsFor(configuredSetup) : defaultTrelloMappings(),
+    );
+    const activeCards = cards.filter((card) => card.listType !== "revoked");
+    if (activeCards.length !== 1) {
+      throw new Error(
+        activeCards.length === 0
+          ? `No active Trello blacklist card was found for ${robloxUser.name} (${robloxUser.id}).`
+          : `Multiple active Trello blacklist cards match ${robloxUser.name} (${robloxUser.id}); resolve the duplicate cards before revoking.`,
+      );
+    }
+    cardId = activeCards[0]!.id;
+  }
+  let member: GuildMember | undefined;
+  try {
+    if (snapshot) {
+      // A saved snapshot is the authority for revocation. The member may have
+      // left and must not be re-resolved by a mutable username.
+      try {
+        const fetched = await interaction.guild!.members.fetch(snapshot.discordUserId);
+        member = memberResults(fetched).find((candidate) => candidate.id === snapshot.discordUserId);
+      } catch {
+        member = undefined;
+      }
+    } else {
+      member = await resolveMember(interaction, robloxUser.name);
+    }
+  } catch (error) {
+    if (error instanceof DiscordIdentityRequiredError && cardId) {
+      error.cardId = cardId;
+    }
+    throw error;
+  }
+  const discordUserId = snapshot?.discordUserId ?? member?.id;
+  if (!discordUserId) throw new DiscordIdentityRequiredError(
+    `I could not resolve a Discord identity for Roblox username "${robloxUser.name}".`,
+    cardId,
+  );
+  return {
+    discordUserId,
+    robloxUserId: robloxUser.id,
+    robloxUsername: robloxUser.name,
+    memberPresent: Boolean(member),
+    ...(command === "revoke_blacklist" && cardId
+      ? { cardId }
+      : {}),
+  };
+}
+
+function confirmationPayload(command: string, target: ModerationTarget) {
+  return {
+    content: "",
+    embeds: [outcomeEmbed(
+      "Confirm Action",
+      `Review the requested /${command} operation. Your current Administrator permission will be checked again before execution.`,
+      "warning",
+      [
+        { name: "Roblox User", value: `${safePresentationText(target.robloxUsername)} (${displayId(target.robloxUserId)})` },
+        {
+          name: "Discord Account",
+          value: `<@${target.discordUserId}> (${displayId(target.discordUserId)})\n${target.memberPresent ? "Current server member" : "Validated nonmember account"}`,
+        },
+      ],
+    )],
+    allowedMentions: noMentions,
+    ephemeral: true,
+  };
+}
+
+async function requireIdentityPrompt(
+  interaction: ButtonInteraction | ModalSubmitInteraction,
+): Promise<{ pending: DiscordIdentityPrompt; setup: GuildSetup }> {
+  if (!interaction.guild) throw new Error("This account prompt is only available in the configured server.");
+  const match = interaction.customId.match(/^identity-(?:prompt|modal):([a-f0-9]{32}):([a-f0-9]{32})$/);
+  const id = match?.[1];
+  const nonce = match?.[2];
+  const pending = id ? identityPrompts.get(id) : undefined;
+  const expectedPhase = interaction.customId.startsWith("identity-prompt:")
+    ? "button"
+    : "modal";
+  if (
+    !pending ||
+    !nonce ||
+    pending.nonce !== nonce ||
+    pending.expiresAt <= Date.now() ||
+    pending.userId !== interaction.user.id ||
+    pending.guildId !== interaction.guild.id ||
+    (expectedPhase === "button"
+      ? pending.phase !== undefined
+      : pending.phase !== "modal")
+  ) {
+    throw new Error("This Discord account prompt has expired or belongs to another administrator.");
+  }
+  // Claim before the first await. Discord can deliver duplicate button/modal
+  // interactions while the member/provider lookup is still in flight.
+  pending.phase = expectedPhase === "button" ? "button" : "resolving";
+  try {
+    const setup = await getGuildSetup(interaction.guild.id);
+    await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, `/${pending.command} account prompt`);
+    const state = await getSecurityState(interaction.guild.id);
+    if (state.maintenance.active) throw new Error(maintenanceMessage);
+    if (state.lockdown.active) throw new Error(`Security lockdown is active: ${state.lockdown.reason || "no reason provided"}.`);
+    if (!setup) throw new Error("Complete setup before continuing this moderation action.");
+    return { pending, setup };
+  } catch (error) {
+    // Permission/state failures do not consume the prompt. Releasing only this
+    // still-current object permits a controlled retry after the administrator
+    // restores setup/state, while duplicate in-flight interactions remain
+    // rejected by the synchronous phase claim above.
+    if (id && identityPrompts.get(id) === pending) {
+      pending.phase = expectedPhase === "button" ? undefined : "modal";
+    }
+    throw error;
+  }
+}
+
+async function handleIdentityPromptButton(interaction: ButtonInteraction): Promise<void> {
+  const { pending } = await requireIdentityPrompt(interaction);
+  const match = interaction.customId.match(/^identity-prompt:([a-f0-9]{32}):([a-f0-9]{32})$/);
+  if (!match) throw new Error("This Discord account prompt is invalid.");
+  const [, id, nonce] = match;
+  // Keep the prompt claimed while opening the modal; a second button click
+  // must not produce another modal or continuation.
+  pending.phase = "modal";
+  try {
+    await interaction.showModal(new ModalBuilder()
+      .setCustomId(`identity-modal:${id}:${nonce}`)
+      .setTitle("Provide Discord Account")
+      .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("discord_identity")
+          .setLabel("Discord tag, username, or numeric ID")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(100),
+      )));
+  } catch (error) {
+    if (id && identityPrompts.get(id) === pending) pending.phase = undefined;
+    throw error;
+  }
+}
+
+async function handleIdentityPromptModal(interaction: ModalSubmitInteraction): Promise<void> {
+  const { pending } = await requireIdentityPrompt(interaction);
+  const rawIdentity = interaction.fields.getTextInputValue("discord_identity");
+  let resolved: ResolvedDiscordIdentity;
+  try {
+    resolved = await resolveDiscordIdentity(interaction.guild!, rawIdentity);
+  } catch (error) {
+    // Keep the prompt alive so a bad tag/ID can be corrected without creating
+    // a confirmation, reserving a rate slot, touching Trello, or changing
+    // roles.
+    if (identityPrompts.get(interaction.customId.split(":")[1] ?? "") === pending) {
+      pending.phase = "modal";
+    }
+    await interaction.reply({
+      ...errorResponse(error instanceof Error ? error.message : "Discord account lookup failed.", "Discord Account Not Resolved"),
+      ephemeral: true,
+    });
+    return;
+  }
+  const target: ModerationTarget = {
+    discordUserId: resolved.userId,
+    robloxUserId: pending.robloxUserId,
+    robloxUsername: pending.robloxUsername,
+    memberPresent: Boolean(resolved.member),
+    ...(pending.command === "revoke_blacklist" && pending.cardId
+      ? { cardId: pending.cardId }
+      : {}),
+  };
+  const promptId = interaction.customId.split(":")[1];
+  // Delete the claimed prompt before creating the confirmation or awaiting
+  // Discord. A valid modal can therefore be consumed only once.
+  if (promptId && identityPrompts.get(promptId) === pending) identityPrompts.delete(promptId);
+  const confirmationId = crypto.randomUUID().replaceAll("-", "");
+  confirmations.set(confirmationId, {
+    userId: pending.userId,
+    guildId: pending.guildId,
+    command: pending.command,
+    original: pending.original,
+    target,
+    expiresAt: Date.now() + setupSessionLifetimeMs,
+  });
+  await interaction.reply({
+    ...confirmationPayload(pending.command, target),
+    components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`confirm:${confirmationId}`).setLabel("Confirm").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`cancel:${confirmationId}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
     )],
   });
 }
@@ -2226,15 +2615,27 @@ async function handleMaintenanceConfirmation(interaction: ButtonInteraction): Pr
       pending.guildId !== interaction.guildId || !interaction.guild) {
     throw new Error("This maintenance confirmation has expired or belongs to another administrator.");
   }
-  maintenanceConfirmations.delete(id!);
+  if (pending.claimed) throw new Error("This maintenance confirmation is already being processed.");
+  // Claim synchronously before setup/permission reads. Only the first
+  // duplicate interaction may reserve and commit the transition.
+  pending.claimed = true;
+  let setup: GuildSetup | undefined;
+  try {
+    setup = await getGuildSetup(pending.guildId);
+    await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, "/maintenance confirmation");
+  } catch (error) {
+    if (id && maintenanceConfirmations.get(id) === pending) pending.claimed = false;
+    throw error;
+  }
   if (interaction.customId.startsWith("maintenance-cancel:")) {
+    maintenanceConfirmations.delete(id!);
     await interaction.update({
       ...responseWithEmbed("Maintenance change cancelled.", "Maintenance Change Cancelled", "info"),
       components: [],
     });
     return;
   }
-  const setup = await getGuildSetup(pending.guildId);
+  maintenanceConfirmations.delete(id!);
   await interaction.deferUpdate();
   await completeMaintenanceChange(
     interaction.guild,
@@ -2285,17 +2686,29 @@ async function handleConfirmation(interaction: ButtonInteraction): Promise<void>
   if (!pending || pending.expiresAt <= Date.now() || pending.userId !== interaction.user.id || pending.guildId !== interaction.guildId) {
     throw new Error("This confirmation has expired or belongs to another administrator.");
   }
-  confirmations.delete(id!);
+  if (!interaction.guild) throw new Error("Bot setup is unavailable.");
+  if (pending.claimed) throw new Error("This confirmation is already being processed.");
+  // Claim before any await. The map entry is deleted below only after the
+  // synchronous cancel/authorization checks, so a duplicate cannot reserve a
+  // second destructive-action slot.
+  pending.claimed = true;
+  let setup: GuildSetup | undefined;
+  try {
+    setup = await getGuildSetup(pending.guildId);
+    await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, `/${pending.command} confirmation`);
+  } catch (error) {
+    if (id && confirmations.get(id) === pending) pending.claimed = false;
+    throw error;
+  }
   if (interaction.customId.startsWith("cancel:")) {
+    confirmations.delete(id!);
     await interaction.update({
       ...responseWithEmbed("Action cancelled.", "Action Cancelled", "info"),
       components: [],
     });
     return;
   }
-  const setup = await getGuildSetup(pending.guildId);
-  if (!interaction.guild) throw new Error("Bot setup is unavailable.");
-  await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, `/${pending.command} confirmation`);
+  confirmations.delete(id!);
   await interaction.deferUpdate();
   if (pending.command === "security_unlock") {
     await completeSecurityUnlock(
@@ -2416,19 +2829,31 @@ export async function handleSetup(
 async function handleBlacklistUnlocked(
   interaction: ChatInputCommandInteraction,
   setup?: GuildSetup,
-  boundTarget?: { discordUserId: string; robloxUserId: number; robloxUsername: string },
+  boundTarget?: ModerationTarget,
 ): Promise<void> {
-  const username = interaction.options.getString("user", true);
+  const username = moderationRobloxUsername(interaction);
   const type = interaction.options.getString("type", true) as BlacklistType;
   const reason = interaction.options.getString("reason", true).trim();
   const robloxUser = boundTarget
     ? { id: boundTarget.robloxUserId, name: boundTarget.robloxUsername }
     : await findRobloxUser(username);
-  const member = boundTarget
-    ? await interaction.guild!.members.fetch(boundTarget.discordUserId)
-    : await resolveMember(interaction, robloxUser.name);
-  if (setup) await protectTarget(interaction.guild!, member, setup);
-  if (setup) await validateBlacklistRoleForAction(interaction.guild!, setup);
+  let member: GuildMember | undefined;
+  if (boundTarget) {
+    try {
+      const fetched = await interaction.guild!.members.fetch(boundTarget.discordUserId);
+      member = memberResults(fetched).find((candidate) => candidate.id === boundTarget.discordUserId);
+    } catch {
+      member = undefined;
+    }
+  } else {
+    member = await resolveMember(interaction, robloxUser.name);
+  }
+  const targetDiscordUserId = boundTarget?.discordUserId ?? member?.id;
+  if (!targetDiscordUserId) throw new Error("A validated Discord account is required.");
+  if (setup) {
+    await protectTargetIdentity(interaction.guild!, targetDiscordUserId, member, setup);
+    await validateBlacklistRoleForAction(interaction.guild!, setup);
+  }
   const existing = await findPendingOrActiveSnapshot(
     interaction.guild!.id,
     robloxUser.id,
@@ -2438,8 +2863,21 @@ async function handleBlacklistUnlocked(
     throw new Error(`${robloxUser.name} already has an active blacklist snapshot.`);
   }
 
-  const plannedRoleIds = getRemovableRoleIds(member).changed;
-  const roleSummary = describeRoles(member, plannedRoleIds);
+  const plannedRoleIds = member ? getRemovableRoleIds(member).changed : [];
+  // A Discord account may carry several independent Roblox restrictions. Each
+  // snapshot retains the union so restoring one restriction cannot discard
+  // roles that belong to the eventual last revocation.
+  const priorRoleSnapshots = await listSnapshotsForMember(
+    interaction.guild!.id,
+    targetDiscordUserId,
+  );
+  const savedRoleIds = [...new Set([
+    ...(member ? plannedRoleIds : []),
+    ...priorRoleSnapshots
+      .filter((snapshot) => ["pending", "active", "revocation_pending"].includes(snapshot.status))
+      .flatMap((snapshot) => snapshot.roleIds),
+  ])];
+  const roleSummary = member ? describeRoles(member, plannedRoleIds) : "None; member absent";
   const key = keyFor(interaction.guild!.id, robloxUser.id);
   const mappings = setup ? trelloMappingsFor(setup) : undefined;
   const matchingCards = await findBlacklistCardsByRobloxId(
@@ -2462,8 +2900,28 @@ async function handleBlacklistUnlocked(
     | Awaited<ReturnType<typeof createBlacklistCard>>
     | undefined;
   const reusedRevokedCard = Boolean(revokedCard);
+  const createdAt = new Date().toISOString();
+  const approvedNonmemberSnapshot = !member
+    ? {
+        key,
+        guildId: interaction.guild!.id,
+        discordUserId: targetDiscordUserId,
+        robloxUserId: robloxUser.id,
+        robloxUsername: robloxUser.name,
+        // A nonmember has no role state to invent. Join enforcement will
+        // enforce this exact Discord-ID binding when the account joins.
+         roleIds: savedRoleIds,
+        blacklistType: type,
+        blacklistReason: reason,
+        source: "command" as const,
+        status: "pending" as const,
+        createdAt,
+      }
+    : undefined;
 
   try {
+    // Approval is durable before a provider mutation for an absent account.
+    if (approvedNonmemberSnapshot) await saveRoleSnapshot(approvedNonmemberSnapshot);
     createdCard = revokedCard
       ? await reactivateBlacklistCardById(revokedCard.id, {
           robloxId: robloxUser.id,
@@ -2481,10 +2939,10 @@ async function handleBlacklistUnlocked(
     await saveRoleSnapshot({
       key,
       guildId: interaction.guild!.id,
-      discordUserId: member.id,
+      discordUserId: targetDiscordUserId,
       robloxUserId: robloxUser.id,
       robloxUsername: robloxUser.name,
-      roleIds: plannedRoleIds,
+       roleIds: savedRoleIds,
       cardId: createdCard.id,
       cardUrl: createdCard.url,
       blacklistType: type,
@@ -2500,7 +2958,7 @@ async function handleBlacklistUnlocked(
           : "Trello blacklist card created",
         status: "success",
         actorId: interaction.user.id,
-        target: `<@${member.id}> (${member.id})`,
+        target: `<@${targetDiscordUserId}> (${targetDiscordUserId})`,
         fields: [
           { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
           { name: "Blacklist type", value: type, inline: true },
@@ -2513,22 +2971,24 @@ async function handleBlacklistUnlocked(
       });
     }
 
-    const roleIds = await withMemberRoleLock(interaction.guild!.id, member.id, async () => {
-      const removed = (await removeAssignableRoles(member)).changed;
-      if (setup?.blacklistRoleId) {
-        const blacklistRole = await interaction.guild!.roles.fetch(setup.blacklistRoleId);
-        if (!blacklistRole) throw new Error("The configured blacklisted role no longer exists.");
-        const botMember = interaction.guild!.members.me;
-        if (blacklistRole.managed || !botMember || blacklistRole.position >= botMember.roles.highest.position) {
-          throw new Error("The configured blacklisted role is not assignable by the bot.");
-        }
-        if (!member.roles.cache.has(blacklistRole.id)) {
-          await member.roles.add(blacklistRole, "Roblox blacklist");
-        }
-      }
-      return removed;
-    });
-    const associations = await recordIdentityAssociation(interaction.guild!.id, member.id, robloxUser.id);
+    const roleIds = member
+      ? await withMemberRoleLock(interaction.guild!.id, member.id, async () => {
+          const removed = (await removeAssignableRoles(member)).changed;
+          if (setup?.blacklistRoleId) {
+            const blacklistRole = await interaction.guild!.roles.fetch(setup.blacklistRoleId);
+            if (!blacklistRole) throw new Error("The configured blacklisted role no longer exists.");
+            const botMember = interaction.guild!.members.me;
+            if (blacklistRole.managed || !botMember || blacklistRole.position >= botMember.roles.highest.position) {
+              throw new Error("The configured blacklisted role is not assignable by the bot.");
+            }
+            if (!member.roles.cache.has(blacklistRole.id)) {
+              await member.roles.add(blacklistRole, "Roblox blacklist");
+            }
+          }
+          return removed;
+        })
+      : [];
+    const associations = await recordIdentityAssociation(interaction.guild!.id, targetDiscordUserId, robloxUser.id);
     const identity = { ...defaultIdentitySettings(), ...setup?.identity };
     const warnings = associations.warnings.filter((warning) =>
       identity.historicalAssociationWarnings &&
@@ -2540,7 +3000,7 @@ async function handleBlacklistUnlocked(
         action: "Identity association warning",
         status: "failed",
         actorId: interaction.user.id,
-        target: `<@${member.id}> (${member.id})`,
+        target: `<@${targetDiscordUserId}> (${targetDiscordUserId})`,
         fields: [{ name: "Result", value: warnings.map((warning) =>
           warning === "same_discord_different_roblox"
             ? "Same Discord account is associated with another Roblox identity."
@@ -2550,39 +3010,43 @@ async function handleBlacklistUnlocked(
     }
     if (setup) {
       await auditBestEffort(interaction.guild!, setup, {
-        action: "Discord roles removed",
+        action: member
+          ? "Discord roles removed"
+          : "Discord role enforcement deferred for nonmember",
         status: "success",
         actorId: interaction.user.id,
-        target: `<@${member.id}> (${member.id})`,
+        target: `<@${targetDiscordUserId}> (${targetDiscordUserId})`,
         fields: [
           {
             name: "Roblox user",
             value: `${robloxUser.name} | ${robloxUser.id}`,
           },
-          { name: "Roles removed", value: describeRoles(member, roleIds) },
+          { name: "Roles removed", value: member ? describeRoles(member, roleIds) : "None; member absent" },
         ],
       });
     }
     await saveRoleSnapshot({
       key,
       guildId: interaction.guild!.id,
-      discordUserId: member.id,
+      discordUserId: targetDiscordUserId,
       robloxUserId: robloxUser.id,
       robloxUsername: robloxUser.name,
       // Retain the original snapshot, even when a later enforcement attempt
       // could only remove part of the member's current roles.
-      roleIds: plannedRoleIds,
+       roleIds: savedRoleIds,
       cardId: createdCard.id,
       cardUrl: createdCard.url,
       blacklistType: type,
       blacklistReason: reason,
       source: "command",
-      blacklistNotificationAttemptedAt: new Date().toISOString(),
+      ...(member
+        ? { blacklistNotificationAttemptedAt: new Date().toISOString() }
+        : {}),
       status: "active",
-      createdAt: new Date().toISOString(),
+      createdAt,
     });
 
-    try {
+    if (member) try {
       await member.send({
         content: "",
         embeds: [presentationEmbed(
@@ -2603,7 +3067,7 @@ async function handleBlacklistUnlocked(
           action: "Blacklist DM could not be delivered",
           status: "failed",
           actorId: interaction.user.id,
-          target: `<@${member.id}> (${member.id})`,
+          target: `<@${targetDiscordUserId}> (${targetDiscordUserId})`,
           fields: [
             {
               name: "Trello card",
@@ -2619,7 +3083,7 @@ async function handleBlacklistUnlocked(
         action: "User blacklist completed",
         status: "success",
         actorId: interaction.user.id,
-        target: `<@${member.id}> (${member.id})`,
+        target: `<@${targetDiscordUserId}> (${targetDiscordUserId})`,
         fields: [
           { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
           { name: "Roles removed", value: roleSummary },
@@ -2632,9 +3096,11 @@ async function handleBlacklistUnlocked(
     }
     await interaction.editReply({
       content: "",
-      embeds: [outcomeEmbed("Blacklist Completed", "The Roblox user was recorded and Discord role enforcement completed.", "success", [
+       embeds: [outcomeEmbed("Blacklist Completed", member
+         ? "The Roblox user was recorded and Discord role enforcement completed."
+         : "The Roblox user and exact Discord account binding were recorded; role enforcement will run if the account joins this server.", "success", [
         { name: "Roblox User", value: `${safePresentationText(robloxUser.name)} (${displayId(robloxUser.id)})`, inline: true },
-        { name: "Roles Removed", value: String(roleIds.length), inline: true },
+        { name: "Discord State", value: member ? `${roleIds.length} roles removed` : "Nonmember binding saved; enforcement will run on join", inline: true },
         { name: "Trello Card", value: `[Open card](${createdCard.url})\n${displayId(createdCard.id)}` },
       ])],
       allowedMentions: noMentions,
@@ -2645,7 +3111,7 @@ async function handleBlacklistUnlocked(
         action: "Blacklist command did not finish",
         status: "failed",
         actorId: interaction.user.id,
-        target: `<@${member.id}> (${member.id})`,
+        target: `<@${targetDiscordUserId}> (${targetDiscordUserId})`,
         fields: [
           { name: "Roblox user", value: `${robloxUser.name} | ${robloxUser.id}` },
           {
@@ -2654,7 +3120,9 @@ async function handleBlacklistUnlocked(
               ? reusedRevokedCard
                 ? "The existing Trello card was updated; synchronization will retry role enforcement."
                 : "The Trello card exists and synchronization will retry role enforcement."
-              : "No Trello blacklist card was created and no roles were changed.",
+              : approvedNonmemberSnapshot
+                ? "The exact nonmember Discord binding remains durably approved and pending provider recovery; no roles were changed."
+                : "No Trello blacklist card was created and no roles were changed.",
           },
         ],
       });
@@ -2666,7 +3134,7 @@ async function handleBlacklistUnlocked(
 export function handleBlacklist(
   interaction: ChatInputCommandInteraction,
   setup?: GuildSetup,
-  boundTarget?: { discordUserId: string; robloxUserId: number; robloxUsername: string },
+  boundTarget?: ModerationTarget,
 ): Promise<void> {
   return withGuildBlacklistLifecycleLock(interaction.guild!.id, async () => {
     if (await maintenanceActive(interaction.guild!.id)) {
@@ -2725,7 +3193,7 @@ function handleGroupBlacklist(
 async function handleRevokeUnlocked(
   interaction: ChatInputCommandInteraction,
   setup: GuildSetup,
-  boundTarget?: { discordUserId: string; robloxUserId: number; robloxUsername: string; cardId?: string },
+  boundTarget?: ModerationTarget,
 ): Promise<void> {
   const username = interaction.options.getString("username", true);
   const robloxUser = boundTarget
@@ -2733,17 +3201,34 @@ async function handleRevokeUnlocked(
     : await findRobloxUser(username);
   const guild = interaction.guild!;
   const snapshot = await findPendingOrActiveSnapshot(guild.id, robloxUser.id);
+  if (
+    boundTarget &&
+    snapshot &&
+    (snapshot.discordUserId !== boundTarget.discordUserId ||
+      snapshot.robloxUserId !== boundTarget.robloxUserId)
+  ) {
+    throw new Error("The saved Discord/Roblox binding changed after confirmation; start /revoke_blacklist again.");
+  }
   // A role snapshot is an immutable account binding. A departed member does
   // not invalidate a revocation approval: role restoration completes on join.
-  const member = snapshot
-    ? await guild.members.fetch(snapshot.discordUserId).catch(() => undefined)
-    : undefined;
-  await validateBlacklistRoleForAction(interaction.guild!, setup);
+  let member: GuildMember | undefined;
+  if (snapshot) {
+    try {
+      const fetched = await guild.members.fetch(snapshot.discordUserId);
+      member = memberResults(fetched).find((candidate) => candidate.id === snapshot.discordUserId);
+    } catch {
+      member = undefined;
+    }
+  }
+  if (member) await validateBlacklistRoleForAction(interaction.guild!, setup);
   const mappings = trelloMappingsFor(setup);
   let pending = snapshot;
   if (pending?.status !== "revocation_pending") {
-    const card = await findBlacklistCardByRobloxId(robloxUser.id, mappings);
-    if (!card || card.listType === "revoked" || (boundTarget?.cardId && card.id !== boundTarget.cardId)) {
+    const cards = await findBlacklistCardsByRobloxId(robloxUser.id, mappings);
+    const card = boundTarget?.cardId
+      ? cards.find((candidate) => candidate.id === boundTarget.cardId)
+      : cards[0];
+    if (!card || card.listType === "revoked") {
       throw new Error(
         `No active Trello blacklist card was found for ${robloxUser.name} (${robloxUser.id}).`,
       );
@@ -2840,7 +3325,7 @@ async function handleRevokeUnlocked(
 function handleRevoke(
   interaction: ChatInputCommandInteraction,
   setup: GuildSetup,
-  boundTarget?: { discordUserId: string; robloxUserId: number; robloxUsername: string; cardId?: string },
+  boundTarget?: ModerationTarget,
 ): Promise<void> {
   return withGuildBlacklistLifecycleLock(interaction.guild!.id, async () => {
     if (await maintenanceActive(interaction.guild!.id)) {
@@ -3045,11 +3530,23 @@ async function handleInteraction(
         await createConfirmation(interaction, command);
         return;
       }
+        let boundTarget: ModerationTarget | undefined;
+        if (command === "blacklist" || command === "revoke_blacklist") {
+          try {
+            boundTarget = await resolveModerationTarget(interaction, command);
+          } catch (error) {
+            if (!(error instanceof DiscordIdentityRequiredError)) throw error;
+            // Even when ordinary confirmations are disabled, an unresolved
+            // Discord account must use the same private identity continuation.
+            await createConfirmation(interaction, command);
+            return;
+          }
+        }
       await reserveDestructiveAction(interaction.guild, interaction.user.id, setup, command);
       await requireTrelloReadiness(trelloMappingsFor(setup));
-      if (command === "blacklist") await handleBlacklist(interaction, setup);
+        if (command === "blacklist") await handleBlacklist(interaction, setup, boundTarget);
       else if (command === "group_blacklist") await handleGroupBlacklist(interaction, setup);
-      else await handleRevoke(interaction, setup);
+        else await handleRevoke(interaction, setup, boundTarget);
     } else if (interaction.commandName === "security_status") {
       const state = await getSecurityState(interaction.guild.id);
       const settings = securitySettingsFor(setup);
@@ -3340,6 +3837,10 @@ async function connectDiscord(): Promise<void> {
           await handleMaintenanceConfirmation(interaction);
           return;
         }
+        if (interaction.customId.startsWith("identity-prompt:")) {
+          await handleIdentityPromptButton(interaction);
+          return;
+        }
         const [, confirmationId] = interaction.customId.split(/:(.+)/);
         const existingConfirmation = confirmationId ? confirmations.get(confirmationId) : undefined;
         // The command form of emergency unlock remains usable in maintenance;
@@ -3385,6 +3886,10 @@ async function connectDiscord(): Promise<void> {
       })().catch((error) => replyInteractionError(interaction, error));
     } else if (interaction.isModalSubmit()) {
       void (async () => {
+        if (interaction.customId.startsWith("identity-modal:")) {
+          await handleIdentityPromptModal(interaction);
+          return;
+        }
         if (interaction.customId.startsWith("settings-modal:")) {
           await handleSettingsModal(interaction);
           return;

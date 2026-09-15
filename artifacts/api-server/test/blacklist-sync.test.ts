@@ -23,10 +23,12 @@ process.env.TRELLO_LIST_GROUP = "Group Blacklist";
 
 const {
   enforceBlacklistForJoinedMember,
+  finishApprovedRevocation,
+  processApprovedRevocation,
   getBlacklistSyncStatus,
   synchronizeBlacklists,
 } = await import("../src/bot/blacklist-sync.ts");
-const { findActiveSnapshot } = await import("../src/bot/role-store.ts");
+const { findActiveSnapshot, findRoleSnapshot, saveRoleSnapshot } = await import("../src/bot/role-store.ts");
 
 const listIds = {
   appealable: "list-appealable",
@@ -282,6 +284,301 @@ test("does not enforce a manual cached Trello record when a member joins", async
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("enforces a command-approved nonmember binding on join without inventing saved roles", async () => {
+  const fixture = createDiscordFixture("approved-empty-join-guild", false);
+  await saveRoleSnapshot({
+    key: `${fixture.guild.id}:808`,
+    guildId: fixture.guild.id,
+    discordUserId: fixture.member.id,
+    robloxUserId: 808,
+    robloxUsername: "Builder",
+    roleIds: [],
+    cardId: "approved-empty-card",
+    cardUrl: "https://trello.test/approved-empty-card",
+    source: "command",
+    status: "active",
+    createdAt: new Date().toISOString(),
+  });
+
+  await enforceBlacklistForJoinedMember(
+    fixture.member as never,
+    setupFor(fixture.guild.id),
+  );
+
+  assert.deepEqual(fixture.removed, [["role-1", "role-2"]]);
+  assert.deepEqual(fixture.restored, []);
+  assert.equal((await findActiveSnapshot(fixture.guild.id, 808))?.roleIds.length, 0);
+});
+
+test("recovers a cardless approved join binding before promotion and keeps it pending when recovery is ambiguous", async () => {
+  const fixture = createDiscordFixture("cardless-recovery-guild", false);
+  const snapshot = {
+    key: `${fixture.guild.id}:809`,
+    guildId: fixture.guild.id,
+    discordUserId: fixture.member.id,
+    robloxUserId: 809,
+    robloxUsername: "RecoveryBuilder",
+    roleIds: [],
+    blacklistType: "permanent",
+    blacklistReason: "cardless provider recovery",
+    source: "command" as const,
+    status: "pending" as const,
+    createdAt: new Date().toISOString(),
+  };
+  await saveRoleSnapshot(snapshot);
+  let cards: Array<Record<string, unknown>> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const pathname = requestPath(input);
+    const method = init?.method ?? "GET";
+    if (pathname.endsWith("/lists")) return jsonResponse(configuredLists());
+    if (pathname === "/1/cards" && method === "POST") {
+      return jsonResponse({
+        id: "recovered-card",
+        name: "RecoveryBuilder | 809",
+        desc: "- cardless provider recovery",
+        idList: listIds.permanent,
+        idLabels: [],
+        url: "https://trello.test/recovered-card",
+        dateLastActivity: "2026-09-14T15:00:00.000Z",
+        closed: false,
+      });
+    }
+    if (pathname.endsWith("/idLabels")) return jsonResponse({});
+    if (pathname.endsWith("/labels")) {
+      return jsonResponse([
+        { id: "label-blacklisted", name: "blacklisted" },
+        { id: "label-permanent", name: "permanent" },
+      ]);
+    }
+    if (pathname.endsWith("/cards")) return jsonResponse(cards);
+    throw new Error(`Unexpected request: ${pathname}`);
+  };
+  try {
+    await enforceBlacklistForJoinedMember(
+      fixture.member as never,
+      setupFor(fixture.guild.id),
+    );
+    const recovered = await findActiveSnapshot(fixture.guild.id, 809);
+    const recoveredSnapshot = await findRoleSnapshot(fixture.guild.id, 809);
+    assert.equal(recoveredSnapshot?.status, "active");
+    assert.equal(recovered?.cardId, "recovered-card");
+    assert.deepEqual(fixture.removed, [["role-1", "role-2"]]);
+
+    const ambiguous = {
+      ...snapshot,
+      key: `${fixture.guild.id}:810`,
+      robloxUserId: 810,
+      robloxUsername: "AmbiguousBuilder",
+    };
+    await saveRoleSnapshot(ambiguous);
+    cards = [
+      trelloCard({
+        id: "ambiguous-a",
+        userId: 810,
+        username: "AmbiguousBuilder",
+        listId: listIds.permanent,
+        updatedAt: "2026-09-14T16:00:00.000Z",
+      }),
+      trelloCard({
+        id: "ambiguous-b",
+        userId: 810,
+        username: "AmbiguousBuilder",
+        listId: listIds.permanent,
+        updatedAt: "2026-09-14T17:00:00.000Z",
+      }),
+    ];
+    await enforceBlacklistForJoinedMember(
+      fixture.member as never,
+      setupFor(fixture.guild.id),
+    );
+    const remainsApproved = await findActiveSnapshot(fixture.guild.id, 810);
+    assert.equal(remainsApproved, undefined, "ambiguous cardless approval must not be promoted");
+    const persisted = JSON.parse(await readFile(process.env.ROLE_SNAPSHOT_FILE!, "utf8")) as {
+      snapshots: Array<{ key: string; status: string; cardId?: string }>;
+    };
+    assert.deepEqual(
+      persisted.snapshots.find((candidate) => candidate.key === ambiguous.key),
+      { ...ambiguous },
+      "ambiguous approved snapshot must remain durable and untouched",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("provider failure during cardless join recovery still enforces the approved binding", async () => {
+  const fixture = createDiscordFixture("cardless-provider-failure-guild", false);
+  const snapshot = {
+    key: `${fixture.guild.id}:814`,
+    guildId: fixture.guild.id,
+    discordUserId: fixture.member.id,
+    robloxUserId: 814,
+    robloxUsername: "ProviderFailureJoinBuilder",
+    roleIds: [],
+    blacklistType: "appealable",
+    blacklistReason: "retry provider recovery",
+    source: "command" as const,
+    status: "pending" as const,
+    createdAt: new Date().toISOString(),
+  };
+  await saveRoleSnapshot(snapshot);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({ error: "provider unavailable" }, 503);
+  try {
+    await enforceBlacklistForJoinedMember(
+      fixture.member as never,
+      setupFor(fixture.guild.id),
+    );
+    assert.deepEqual(fixture.removed, [["role-1", "role-2"]]);
+    assert.equal((await findRoleSnapshot(fixture.guild.id, 814))?.status, "pending");
+    assert.equal((await findRoleSnapshot(fixture.guild.id, 814))?.cardId, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("scheduled sync recovers an absent cardless nonmember approval without duplicating Trello", async () => {
+  const fixture = createDiscordFixture("scheduled-cardless-recovery-guild", false);
+  const snapshot = {
+    key: `${fixture.guild.id}:815`,
+    guildId: fixture.guild.id,
+    discordUserId: "absent-discord-account",
+    robloxUserId: 815,
+    robloxUsername: "ScheduledRecoveryBuilder",
+    roleIds: [],
+    blacklistType: "permanent",
+    blacklistReason: "scheduled recovery",
+    source: "command" as const,
+    status: "pending" as const,
+    createdAt: new Date().toISOString(),
+  };
+  await saveRoleSnapshot(snapshot);
+  let providerAvailable = false;
+  let createCalls = 0;
+  let cards: Array<Record<string, unknown>> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const pathname = requestPath(input);
+    const method = init?.method ?? "GET";
+    if (pathname.endsWith("/lists")) return jsonResponse(configuredLists());
+    if (pathname === "/1/cards" && method === "POST") {
+      createCalls += 1;
+      if (!providerAvailable) return jsonResponse({ error: "Trello unavailable" }, 503);
+      return jsonResponse({
+        id: "scheduled-recovered-card",
+        name: "ScheduledRecoveryBuilder | 815",
+        desc: "- scheduled recovery",
+        idList: listIds.permanent,
+        idLabels: [],
+        url: "https://trello.test/scheduled-recovered-card",
+        dateLastActivity: "2026-09-14T18:00:00.000Z",
+        closed: false,
+      });
+    }
+    if (pathname.endsWith("/idLabels")) return jsonResponse({});
+    if (pathname.endsWith("/labels")) {
+      return jsonResponse([
+        { id: "label-blacklisted", name: "blacklisted" },
+        { id: "label-permanent", name: "permanent" },
+      ]);
+    }
+    if (pathname.endsWith("/cards")) return jsonResponse(cards);
+    throw new Error(`Unexpected request: ${pathname}`);
+  };
+  try {
+    const failed = await synchronizeBlacklists(
+      fixture.guild as never,
+      setupFor(fixture.guild.id),
+      "poll",
+    );
+    assert.equal(failed.state, "partial");
+    assert.equal((await findRoleSnapshot(fixture.guild.id, 815))?.status, "pending");
+    assert.equal(createCalls, 1);
+
+    providerAvailable = true;
+    const recovered = await synchronizeBlacklists(
+      fixture.guild as never,
+      setupFor(fixture.guild.id),
+      "poll",
+    );
+    assert.equal(recovered.state, "successful");
+    assert.equal((await findRoleSnapshot(fixture.guild.id, 815))?.status, "active");
+    assert.equal((await findRoleSnapshot(fixture.guild.id, 815))?.cardId, "scheduled-recovered-card");
+    assert.equal(createCalls, 2);
+
+    const stable = await synchronizeBlacklists(
+      fixture.guild as never,
+      setupFor(fixture.guild.id),
+      "poll",
+    );
+    assert.equal(stable.state, "successful");
+    assert.equal(createCalls, 2, "an active recovered approval must not create a duplicate card");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("restores the union only after the last same-Discord restriction, including absent-member ordering", async () => {
+  const fixture = createDiscordFixture("multi-restriction-guild", false);
+  const now = new Date().toISOString();
+  const first = {
+    key: `${fixture.guild.id}:811`,
+    guildId: fixture.guild.id,
+    discordUserId: fixture.member.id,
+    robloxUserId: 811,
+    robloxUsername: "FirstBuilder",
+    roleIds: ["role-1", "role-2"],
+    cardId: "first-card",
+    cardUrl: "https://trello.test/first-card",
+    source: "command" as const,
+    status: "revocation_pending" as const,
+    revocationCardMovedAt: now,
+    createdAt: now,
+  };
+  const second = {
+    ...first,
+    key: `${fixture.guild.id}:812`,
+    robloxUserId: 812,
+    robloxUsername: "SecondBuilder",
+    cardId: "second-card",
+    status: "active" as const,
+    revocationCardMovedAt: undefined,
+  };
+  await saveRoleSnapshot(first);
+  await saveRoleSnapshot(second);
+
+  const setup = setupFor(fixture.guild.id);
+  const firstResult = await processApprovedRevocation(
+    fixture.guild as never,
+    setup,
+    first,
+  );
+  assert.equal(firstResult.completed, true);
+  assert.deepEqual(fixture.restored, []);
+  assert.deepEqual(fixture.removed, []);
+  assert.equal((await findActiveSnapshot(fixture.guild.id, 811)), undefined);
+
+  const secondPending = { ...second, status: "revocation_pending" as const, revocationCardMovedAt: now };
+  await saveRoleSnapshot(secondPending);
+  const absentResult = await processApprovedRevocation(
+    fixture.guild as never,
+    setup,
+    secondPending,
+  );
+  assert.equal(absentResult.completed, false);
+  assert.equal((await findActiveSnapshot(fixture.guild.id, 812)), undefined);
+
+  fixture.member.roles.cache.clear();
+  await enforceBlacklistForJoinedMember(fixture.member as never, setup);
+  assert.deepEqual(fixture.restored, [["role-1", "role-2"]]);
+  assert.equal((await findActiveSnapshot(fixture.guild.id, 812)), undefined);
+  const persisted = JSON.parse(await readFile(process.env.ROLE_SNAPSHOT_FILE!, "utf8")) as {
+    snapshots: Array<{ key: string; status: string }>;
+  };
+  assert.equal(persisted.snapshots.find((candidate) => candidate.key === second.key)?.status, "revoked");
 });
 
 test("reports unavailable Roblox cards and Trello scans without leaking credentials", async () => {

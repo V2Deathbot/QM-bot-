@@ -43,6 +43,42 @@
       "revocationCardMovedAt": "2026-09-15T00:00:15.529Z",
       "revokedAt": "2026-09-15T00:00:15.704Z",
       "revocationNotificationAttemptedAt": "2026-09-15T00:00:15.704Z"
+    },
+    {
+      "key": "1114860005334716422:1370330049",
+      "guildId": "1114860005334716422",
+      "discordUserId": "937942479980859412",
+      "robloxUserId": 1370330049,
+      "robloxUsername": "V2Deathbot",
+      "roleIds": [
+        "1548958021160411216"
+      ],
+      "cardId": "6aa8911e26f644a42208a7e0",
+      "cardUrl": "https://trello.com/c/NJKVvohJ/7-v2deathbot-1370330049",
+      "blacklistType": "conditional",
+      "blacklistReason": "yes",
+      "source": "command",
+      "blacklistNotificationAttemptedAt": "2026-09-15T00:28:16.261Z",
+      "status": "active",
+      "createdAt": "2026-09-15T00:28:16.261Z"
+    },
+    {
+      "key": "1114860005334716422:18906408",
+      "guildId": "1114860005334716422",
+      "discordUserId": "1170780243754242199",
+      "robloxUserId": 18906408,
+      "robloxUsername": "bloxx99",
+      "roleIds": [
+        "1548958021160411216"
+      ],
+      "cardId": "6aa891e914f65aea9bae4418",
+      "cardUrl": "https://trello.com/c/cfwDxlMf/8-bloxx99-18906408",
+      "blacklistType": "permanent",
+      "blacklistReason": "Uploaded his own uniform",
+      "source": "command",
+      "blacklistNotificationAttemptedAt": "2026-09-15T00:31:41.470Z",
+      "status": "active",
+      "createdAt": "2026-09-15T00:31:41.470Z"
     }
   ],
   "notes": [
