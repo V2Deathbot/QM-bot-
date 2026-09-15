@@ -254,6 +254,27 @@ export class UniformDiscordDeliveryError extends Error {
   }
 }
 
+export type UniformDeliveryRetryControl = "enabled" | "disabled" | "none";
+
+/**
+ * A delivery interaction has already created a durable submission record. Keep
+ * that record's ID attached to failures so the interaction router can repair
+ * the same ephemeral response instead of replacing it with a generic error.
+ * The retry control is deliberately explicit: authorization failures never
+ * return a usable retry control, while ambiguous outbox states return only a
+ * disabled control and a manual-verification explanation.
+ */
+export class UniformDeliveryRecoveryError extends Error {
+  constructor(
+    readonly submissionId: string,
+    message: string,
+    readonly retryControl: UniformDeliveryRetryControl,
+  ) {
+    super(message);
+    this.name = "UniformDeliveryRecoveryError";
+  }
+}
+
 function discordDeliveryFailure(stage: DiscordDeliveryStage, error: unknown): UniformDiscordDeliveryError {
   const { status, code } = discordFailureDetails(error);
   // Do not attach `error`: Discord.js error objects can include the request
@@ -869,9 +890,10 @@ function customerDeliveryButtons(record: UniformDeliveryRecord, disabled = false
     new ButtonBuilder().setCustomId(`uniform:assist:${record.submissionId}`).setLabel("Request Assistance").setStyle(ButtonStyle.Danger).setDisabled(disabled),
   )];
 }
-function deliveryRetryComponents(record: UniformDeliveryRecord) {
+function deliveryRetryComponents(record: Pick<UniformDeliveryRecord, "submissionId"> | string, disabled = false) {
+  const submissionId = typeof record === "string" ? record : record.submissionId;
   return [new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`uniform:retry:${record.submissionId}`).setLabel("Retry Delivery").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`uniform:retry:${submissionId}`).setLabel("Retry Delivery").setStyle(ButtonStyle.Primary).setDisabled(disabled),
   )];
 }
 
@@ -882,6 +904,61 @@ function hasRetryableDelivery(record: UniformDeliveryRecord | undefined): boolea
     (record.logNoticeState === "pending" || record.customerDeliveryState === "pending") &&
     record.logNoticeState !== "unresolved" &&
     record.customerDeliveryState !== "unresolved",
+  );
+}
+
+/**
+ * Sheet writes use a durable reservation keyed by submission ID, so a
+ * prepared record may safely re-check an uncertain write. Once either
+ * Discord operation is unresolved, however, no automatic replay is safe.
+ */
+function canRetryDelivery(record: UniformDeliveryRecord | undefined): boolean {
+  return Boolean(
+    record &&
+    (record.sheetState === "prepared" || record.sheetState === "saved") &&
+    record.logNoticeState !== "unresolved" &&
+    record.customerDeliveryState !== "unresolved",
+  );
+}
+
+function retryControlFor(record: UniformDeliveryRecord | undefined): UniformDeliveryRetryControl {
+  if (!record) return "none";
+  return canRetryDelivery(record) ? "enabled" : "disabled";
+}
+
+function recoveryPayload(
+  submissionId: string,
+  title: string,
+  description: string,
+  tone: "info" | "success" | "warning" | "error",
+  retryControl: UniformDeliveryRetryControl,
+) {
+  const manualVerification = retryControl === "disabled"
+    ? " Retry Delivery is disabled; manual verification is required before it can be enabled. No duplicate message will be sent."
+    : "";
+  return {
+    content: "",
+    embeds: [presentationEmbed(
+      title,
+      `${description}${manualVerification}`,
+      tone,
+      undefined,
+      [{ name: "Submission ID", value: displayId(submissionId), inline: true }],
+    )],
+    components: retryControl === "none"
+      ? []
+      : deliveryRetryComponents(submissionId, retryControl === "disabled"),
+    allowedMentions: noMentions,
+  };
+}
+
+export function uniformDeliveryRecoveryResponse(error: UniformDeliveryRecoveryError) {
+  return recoveryPayload(
+    error.submissionId,
+    "Uniform Delivery Recovery Error",
+    error.message,
+    "warning",
+    error.retryControl,
   );
 }
 
@@ -1020,13 +1097,13 @@ export async function handleUniformSubmitButton(
         record = await updateUniformDelivery(record.submissionId, (item) => { item.sheetState = "saved"; });
       } catch {
         await interaction.editReply({
-          embeds: [presentationEmbed(
+          ...recoveryPayload(
+            record.submissionId,
             "Submission Pending",
             "The original Sheets target and rows are durably preserved, but the write outcome was not confirmed. Do not run the slash command again; Retry Delivery uses only that original target.",
             "warning",
-          )],
-          components: deliveryRetryComponents(record),
-          allowedMentions: noMentions,
+            retryControlFor(record),
+          ),
         });
         return;
       }
@@ -1036,22 +1113,20 @@ export async function handleUniformSubmitButton(
       delivered = await sendPendingDelivery(record, interaction.guild!);
     } catch (error) {
       const current = await getUniformDelivery(record.submissionId);
-      await interaction.editReply({
-        embeds: [presentationEmbed(
-          hasRetryableDelivery(current)
-            ? "Saved, Delivery Needs Retry"
-            : current?.sheetState === "saved" ? "Saved, Delivery Unresolved" : "Submission Outcome Unresolved",
-          current?.sheetState === "saved" && error instanceof UniformDiscordDeliveryError
-            ? `The uniform rows are saved, but ${error.message} The original rows will not be written again.`
-            : current?.sheetState === "saved"
-            ? "The uniform rows are saved, but a Discord delivery outcome could not be confirmed. No duplicate message will be sent automatically; an administrator must verify the recorded channel."
-            : "The original Sheets target is durably reserved, but its write outcome could not be confirmed. Do not run the slash command again; an administrator must verify the original sheet target.",
-          "warning",
-        )],
-        components: hasRetryableDelivery(current)
-          ? deliveryRetryComponents(current!) : [],
-        allowedMentions: noMentions,
-      });
+      const retryControl = retryControlFor(current);
+      await interaction.editReply(recoveryPayload(
+        record.submissionId,
+        hasRetryableDelivery(current)
+          ? "Saved, Delivery Needs Retry"
+          : current?.sheetState === "saved" ? "Saved, Delivery Unresolved" : "Submission Outcome Unresolved",
+        current?.sheetState === "saved" && error instanceof UniformDiscordDeliveryError
+          ? `The uniform rows are saved, but ${error.message} The original rows will not be written again.`
+          : current?.sheetState === "saved"
+          ? "The uniform rows are saved, but a Discord delivery outcome could not be confirmed. No duplicate message will be sent automatically; an administrator must verify the recorded channel."
+          : "The original Sheets target is durably reserved, but its write outcome could not be confirmed. Do not run the slash command again; an administrator must verify the original sheet target.",
+        "warning",
+        retryControl,
+      ));
       return;
     }
     await interaction.editReply({
@@ -1079,36 +1154,56 @@ export async function handleUniformRetryButton(
     throw new Error("This recorded delivery is unavailable.");
   }
   await interaction.deferUpdate();
-  if (await maintenanceIsActive(record.guildId)) throw new Error("Bot maintenance mode is active. Commands are temporarily unavailable.");
-  const latest = await getGuildSetup(record.guildId);
-  if (!latest) throw new Error("This server no longer has a valid bot setup.");
-  const settings = uniformSettingsFor(latest);
-  if (record.actorId === interaction.user.id) {
-    await requireUniformSubmitter(interaction.guild!, record.actorId, settings);
-  } else {
-    const member = await currentMember(interaction.guild!, interaction.user.id);
-    if (interaction.guild!.ownerId !== member.id && !member.permissions.has(PermissionFlagsBits.Administrator)) {
-      throw new Error("Only the original authorized submitter or a current Administrator can retry this recorded delivery.");
+  let authorizationVerified = false;
+  try {
+    if (await maintenanceIsActive(record.guildId)) {
+      throw new Error("Bot maintenance mode is active. Commands are temporarily unavailable.");
     }
+    const latest = await getGuildSetup(record.guildId);
+    if (!latest) throw new Error("This server no longer has a valid bot setup.");
+    const settings = uniformSettingsFor(latest);
+    if (record.actorId === interaction.user.id) {
+      await requireUniformSubmitter(interaction.guild!, record.actorId, settings);
+    } else {
+      const member = await currentMember(interaction.guild!, interaction.user.id);
+      if (interaction.guild!.ownerId !== member.id && !member.permissions.has(PermissionFlagsBits.Administrator)) {
+        throw new Error("Only the original authorized submitter or a current Administrator can retry this recorded delivery.");
+      }
+    }
+    // Re-check authorization on every click. A saved record never grants
+    // access by itself, and the guild binding above is checked before any
+    // provider work.
+    authorizationVerified = true;
+    await fetchedMember(interaction.guild!, record.customerId);
+    if (record.command === "log") await fetchedMember(interaction.guild!, record.seqmId);
+    await requireUniformChannel(interaction.guild!, record.uploadLogChannelId, record.command);
+    await requireUniformChannel(interaction.guild!, record.destinationChannelId, record.command);
+    if (record.sheetState !== "saved") {
+      await appendUniformRows({ config: record.spreadsheet, logKind: record.command, rows: record.rows, submissionId: record.submissionId });
+      await updateUniformDelivery(record.submissionId, (item) => { item.sheetState = "saved"; });
+    }
+    const current = await getUniformDelivery(submissionId);
+    if (!current || current.logNoticeState === "unresolved" || current.customerDeliveryState === "unresolved") {
+      throw new Error("This delivery outcome is unresolved and will not be replayed automatically.");
+    }
+    const delivered = await sendPendingDelivery(current, interaction.guild!);
+    await interaction.editReply({
+      embeds: [presentationEmbed("Uniform Delivery Completed", `The existing saved submission was delivered to <#${delivered.destinationChannelId}> without writing Sheets rows again.`, "success", undefined, [
+        { name: "Submission ID", value: displayId(delivered.submissionId), inline: true },
+      ])],
+      components: [],
+      allowedMentions: noMentions,
+    });
+  } catch (error) {
+    const current = await getUniformDelivery(submissionId).catch(() => record);
+    const retryControl = authorizationVerified ? retryControlFor(current) : "none";
+    if (error instanceof UniformDeliveryRecoveryError) throw error;
+    throw new UniformDeliveryRecoveryError(
+      submissionId,
+      error instanceof Error ? error.message : "The saved delivery could not be retried.",
+      retryControl,
+    );
   }
-  await fetchedMember(interaction.guild!, record.customerId);
-  if (record.command === "log") await fetchedMember(interaction.guild!, record.seqmId);
-  await requireUniformChannel(interaction.guild!, record.uploadLogChannelId, record.command);
-  await requireUniformChannel(interaction.guild!, record.destinationChannelId, record.command);
-  if (record.sheetState !== "saved") {
-    await appendUniformRows({ config: record.spreadsheet, logKind: record.command, rows: record.rows, submissionId: record.submissionId });
-    await updateUniformDelivery(record.submissionId, (item) => { item.sheetState = "saved"; });
-  }
-  const current = await getUniformDelivery(submissionId);
-  if (!current || current.logNoticeState === "unresolved" || current.customerDeliveryState === "unresolved") {
-    throw new Error("This delivery outcome is unresolved and will not be replayed automatically.");
-  }
-  const delivered = await sendPendingDelivery(current, interaction.guild!);
-  await interaction.editReply({
-    embeds: [presentationEmbed("Uniform Delivery Completed", `The existing saved submission was delivered to <#${delivered.destinationChannelId}> without writing Sheets rows again.`, "success")],
-    components: [],
-    allowedMentions: noMentions,
-  });
 }
 
 export async function handleUniformCancelButton(interaction: ButtonInteraction): Promise<void> {
@@ -1627,18 +1722,26 @@ export async function handleUniformRecoveryModal(
   if (!/^\d{17,25}$/.test(submissionId)) {
     throw new Error("The saved delivery submission ID must contain 17 to 25 digits.");
   }
-  const recovered = await recoverLegacyNonceRejectedDelivery(setup.guildId, submissionId);
-  await interaction.reply({
-    content: "",
-    embeds: [presentationEmbed(
-      "Delivery Recovery Ready",
-      "The confirmed legacy nonce rejection was reset to pending. Retry Delivery will use the original saved delivery and will not write Google Sheets rows again.",
-      "warning",
-    )],
-    components: deliveryRetryComponents(recovered),
-    allowedMentions: noMentions,
-    ephemeral: true,
-  });
+  try {
+    const recovered = await recoverLegacyNonceRejectedDelivery(setup.guildId, submissionId);
+    await interaction.reply({
+      ...recoveryPayload(
+        recovered.submissionId,
+        "Delivery Recovery Ready",
+        "The confirmed legacy nonce rejection was reset to pending. Retry Delivery will use the original saved delivery and will not write Google Sheets rows again.",
+        "warning",
+        retryControlFor(recovered),
+      ),
+      ephemeral: true,
+    });
+  } catch (error) {
+    const record = await getUniformDelivery(submissionId).catch(() => undefined);
+    throw new UniformDeliveryRecoveryError(
+      submissionId,
+      error instanceof Error ? error.message : "The saved delivery could not be recovered.",
+      retryControlFor(record),
+    );
+  }
 }
 
 export async function handleUniformSpreadsheetSettingsModal(

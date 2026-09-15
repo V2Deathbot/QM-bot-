@@ -34,6 +34,78 @@
       "state": "written",
       "notified": true,
       "createdAt": "2026-09-15T04:08:37.433Z"
+    },
+    {
+      "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549283213653053481",
+      "destination": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E",
+      "submissionId": "1549283213653053481",
+      "targetRange": "A4:E4",
+      "values": [
+        [
+          "26138z",
+          "26138z",
+          "26138z",
+          "26138z",
+          "https://www.roblox.com/catalog/558755898"
+        ]
+      ],
+      "state": "written",
+      "notified": true,
+      "createdAt": "2026-09-15T04:58:34.561Z"
+    },
+    {
+      "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549283945688993903",
+      "destination": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E",
+      "submissionId": "1549283945688993903",
+      "targetRange": "A5:E5",
+      "values": [
+        [
+          "26138z",
+          "26138z",
+          "26138z",
+          "V2Deathbot",
+          "https://www.roblox.com/catalog/69696696"
+        ]
+      ],
+      "state": "written",
+      "notified": true,
+      "createdAt": "2026-09-15T05:01:30.851Z"
+    },
+    {
+      "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549284276166721546",
+      "destination": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E",
+      "submissionId": "1549284276166721546",
+      "targetRange": "A6:E6",
+      "values": [
+        [
+          "26138z",
+          "26138z",
+          "26138z",
+          "V2Deathbot",
+          "https://www.roblox.com/catalog/432345654"
+        ]
+      ],
+      "state": "written",
+      "notified": true,
+      "createdAt": "2026-09-15T05:02:50.995Z"
+    },
+    {
+      "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549284883770245272",
+      "destination": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E",
+      "submissionId": "1549284883770245272",
+      "targetRange": "A7:E7",
+      "values": [
+        [
+          "26138z",
+          "26138z",
+          "26138z",
+          "V2Deathbot",
+          "https://www.roblox.com/catalog/696969"
+        ]
+      ],
+      "state": "written",
+      "notified": true,
+      "createdAt": "2026-09-15T05:05:13.345Z"
     }
   ]
 }

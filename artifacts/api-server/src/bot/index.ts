@@ -108,8 +108,10 @@ import {
   handleUniformSubmitButton,
   handleUniformRetryButton,
   handleUniformUserSelection,
+  UniformDeliveryRecoveryError,
   UniformNotificationError,
   renderUniformSettings,
+  uniformDeliveryRecoveryResponse,
   uniformCommandNames,
   uniformCommands,
 } from "./uniforms";
@@ -3862,9 +3864,36 @@ async function replyInteractionError(
   error: unknown,
 ): Promise<void> {
   const message = error instanceof Error ? error.message : "The interaction failed unexpectedly.";
-  const payload = errorResponse(message, "Interaction Error");
+  let payload: ReturnType<typeof errorResponse> | ReturnType<typeof uniformDeliveryRecoveryResponse>;
+  if (error instanceof UniformDeliveryRecoveryError) {
+    payload = uniformDeliveryRecoveryResponse(error);
+  } else {
+    // A recovery modal is authorized by the surrounding settings session
+    // before its handler runs. If that authorization fails, expose only the
+    // submitted ID and never manufacture a retry control for the caller.
+    let recoverySubmissionId: string | undefined;
+    if (interaction.customId.startsWith("setup-modal:uniforms-recover") && "fields" in interaction) {
+      try {
+        const candidate = interaction.fields.getTextInputValue("submission_id").trim();
+        if (/^\d{17,25}$/.test(candidate)) recoverySubmissionId = candidate;
+      } catch {
+        recoverySubmissionId = undefined;
+      }
+    }
+    payload = recoverySubmissionId
+      ? uniformDeliveryRecoveryResponse(new UniformDeliveryRecoveryError(
+        recoverySubmissionId,
+        message,
+        "none",
+      ))
+      : errorResponse(message, "Interaction Error");
+  }
   if (interaction.deferred || interaction.replied) {
-    await interaction.followUp({ ...payload, ephemeral: true }).catch(() => undefined);
+    if (error instanceof UniformDeliveryRecoveryError && typeof interaction.editReply === "function") {
+      await interaction.editReply(payload).catch(() => undefined);
+    } else {
+      await interaction.followUp({ ...payload, ephemeral: true }).catch(() => undefined);
+    }
   } else {
     await interaction.reply({ ...payload, ephemeral: true }).catch(() => undefined);
   }

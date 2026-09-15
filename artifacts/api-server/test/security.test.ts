@@ -998,6 +998,8 @@ test("limits legacy uniform delivery recovery to its scoped Administrator settin
 
   await dispatchRaw(modal("admin-a", shown.customId, { submission_id: submissionId }));
   assert.match(replies.at(-1) ?? "", /expired|another administrator/i);
+  assert.match(replies.at(-1) ?? "", new RegExp("Submission ID: `" + submissionId + "`"));
+  assert.doesNotMatch(replies.at(-1) ?? "", /Retry Delivery/);
   assert.equal((await getUniformDelivery(submissionId))?.logNoticeState, "unresolved");
 
   await dispatchRaw(modal("setup-owner", shown.customId, { submission_id: submissionId }));
@@ -1007,6 +1009,8 @@ test("limits legacy uniform delivery recovery to its scoped Administrator settin
   assert.equal(recovered?.customerDeliveryState, "pending");
   assert.equal(recovered?.legacyNonceRejected, undefined);
   assert.equal(spreadsheetRows.get("Uniform Logs")?.length, rowCount);
+  assert.match(replies.at(-1) ?? "", new RegExp("Submission ID: `" + submissionId + "`"));
+  assert.match(replies.at(-1) ?? "", /Retry Delivery/);
 
   await dispatchRaw(modal("setup-owner", shown.customId, { submission_id: submissionId }));
   assert.match(replies.at(-1) ?? "", /not eligible/i);

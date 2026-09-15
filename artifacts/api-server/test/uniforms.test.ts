@@ -15,7 +15,7 @@ const {
   handleUniformRetryButton, handleUniformSubmitButton, handleUniformUserSelection, parseUniformAssetInput,
   resetUniformSubmissionStateForTests, saveUniformSettings,
   saveUniformSpreadsheetSettings, uniformCommands, uniformSheetRows,
-  validateUniformSettings,
+  UniformDeliveryRecoveryError, uniformDeliveryRecoveryResponse, validateUniformSettings,
 } = await import("../src/bot/uniforms.ts");
 const { setGoogleSheetsProxyForTests, resetGoogleSheetsProxyForTests } =
   await import("../src/bot/google-sheets.ts");
@@ -333,14 +333,72 @@ test("keeps definitive Discord 400 and 403 delivery failures pending with Retry 
     assert.equal(saved?.logNoticeState, "pending");
     assert.equal(saved?.customerDeliveryState, "pending");
     const reply = result.edits.at(-1) as {
-      embeds: Array<{ data: { description: string } }>;
+      embeds: Array<{ data: { description: string; fields: Array<{ name: string; value: string; inline?: boolean }> } }>;
       components: unknown[];
     };
     assert.match(reply.embeds[0]!.data.description, new RegExp(`HTTP ${status}`));
     assert.match(reply.embeds[0]!.data.description, /Retry Delivery/);
+    assert.deepEqual(reply.embeds[0]!.data.fields, [
+      { name: "Submission ID", value: `\`${id}\``, inline: true },
+    ]);
+    assert.equal(componentId(reply, 0), `uniform:retry:${id}`);
     assert.equal(reply.components.length, 1);
     sendFailure = undefined;
   }
+});
+
+test("retries a saved definitive Discord failure by submission ID without rewriting Sheets rows", async () => {
+  const id = "400987654321098765";
+  sendFailure = Object.assign(new Error("Discord rejected delivery"), { status: 400, code: 50035 });
+  await prepareAndSubmit("log", {
+    qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer", shirtid1: "13",
+  }, id);
+  const before = rows.get("Uniform Logs")?.length;
+  sendFailure = undefined;
+  const edits: unknown[] = [];
+  await handleUniformRetryButton({
+    customId: `uniform:retry:${id}`, guild, guildId: guild.id, user: { id: "submitter" },
+    deferUpdate: async () => undefined, editReply: async (payload: unknown) => { edits.push(payload); },
+  } as never, async () => false);
+  const saved = await getUniformDelivery(id);
+  assert.equal(saved?.logNoticeState, "sent");
+  assert.equal(saved?.customerDeliveryState, "sent");
+  assert.equal(rows.get("Uniform Logs")?.length, before);
+  assert.equal(sends.length, 2);
+  assert.match(JSON.stringify(edits[0]), new RegExp(`Submission ID.*${id}`));
+});
+
+test("renders an unresolved recovery with its ID and a disabled no-duplicate retry control", async () => {
+  const id = "unresolved-recovery";
+  await saveUniformDelivery({
+    submissionId: id, guildId: guild.id, command: "log", actorId: "submitter",
+    customerId: "customer-discord", seqmId: "seqm-discord", destinationChannelId: "customer-channel",
+    uploadLogChannelId: "log", spreadsheet: setup.uniforms!.spreadsheet!, rows: [["unchanged"]],
+    sheetState: "saved", customerName: "Customer", assets: [{ id: 15, url: "https://www.roblox.com/catalog/15" }],
+    logNoticeState: "unresolved", customerDeliveryState: "pending", createdAt: new Date().toISOString(),
+  });
+  let thrown: unknown;
+  await assert.rejects(
+    handleUniformRetryButton({
+      customId: `uniform:retry:${id}`, guild, guildId: guild.id, user: { id: "submitter" },
+      deferUpdate: async () => undefined, editReply: async () => undefined,
+    } as never, async () => false).catch((error) => {
+      thrown = error;
+      throw error;
+    }),
+    /unresolved/i,
+  );
+  assert.ok(thrown instanceof UniformDeliveryRecoveryError);
+  const recovery = uniformDeliveryRecoveryResponse(thrown as UniformDeliveryRecoveryError) as {
+    embeds: Array<{ data: { description: string; fields: Array<{ name: string; value: string }> } }>;
+    components: Array<{ components: Array<{ data: { custom_id: string; disabled?: boolean } }> }>;
+  };
+  assert.equal(recovery.embeds[0]!.data.fields[0]!.value, `\`${id}\``);
+  assert.match(recovery.embeds[0]!.data.description, /manual verification|required/i);
+  assert.equal(recovery.components[0]!.components[0]!.data.custom_id, `uniform:retry:${id}`);
+  assert.equal(recovery.components[0]!.components[0]!.data.disabled, true);
+  assert.equal(sends.length, 0);
+  assert.equal(rows.get("Uniform Logs"), undefined);
 });
 
 test("only a current Administrator can retry a recovered delivery for another submitter", async () => {
@@ -352,10 +410,19 @@ test("only a current Administrator can retry a recovered delivery for another su
     sheetState: "saved", customerName: "Customer", assets: [{ id: 14, url: "https://www.roblox.com/catalog/14" }],
     logNoticeState: "sent", customerDeliveryState: "pending", createdAt: new Date().toISOString(),
   });
+  let unauthorizedError: unknown;
   await assert.rejects(handleUniformRetryButton({
     customId: "uniform:retry:admin-retry", guild, guildId: guild.id, user: { id: "other-submitter" },
     deferUpdate: async () => undefined, editReply: async () => undefined,
-  } as never, async () => false), /original authorized submitter or a current Administrator/i);
+  } as never, async () => false).catch((error) => {
+    unauthorizedError = error;
+    throw error;
+  }), /original authorized submitter or a current Administrator/i);
+  assert.ok(unauthorizedError instanceof UniformDeliveryRecoveryError);
+  assert.equal(
+    (uniformDeliveryRecoveryResponse(unauthorizedError as UniformDeliveryRecoveryError) as { components: unknown[] }).components.length,
+    0,
+  );
   assert.equal(sends.length, 0);
 
   const administratorGuild = {
