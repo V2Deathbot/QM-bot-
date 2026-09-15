@@ -62,8 +62,10 @@
         "moderatedChannelId": "1549233954136006737",
         "spreadsheet": {
           "spreadsheetId": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98",
-          "logTab": "Uniform Logs",
-          "moderatedTab": "Moderated Logs",
+          "logTab": "Uniform Logging",
+          "moderatedTab": "Moderated Uniforms",
+          "logRange": "A2:E",
+          "moderatedRange": "A2:D",
           "createMissingTabs": false
         }
       }
