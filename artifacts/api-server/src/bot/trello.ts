@@ -7,6 +7,7 @@ import {
 export interface TrelloList {
   id: string;
   name: string;
+  idBoard?: string;
 }
 
 export type TrelloReadinessStatus =
@@ -131,11 +132,18 @@ function assertCardOnConfiguredBoard(
   boardLists: TrelloList[],
 ): void {
   const { boardId } = requireTrelloConfig(boardIdFor(mappings));
-  // idBoard is explicitly requested from Trello. The list-membership fallback
-  // is only for legacy provider responses that omit this field; Trello list
-  // IDs are board-scoped, so it still prevents a cross-board mutation.
+  const canonicalBoardIds = new Set(
+    boardLists
+      .map((list) => list.idBoard)
+      .filter((id): id is string => Boolean(id)),
+  );
+  // Trello accepts either its canonical board ID or a short link in board
+  // routes, while card.idBoard always uses the canonical ID. Resolve aliases
+  // through the configured board's own list records before rejecting.
   if (
-    (card.idBoard && card.idBoard !== boardId) ||
+    (card.idBoard &&
+      card.idBoard !== boardId &&
+      !canonicalBoardIds.has(card.idBoard)) ||
     (!card.idBoard && !boardLists.some((list) => list.id === card.idList))
   ) {
     throw new Error(
@@ -147,7 +155,7 @@ function assertCardOnConfiguredBoard(
 async function getOpenLists(mappings?: TrelloMappings): Promise<TrelloList[]> {
   const { boardId } = requireTrelloConfig(boardIdFor(mappings));
   return request<TrelloList[]>(
-    `/boards/${encodeURIComponent(boardId)}/lists?filter=open`,
+    `/boards/${encodeURIComponent(boardId)}/lists?filter=open&fields=id,name,idBoard`,
   );
 }
 

@@ -347,6 +347,58 @@ test("refuses an exact-card revoke from a different Trello board", async () => {
   }
 });
 
+test("accepts a configured Trello short link when card and lists use the canonical board ID", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalBoardId = config.trelloBoardId;
+  let writes = 0;
+  Object.defineProperty(config, "trelloBoardId", {
+    value: "configured-short-link",
+    configurable: true,
+  });
+  globalThis.fetch = async (input, init) => {
+    const pathname = requestPath(input);
+    if (pathname === "/1/cards/aliased-board-card" && (init?.method ?? "GET") === "GET") {
+      return jsonResponse({
+        id: "aliased-board-card", idBoard: "canonical-board-id", name: "Builder | 1",
+        desc: "- policy", idList: "list-0", idLabels: [], url: "https://trello.test/card",
+        dateLastActivity: "2026-01-01T00:00:00.000Z", closed: false,
+      });
+    }
+    if (pathname.endsWith("/lists")) {
+      return jsonResponse(Object.values(config.trelloListNames).map((name, index) => ({
+        id: `list-${index}`,
+        idBoard: "canonical-board-id",
+        name,
+      })));
+    }
+    if (pathname.endsWith("/labels")) {
+      return jsonResponse([
+        "blacklisted", "appealable", "conditional", "permanent", "group blacklist", "revoked",
+      ].map((name, index) => ({
+        id: `label-${index}`,
+        name,
+        color: "blue",
+      })));
+    }
+    if ((init?.method ?? "GET") === "PUT") {
+      writes += 1;
+      return jsonResponse({});
+    }
+    throw new Error(`Unexpected aliased-board request: ${pathname}`);
+  };
+  try {
+    await revokeBlacklistCard({
+      id: "aliased-board-card", idBoard: "canonical-board-id", name: "Builder | 1",
+      desc: "- policy", idList: "list-0", idLabels: [], url: "https://trello.test/card",
+      dateLastActivity: "2026-01-01T00:00:00.000Z", closed: false,
+    });
+    assert.equal(writes, 1);
+  } finally {
+    Object.defineProperty(config, "trelloBoardId", { value: originalBoardId, configurable: true });
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("requires a current Administrator permission while recognizing server owner", async () => {
   let highestPosition = 4;
   let administrator = false;
