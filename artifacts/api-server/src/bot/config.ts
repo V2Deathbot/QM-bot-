@@ -40,6 +40,9 @@ export const config = {
     process.env["UNIFORM_SUBMISSION_LEDGER_FILE"] ?? "data/uniform-submission-ledger.json",
   uniformDeliveryFile:
     process.env["UNIFORM_DELIVERY_FILE"] ?? "data/uniform-deliveries.json",
+  /** Durable payout snapshots and reset state. Kept separate from delivery audit history. */
+  payoutFile:
+    process.env["PAYOUT_ARCHIVE_FILE"] ?? "data/payout-runs.json",
 } as const;
 
 function parseDelay(value: string | undefined, fallback: number): number {

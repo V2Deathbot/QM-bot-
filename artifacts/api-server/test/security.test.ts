@@ -764,10 +764,11 @@ test.before(async () => {
   await refreshBot();
 });
 
-test("registers exactly seven commands with the requested moderation and uniform options", () => {
+test("registers exactly eight commands with the requested moderation and uniform options", () => {
   const definitions = getRegisteredCommandDefinitions();
   assert.deepEqual(definitions.map((command) => command.name), [
     "settings",
+    "payout",
     "blacklist",
     "revoke_blacklist",
     "blacklist_lookup",
@@ -776,6 +777,7 @@ test("registers exactly seven commands with the requested moderation and uniform
     "relog",
   ]);
   const blacklist = definitions.find((command) => command.name === "blacklist");
+  const payout = definitions.find((command) => command.name === "payout");
   const revoke = definitions.find((command) => command.name === "revoke_blacklist");
   const log = definitions.find((command) => command.name === "log");
   const moderated = definitions.find((command) => command.name === "moderated");
@@ -786,6 +788,7 @@ test("registers exactly seven commands with the requested moderation and uniform
     "reason",
   ]);
   assert.deepEqual(revoke?.options?.map((option) => option.name), ["username"]);
+  assert.deepEqual(payout?.options, []);
   assert.deepEqual(log?.options?.map((option) => option.name), [
     "qm", "seqm", "publisher", "customer",
     "shirtid1", "channel", "shirtid2", "shirtid3", "shirtid4", "shirtid5",

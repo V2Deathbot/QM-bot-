@@ -83,6 +83,8 @@ export interface UniformDeliveryRecord {
     auditState?: "pending" | "claimed" | "sent" | "unresolved";
     nonce: string;
   };
+  /** Retained for audit, but never actionable after its workbook's payout reset. */
+  invalidatedByPayoutRunId?: string;
   createdAt: string;
 }
 
@@ -144,6 +146,7 @@ export async function findUniformDeliveriesForChannel(
     record.guildId === guildId &&
     record.destinationChannelId === channelId &&
     record.sheetState === "saved" &&
+      !record.invalidatedByPayoutRunId &&
     Boolean(record.customerMessageId || record.relog),
   ));
 }
@@ -152,6 +155,9 @@ export async function findUniformDeliveriesForChannel(
 export async function saveUniformDelivery(record: UniformDeliveryRecord): Promise<UniformDeliveryRecord> {
   return mutate((store) => {
     const existing = store.records.find((item) => item.submissionId === record.submissionId);
+    if (existing?.invalidatedByPayoutRunId) {
+      throw new Error("This uniform submission belongs to a completed payout cycle and cannot write reset rows.");
+    }
     if (existing) return existing;
     store.records.push(record);
     return record;
@@ -165,8 +171,25 @@ export async function updateUniformDelivery(
   return mutate((store) => {
     const record = store.records.find((item) => item.submissionId === submissionId);
     if (!record) throw new Error("This uniform delivery record is unavailable.");
+    if (record.invalidatedByPayoutRunId) {
+      throw new Error("This uniform delivery belongs to a completed payout cycle and cannot be changed.");
+    }
     change(record);
     return record;
+  });
+}
+
+/** Preserve delivery audit history while invalidating every old control/retry. */
+export async function invalidateUniformDeliveriesForPayout(
+  spreadsheetId: string,
+  payoutRunId: string,
+): Promise<void> {
+  await mutate((store) => {
+    for (const record of store.records) {
+      if (record.spreadsheet.spreadsheetId === spreadsheetId) {
+        record.invalidatedByPayoutRunId ??= payoutRunId;
+      }
+    }
   });
 }
 
@@ -182,7 +205,7 @@ export async function findLegacyNonceRejectedDelivery(
   guildId: string,
 ): Promise<UniformDeliveryRecord | undefined> {
   return mutate((store) => store.records.find((record) =>
-    record.guildId === guildId && canRecoverLegacyNonceRejection(record),
+    record.guildId === guildId && !record.invalidatedByPayoutRunId && canRecoverLegacyNonceRejection(record),
   ));
 }
 

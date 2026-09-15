@@ -2,6 +2,8 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ReplitConnectors } from "@replit/connectors-sdk";
 import { config } from "./config";
+import { withUniformWorkbookMutation } from "./payout-guard";
+import { payoutLockForWorkbook } from "./payout-store";
 
 /**
  * These are the only user-data cells written by the two commands.  They are
@@ -221,14 +223,72 @@ function rangePath(spreadsheetId: string, tab: string, range: string): string {
   return `/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(`${quoteSheetTab(tab)}!${range}`)}`;
 }
 interface SheetMetadata {
-  sheets?: Array<{ properties?: { title?: string; gridProperties?: { rowCount?: number; columnCount?: number } } }>;
+  sheets?: Array<{ properties?: { sheetId?: number; title?: string; gridProperties?: { rowCount?: number; columnCount?: number } } }>;
 }
 interface ValuesResponse { values?: unknown[][]; }
 async function spreadsheetMetadata(spreadsheetId: string): Promise<SheetMetadata> {
   return jsonResponse(await proxy(
-    `/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}?fields=sheets(properties(title,gridProperties(rowCount,columnCount)))`,
+    `/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}?fields=sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))`,
     { method: "GET" },
   ), "spreadsheet metadata lookup");
+}
+
+export interface PayoutSheetGrid {
+  title: string;
+  sheetId: number;
+  rowCount: number;
+  columnCount: number;
+}
+
+/** Narrow provider surface used by the payout service and its provider mocks. */
+export async function getPayoutSheetGrids(spreadsheetId: string): Promise<PayoutSheetGrid[]> {
+  const metadata = await spreadsheetMetadata(spreadsheetId);
+  return (metadata.sheets ?? []).flatMap((sheet) => {
+    const properties = sheet.properties;
+    const sheetId = properties?.sheetId;
+    const title = properties?.title;
+    const rowCount = properties?.gridProperties?.rowCount;
+    const columnCount = properties?.gridProperties?.columnCount;
+    if (typeof title !== "string" || typeof sheetId !== "number" || !Number.isInteger(sheetId) ||
+        typeof rowCount !== "number" || !Number.isInteger(rowCount) ||
+        typeof columnCount !== "number" || !Number.isInteger(columnCount)) return [];
+    return [{
+      title,
+      sheetId,
+      rowCount,
+      columnCount,
+    }];
+  });
+}
+
+export async function readPayoutValues(
+  spreadsheetId: string,
+  tab: string,
+  range: string,
+  valueRenderOption: "UNFORMATTED_VALUE" | "FORMULA",
+): Promise<unknown[][]> {
+  const output = await jsonResponse<ValuesResponse>(
+    await proxy(
+      `${rangePath(spreadsheetId, tab, range)}?valueRenderOption=${valueRenderOption}`,
+      { method: "GET" },
+    ),
+    `worksheet "${tab}" lookup`,
+  );
+  return Array.isArray(output.values) ? output.values : [];
+}
+
+/**
+ * Sends a caller-built, single Google batchUpdate request. It is intentionally
+ * not a general write API: payout is the only caller and controls every range.
+ */
+export async function batchUpdatePayoutCells(
+  spreadsheetId: string,
+  requests: unknown[],
+): Promise<void> {
+  await jsonResponse(await proxy(
+    `/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}:batchUpdate`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: { requests } },
+  ), "payout reset");
 }
 
 /**
@@ -259,6 +319,8 @@ interface SubmissionLedgerEntry {
   state: "reserved" | "written";
   notified: boolean;
   createdAt: string;
+  /** Historical reservation retained, but cannot be retried after payout reset. */
+  invalidatedByPayoutRunId?: string;
 }
 interface SubmissionLedger { entries: SubmissionLedgerEntry[]; }
 let ledgerQueue: Promise<void> = Promise.resolve();
@@ -309,6 +371,33 @@ async function serialDestination<T>(destination: string, work: () => Promise<T>)
   finally {
     if (destinationQueues.get(destination) === tail) destinationQueues.delete(destination);
   }
+}
+async function withPayoutAwareUniformMutation<T>(
+  spreadsheetId: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  // The durable lock is necessary after a bot restart, when the in-memory
+  // shared gate has no history. The gate then closes the small same-process
+  // race between this check and a newly acquired payout lock.
+  if (await payoutLockForWorkbook(spreadsheetId)) {
+    throw new Error("A payout reset is pending or in progress for this spreadsheet. Uniform changes are unavailable.");
+  }
+  return withUniformWorkbookMutation(spreadsheetId, work);
+}
+
+/**
+ * Hold the workbook's shared activity gate around an entire uniform
+ * interaction, including Discord notification and durable delivery state.
+ * Individual Sheets helpers nest this gate safely; the payout gate only waits
+ * for the outermost work to finish, preventing a just-cleared ledger from
+ * being notified or relogged by an in-flight interaction.
+ */
+export async function withPayoutAwareUniformActivity<T>(
+  configInput: UniformSpreadsheetConfig,
+  work: () => Promise<T>,
+): Promise<T> {
+  const config = normalizeUniformSpreadsheetConfig(configInput);
+  return withPayoutAwareUniformMutation(config.spreadsheetId, work);
 }
 export function resetUniformSubmissionLedgerForTests(): void {
   ledgerQueue = Promise.resolve();
@@ -373,7 +462,7 @@ async function completedLedgerEntry(
 ): Promise<SubmissionLedgerEntry> {
   const key = recordKey(destination, submissionId);
   const entry = await withLedger((ledger) => ledger.entries.find((candidate) => candidate.key === key));
-  if (!entry || entry.state !== "written") {
+  if (!entry || entry.state !== "written" || entry.invalidatedByPayoutRunId) {
     throw new Error("Trusted original spreadsheet row metadata is unavailable. No cells were changed.");
   }
   return entry;
@@ -409,7 +498,7 @@ export async function replaceUniformRowLink(
       !input.newLink || /[\u0000-\u001f\u007f]/.test(input.newLink)) {
     throw new Error("The relog request is invalid. No cells were changed.");
   }
-  return serialDestination(destination, async () => {
+  return serialDestination(destination, () => withPayoutAwareUniformMutation(config.spreadsheetId, async () => {
     const entry = await completedLedgerEntry(destination, input.submissionId);
     const target = targetForEntry(entry, width);
     if (input.rowIndex >= entry.values.length ||
@@ -454,7 +543,7 @@ export async function replaceUniformRowLink(
     }
     await updateLedgerValues(destination, input.submissionId, intended);
     return { alreadyUpdated: false, targetRange: cellRange };
-  });
+  }));
 }
 
 /**
@@ -472,7 +561,7 @@ export async function markUniformRowsSold(
   }
   const config = normalizeUniformSpreadsheetConfig(configInput);
   const { tab, range, destination } = destinationFor(config, logKind);
-  return serialDestination(destination, async () => {
+  return serialDestination(destination, () => withPayoutAwareUniformMutation(config.spreadsheetId, async () => {
     const entry = await completedLedgerEntry(destination, submissionId);
     const target = targetForEntry(entry, LOG_UNIFORM_COLUMN_COUNT);
     if (target.startColumn !== range.startColumn || target.endColumn !== range.endColumn) {
@@ -503,7 +592,7 @@ export async function markUniformRowsSold(
       return { alreadyMarked: true, count: entry.values.length };
     }
     return { alreadyMarked: false, count: entry.values.length };
-  });
+  }));
 }
 
 export async function appendUniformRows(input: AppendUniformRowsInput): Promise<AppendUniformRowsResult> {
@@ -515,9 +604,12 @@ export async function appendUniformRows(input: AppendUniformRowsInput): Promise<
   }
   const { tab, range, destination } = destinationFor(normalized, input.logKind);
   const key = recordKey(destination, input.submissionId);
-  return serialDestination(destination, async () => {
+  return serialDestination(destination, () => withPayoutAwareUniformMutation(normalized.spreadsheetId, async () => {
     let existing = await withLedger((ledger) => ledger.entries.find((entry) => entry.key === key));
     if (existing) {
+      if (existing.invalidatedByPayoutRunId) {
+        throw new Error("This uniform submission belongs to a completed payout cycle and cannot write reset rows.");
+      }
       if (existing.state === "reserved") {
         let committed = false;
         try { committed = await verifyReservation(normalized, tab, existing); } catch { /* preserve conservative reservation */ }
@@ -582,6 +674,19 @@ export async function appendUniformRows(input: AppendUniformRowsInput): Promise<
       throw error;
     }
     return { alreadyWritten: false, count: input.rows.length };
+  }));
+}
+
+/** Retain immutable ledger audit data while making pre-payout writes unusable. */
+export async function invalidateUniformSubmissionLedgerForPayout(
+  spreadsheetId: string,
+  payoutRunId: string,
+): Promise<void> {
+  await withLedger((ledger) => {
+    const prefix = `${spreadsheetId}\u0000`;
+    for (const entry of ledger.entries) {
+      if (entry.destination.startsWith(prefix)) entry.invalidatedByPayoutRunId ??= payoutRunId;
+    }
   });
 }
 

@@ -32,6 +32,7 @@ import {
   type GuildSetup,
   type UniformSettings,
 } from "./setup-store";
+import { payoutWorkbookGeneration } from "./payout-store";
 import {
   getUniformDelivery,
   claimUniformDeliveryAction,
@@ -322,6 +323,7 @@ interface PendingUniformConfirmation {
   customerId?: string;
   seqmId?: string;
   expiresAt: number;
+  workbookGeneration?: number;
 }
 const pendingUniformConfirmations = new Map<string, PendingUniformConfirmation>();
 interface PendingRelogConfirmation {
@@ -820,6 +822,7 @@ export async function handleUniformCommand(
       ? ticketChannel.name.trim()
       : "Ticket name unavailable",
     expiresAt: Date.now() + uniformConfirmationLifetimeMs,
+    ...(settings.spreadsheet ? { workbookGeneration: await payoutWorkbookGeneration(settings.spreadsheet.spreadsheetId) } : {}),
   };
   pendingUniformConfirmations.set(nonce, pending);
   await interaction.editReply({
@@ -1566,6 +1569,11 @@ export async function handleUniformSubmitButton(
   if (!latest) throw new Error("This server no longer has a valid bot setup.");
   const settings = uniformSettingsFor(latest);
   await requireUniformSubmitter(interaction.guild!, pending.actorId, settings);
+  if (settings.spreadsheet && pending.workbookGeneration !== undefined &&
+      pending.workbookGeneration !== await payoutWorkbookGeneration(settings.spreadsheet.spreadsheetId)) {
+    pendingUniformConfirmations.delete(nonce);
+    throw new Error("This uniform confirmation predates a completed payout reset. Start a fresh uniform command.");
+  }
   let record = await getUniformDelivery(pending.submissionId);
   if (record && (record.guildId !== pending.guildId || record.actorId !== pending.actorId)) {
     throw new Error("The durable uniform submission record does not match this confirmation.");

@@ -445,7 +445,7 @@ test("setup persists settings, audits the change, and enables moderation command
   assert.equal(saved?.auditChannelId, "12345678901234567");
   assert.equal(auditMessages.length, 1);
   assert.deepEqual(registeredCommandNames, [
-    ["settings", "blacklist", "revoke_blacklist", "blacklist_lookup", "log", "moderated", "relog"],
+    ["settings", "payout", "blacklist", "revoke_blacklist", "blacklist_lookup", "log", "moderated", "relog"],
   ]);
   const setupReply = replies[0] as {
     content?: string;
@@ -1365,6 +1365,7 @@ test("keeps commands disabled after registration failure and enables them on ret
     assert.equal(registrationAttempts, 3);
     assert.deepEqual(registeredCommandNames[2], [
       "settings",
+      "payout",
       "blacklist",
       "revoke_blacklist",
       "blacklist_lookup",

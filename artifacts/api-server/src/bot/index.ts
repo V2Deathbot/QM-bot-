@@ -118,10 +118,25 @@ import {
   uniformRelogCommandName,
   uniformCommands,
 } from "./uniforms";
+import { normalizeUniformSpreadsheetConfig, withPayoutAwareUniformActivity } from "./google-sheets";
+import {
+  archivePayoutPreview,
+  acknowledgeUncertainPayoutReport,
+  confirmArchivedPayout,
+  googlePayoutSheetsClient,
+  readPayoutSnapshot,
+  recoverUnknownPayoutClear,
+} from "./payout";
+import { activePayoutRunForGuild, getPayoutRun, payoutLockForWorkbook, type PayoutRun } from "./payout-store";
 
 const settingsCommand = new SlashCommandBuilder()
   .setName("settings")
   .setDescription("Quartermaster administration, setup, security, and records.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
+
+const payoutCommand = new SlashCommandBuilder()
+  .setName("payout")
+  .setDescription("Preview and confirm the current uniform payout reset.")
   .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
 
 const moderationCommands = [
@@ -169,7 +184,7 @@ const moderationCommands = [
 // These recovery controls must remain reachable before first-time setup. In
 // particular, maintenance must never make a partially configured guild stuck.
 const setupOnlyCommands = [settingsCommand].map((command) => command.toJSON());
-const enabledCommands = [settingsCommand, ...moderationCommands].map((command) =>
+const enabledCommands = [settingsCommand, payoutCommand, ...moderationCommands].map((command) =>
   command.toJSON(),
 );
 const enabledUniformCommands = uniformCommands.map((command) => command.toJSON());
@@ -278,6 +293,17 @@ const maintenanceConfirmations = new Map<string, {
   original: ChatInputCommandInteraction | ModalSubmitInteraction;
   claimed?: boolean;
 }>();
+interface PayoutConfirmation {
+  userId: string;
+  guildId: string;
+  runId: string;
+  expiresAt: number;
+  original: ChatInputCommandInteraction;
+  messageId?: string;
+  claimed?: boolean;
+  mode?: "confirm" | "resume" | "acknowledge" | "recover-clear";
+}
+const payoutConfirmations = new Map<string, PayoutConfirmation>();
 
 const destructiveCommands = new Set(["blacklist", "group_blacklist", "revoke_blacklist"]);
 const setupSessionLifetimeMs = 10 * 60_000;
@@ -2768,15 +2794,24 @@ async function handleConfirmation(interaction: ButtonInteraction): Promise<void>
   // synchronous cancel/authorization checks, so a duplicate cannot reserve a
   // second destructive-action slot.
   pending.claimed = true;
+  const cancellation = interaction.customId.startsWith("cancel:");
+  // A confirmation token is already atomically claimed. Acknowledge the
+  // Discord button immediately instead of making that acknowledgement wait on
+  // file-backed setup/security reads; authorization and every destructive
+  // check still happen before provider work below.
+  if (!cancellation) await interaction.deferUpdate();
   let setup: GuildSetup | undefined;
   try {
     setup = await getGuildSetup(pending.guildId);
     await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, `/${pending.command} confirmation`);
+    if (pending.command !== "security_unlock" && await maintenanceActive(pending.guildId)) {
+      throw new Error("Bot maintenance mode is active. Commands are temporarily unavailable.");
+    }
   } catch (error) {
     if (id && confirmations.get(id) === pending) pending.claimed = false;
     throw error;
   }
-  if (interaction.customId.startsWith("cancel:")) {
+  if (cancellation) {
     confirmations.delete(id!);
     await interaction.update({
       ...responseWithEmbed("Action cancelled.", "Action Cancelled", "info"),
@@ -2785,7 +2820,6 @@ async function handleConfirmation(interaction: ButtonInteraction): Promise<void>
     return;
   }
   confirmations.delete(id!);
-  await interaction.deferUpdate();
   if (pending.command === "security_unlock") {
     await completeSecurityUnlock(
       interaction.guild,
@@ -3411,6 +3445,234 @@ function handleRevoke(
   });
 }
 
+function payoutPreviewFields(snapshot: Awaited<ReturnType<typeof readPayoutSnapshot>>) {
+  return [
+    ...snapshot.roles.map((role) => ({
+      name: role.role,
+      value: `${role.total} Robux · ${role.participants.length} participant${role.participants.length === 1 ? "" : "s"}`,
+      inline: true,
+    })),
+    { name: "Grand Total", value: `${snapshot.grandTotal} Robux`, inline: true },
+    { name: "Source", value: "Payout Logging1 (read only)", inline: true },
+    { name: "Uniform clear", value: `${snapshot.spreadsheet.logTab}!${snapshot.grids.log.range.a1}; F${snapshot.grids.log.range.startRow}:F${snapshot.grids.log.range.endRow}`, inline: false },
+    { name: "Moderated clear", value: `${snapshot.spreadsheet.moderatedTab}!${snapshot.grids.moderated.range.a1}`, inline: false },
+  ];
+}
+
+async function requirePayoutSafety(
+  guild: Guild,
+  actorId: string,
+  setup: GuildSetup,
+  command: string,
+): Promise<void> {
+  await requireCurrentAdministrator(guild, actorId, setup, command);
+  const state = await getSecurityState(guild.id);
+  if (state.lockdown.active) {
+    throw new Error(`Security lockdown is active: ${state.lockdown.reason || "no reason provided"}.`);
+  }
+  const grantedAt = state.observedAdministrators[actorId];
+  if (
+    securitySettingsFor(setup).recentPermissionEscalationProtection &&
+    grantedAt &&
+    Date.now() - Date.parse(grantedAt) < permissionEscalationWindowMs
+  ) {
+    throw new Error("This administrator permission was granted recently. Payout is delayed for 10 minutes.");
+  }
+  if (await maintenanceActive(guild.id)) {
+    throw new Error("Bot maintenance mode is active. Payout is temporarily unavailable.");
+  }
+}
+
+function payoutRecoveryDetails(run: PayoutRun): {
+  text: string;
+  label: string;
+  mode: NonNullable<PayoutConfirmation["mode"]>;
+  style: ButtonStyle;
+} {
+  if (run.state === "complete") {
+    return {
+      text: "This archived payout is already complete but retained a legacy workbook lock. Finalizing removes only that matching lock; it sends no report and changes no spreadsheet cells.",
+      label: "Finalize Completed Lock",
+      mode: "resume",
+      style: ButtonStyle.Danger,
+    };
+  }
+  if (run.state === "unsafe" || run.state === "cleared" || run.state === "clearing") {
+    return {
+      text: run.state === "cleared"
+        ? "The archived reset completed, but local completion bookkeeping did not finish. This recovery only verifies the exact archived ranges are blank and Sold is false, then finalizes records. It never sends another DM or repeats deletion."
+        : run.state === "clearing"
+          ? "The bot stopped while the Google Sheets reset was being attempted. This recovery only verifies the exact archived ranges are blank and Sold is false, then finalizes records. It never sends another DM or repeats deletion."
+        : "The prior Google Sheets reset response was unknown. This recovery will only verify the exact archived ranges are already blank and Sold is false; it will never send another DM or repeat deletion. It refuses a newer/changed payout source.",
+      label: "Verify and Finalize Reset",
+      mode: "recover-clear",
+      style: ButtonStyle.Danger,
+    };
+  }
+  if (run.reportState === "uncertain") {
+    return {
+      text: "Discord could not confirm the private payout report. Do not continue unless you personally received the complete report (all pages). Choosing the confirmation below records that acknowledgement and then clears the archived uniform ranges; it will not send any DM again.",
+      label: "I Received Full Report — Clear",
+      mode: "acknowledge",
+      style: ButtonStyle.Danger,
+    };
+  }
+  return {
+    text: run.reportState === "delivered"
+      ? "The private report was already delivered. Resume only the archived reset; no report will be sent again."
+      : "This archived payout has a pending private report. Resume sends only undelivered report pages, then clears the archived ranges.",
+    label: "Resume Payout",
+    mode: "resume",
+    style: ButtonStyle.Danger,
+  };
+}
+
+async function renderPayoutRecovery(
+  interaction: ChatInputCommandInteraction,
+  run: PayoutRun,
+): Promise<void> {
+  const details = payoutRecoveryDetails(run);
+  const nonce = crypto.randomUUID().replaceAll("-", "");
+  const pending: PayoutConfirmation = {
+    userId: interaction.user.id, guildId: interaction.guild!.id, runId: run.runId,
+    expiresAt: Date.now() + 10 * 60_000, original: interaction, mode: details.mode,
+  };
+  payoutConfirmations.set(nonce, pending);
+  const reply = await interaction.editReply({
+    content: "",
+    embeds: [outcomeEmbed(
+      "Payout Recovery Required",
+      `${details.text}\n\nRun: ${run.runId}\nState: ${run.state}; report: ${run.reportState}.`,
+      "warning",
+    )],
+    components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`payout:${details.mode}:${nonce}`).setLabel(details.label).setStyle(details.style),
+      new ButtonBuilder().setCustomId(`payout:cancel:${nonce}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
+    )],
+    allowedMentions: noMentions,
+  });
+  pending.messageId = reply.id;
+}
+
+async function handlePayoutCommand(interaction: ChatInputCommandInteraction, setup: GuildSetup): Promise<void> {
+  await requirePayoutSafety(interaction.guild!, interaction.user.id, setup, "/payout");
+  // Discover by guild before consulting current settings. An administrator may
+  // have edited the configured workbook after a run started; that must not
+  // turn the archived lock into a permanently unreachable recovery.
+  const guildActive = await activePayoutRunForGuild(interaction.guild!.id);
+  if (guildActive) {
+    await renderPayoutRecovery(interaction, guildActive);
+    return;
+  }
+  const spreadsheet = uniformSettingsFor(setup).spreadsheet;
+  if (!spreadsheet) throw new Error("Google Sheets uniform logging is not configured.");
+  const normalized = normalizeUniformSpreadsheetConfig(spreadsheet);
+  const locked = await payoutLockForWorkbook(normalized.spreadsheetId);
+  if (locked) {
+    const active = await getPayoutRun(locked.runId);
+    if (!active || active.spreadsheetId !== normalized.spreadsheetId || active.state === "complete") {
+      throw new Error("The payout lock archive is inconsistent; do not start a new payout until it is reviewed.");
+    }
+    await renderPayoutRecovery(interaction, active);
+    return;
+  }
+  const snapshot = await readPayoutSnapshot(googlePayoutSheetsClient, spreadsheet);
+  const run = await archivePayoutPreview(snapshot, interaction.guild!.id, interaction.user.id);
+  const nonce = crypto.randomUUID().replaceAll("-", "");
+  const pending: PayoutConfirmation = { userId: interaction.user.id, guildId: interaction.guild!.id, runId: run.runId,
+    expiresAt: Date.now() + 10 * 60_000, original: interaction };
+  payoutConfirmations.set(nonce, pending);
+  const reply = await interaction.editReply({
+    content: "",
+    embeds: [outcomeEmbed("Payout Preview",
+      "No spreadsheet cells have changed. Confirmation privately reports this payout, then clears the listed uniform data. This does not transfer Robux.",
+      "warning", payoutPreviewFields(snapshot))],
+    components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`payout:confirm:${nonce}`).setLabel("Confirm Payout").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`payout:cancel:${nonce}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
+    )],
+    allowedMentions: noMentions,
+  });
+  pending.messageId = reply.id;
+}
+
+async function handlePayoutConfirmation(interaction: ButtonInteraction): Promise<void> {
+  const match = /^payout:(confirm|cancel|resume|acknowledge|recover-clear):([a-f0-9]{32})$/.exec(interaction.customId);
+  const pending = match && payoutConfirmations.get(match[2]);
+  if (!match || !pending || pending.expiresAt <= Date.now() || pending.userId !== interaction.user.id ||
+      pending.guildId !== interaction.guildId || !interaction.guild ||
+      (match[1] !== "cancel" && match[1] !== (pending.mode ?? "confirm")) ||
+      (pending.messageId !== undefined && interaction.message.id !== pending.messageId)) {
+    throw new Error("This payout confirmation has expired or belongs to another administrator.");
+  }
+  if (pending.claimed) throw new Error("This payout confirmation is already being processed.");
+  pending.claimed = true;
+  try {
+    const setup = await getGuildSetup(pending.guildId);
+    if (!setup) throw new Error("Complete setup before confirming a payout.");
+    await requirePayoutSafety(interaction.guild, interaction.user.id, setup, "/payout confirmation");
+    if (match[1] === "cancel") {
+      payoutConfirmations.delete(match[2]);
+      await interaction.update({ ...responseWithEmbed("Payout preview cancelled. No spreadsheet cells changed.", "Payout Cancelled", "info"), components: [] });
+      return;
+    }
+    const current = await getPayoutRun(pending.runId);
+    const configured = uniformSettingsFor(setup).spreadsheet;
+    const recovery = match[1] === "resume" || match[1] === "acknowledge" || match[1] === "recover-clear";
+    if (!current || current.guildId !== pending.guildId ||
+        (!recovery && (current.actorId !== interaction.user.id || !configured ||
+          normalizeUniformSpreadsheetConfig(configured).spreadsheetId !== current.spreadsheetId))) {
+      throw new Error("The archived payout or configured workbook changed. Run /payout again.");
+    }
+    if (!recovery) {
+      if (!configured) throw new Error("Google Sheets uniform logging is not configured.");
+      const latest = await readPayoutSnapshot(googlePayoutSheetsClient, configured);
+      if (latest.sourceFingerprint !== current.sourceFingerprint ||
+          latest.clearCells.some((cell, index) => cell.range !== current.clearCells[index]?.range)) {
+        payoutConfirmations.delete(match[2]);
+        throw new Error("Payout source or reset configuration changed after preview. Run /payout again; no cells changed.");
+      }
+    }
+    payoutConfirmations.delete(match[2]);
+    await interaction.deferUpdate();
+    if (match[1] === "acknowledge") {
+      await acknowledgeUncertainPayoutReport(pending.runId, interaction.user.id);
+    }
+    const completed = match[1] === "recover-clear"
+      ? await recoverUnknownPayoutClear(googlePayoutSheetsClient, pending.runId)
+      : await confirmArchivedPayout(googlePayoutSheetsClient, pending.runId, {
+        sendPage: async (_run, page) => {
+          const embeds = page.map((embed) => ({
+          title: embed.title, description: embed.description, fields: embed.fields, footer: { text: embed.footer },
+        }));
+        const message = await interaction.user.send({ embeds, allowedMentions: noMentions });
+        return message.id;
+      },
+      });
+    await pending.original.editReply({
+      ...responseWithEmbed(`Payout run ${completed.runId} is complete. Your private payout summary was delivered before the reset.`,
+        "Payout Complete", "success"),
+      components: [],
+    });
+  } catch (error) {
+    pending.claimed = false;
+    throw error;
+  }
+}
+
+async function withUniformInteractionActivity<T>(
+  guildId: string | null,
+  work: () => Promise<T>,
+): Promise<T> {
+  if (!guildId) return work();
+  const setup = await getGuildSetup(guildId);
+  const spreadsheet = setup && uniformSettingsFor(setup).spreadsheet;
+  // Let the established uniform handler return its normal setup error if
+  // there is no configured workbook; there is no workbook to serialize then.
+  if (!spreadsheet) return work();
+  return withPayoutAwareUniformActivity(spreadsheet, work);
+}
+
 async function handleInteraction(
   interaction: ChatInputCommandInteraction,
 ): Promise<void> {
@@ -3575,12 +3837,27 @@ async function handleInteraction(
     return;
   }
 
+  if (interaction.commandName === "payout") {
+    try {
+      await handlePayoutCommand(interaction, setup);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not prepare a payout preview.";
+      await interaction.editReply(errorResponse(message, "Payout Unavailable"));
+    }
+    return;
+  }
+
   // Uniform logging is intentionally independent of blacklist validation,
   // Trello readiness, destructive-action limits, and security lockdown.
   // Maintenance remains the existing global emergency block above.
   if (uniformCommandNames.has(interaction.commandName)) {
     try {
-      await handleUniformCommand(interaction, setup, botAvatarUrl());
+      const spreadsheet = uniformSettingsFor(setup).spreadsheet;
+      if (spreadsheet) {
+        await withPayoutAwareUniformActivity(spreadsheet, () => handleUniformCommand(interaction, setup, botAvatarUrl()));
+      } else {
+        await handleUniformCommand(interaction, setup, botAvatarUrl());
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "The uniform log failed unexpectedly.";
       await interaction.editReply(errorResponse(
@@ -3594,7 +3871,7 @@ async function handleInteraction(
   }
   if (interaction.commandName === uniformRelogCommandName) {
     try {
-      await handleUniformRelogCommand(interaction);
+      await withUniformInteractionActivity(interaction.guildId, () => handleUniformRelogCommand(interaction));
     } catch (error) {
       const message = error instanceof Error ? error.message : "The relog failed unexpectedly.";
       await interaction.editReply(
@@ -3975,6 +4252,10 @@ async function connectDiscord(): Promise<void> {
           await handleIdentityPromptButton(interaction);
           return;
         }
+        if (interaction.customId.startsWith("payout:")) {
+          await handlePayoutConfirmation(interaction);
+          return;
+        }
         if (interaction.customId.startsWith("uniform:") && interaction.guildId && await maintenanceActive(interaction.guildId)) {
           await interaction.reply({
             ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"),
@@ -3983,19 +4264,19 @@ async function connectDiscord(): Promise<void> {
           return;
         }
         if (interaction.customId.startsWith("uniform:submit:")) {
-          await handleUniformSubmitButton(interaction, maintenanceActive);
+          await withUniformInteractionActivity(interaction.guildId, () => handleUniformSubmitButton(interaction, maintenanceActive));
           return;
         }
         if (interaction.customId.startsWith("uniform:retry:")) {
-          await handleUniformRetryButton(interaction, maintenanceActive);
+          await withUniformInteractionActivity(interaction.guildId, () => handleUniformRetryButton(interaction, maintenanceActive));
           return;
         }
         if (interaction.customId.startsWith("uniform:cancel:")) {
-          await handleUniformCancelButton(interaction);
+          await withUniformInteractionActivity(interaction.guildId, () => handleUniformCancelButton(interaction));
           return;
         }
         if (interaction.customId.startsWith("uniform:purchase:") || interaction.customId.startsWith("uniform:assist:")) {
-          await handleUniformCustomerButton(interaction);
+          await withUniformInteractionActivity(interaction.guildId, () => handleUniformCustomerButton(interaction));
           return;
         }
         const [, confirmationId] = interaction.customId.split(/:(.+)/);
@@ -4013,6 +4294,14 @@ async function connectDiscord(): Promise<void> {
           await handleSettingsComponent(interaction);
           return;
         }
+        // The confirmation handler rechecks maintenance after claiming and
+        // immediately acknowledges an otherwise valid confirmation. Keeping
+        // this before the broad maintenance gate prevents storage contention
+        // from delaying the claimed interaction acknowledgement.
+        if (interaction.customId.startsWith("confirm:") || interaction.customId.startsWith("cancel:")) {
+          await handleConfirmation(interaction);
+          return;
+        }
         if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
           await interaction.reply({
             ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"),
@@ -4020,11 +4309,7 @@ async function connectDiscord(): Promise<void> {
           });
           return;
         }
-        if (interaction.customId.startsWith("confirm:") || interaction.customId.startsWith("cancel:")) {
-          await handleConfirmation(interaction);
-        } else {
-          await handleSetupComponent(interaction);
-        }
+        await handleSetupComponent(interaction);
       })().catch((error) => replyInteractionError(interaction, error));
     } else if (typeof interaction.isUserSelectMenu === "function" && interaction.isUserSelectMenu()) {
       void (async () => {
@@ -4032,7 +4317,7 @@ async function connectDiscord(): Promise<void> {
           await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
           return;
         }
-        await handleUniformUserSelection(interaction);
+        await withUniformInteractionActivity(interaction.guildId, () => handleUniformUserSelection(interaction));
       })().catch((error) => replyInteractionError(interaction, error));
     } else if (interaction.isStringSelectMenu()) {
       void (async () => {
@@ -4044,7 +4329,7 @@ async function connectDiscord(): Promise<void> {
             });
             return;
           }
-          await handleUniformRelogSelection(interaction);
+          await withUniformInteractionActivity(interaction.guildId, () => handleUniformRelogSelection(interaction));
           return;
         }
         if (interaction.customId.startsWith("settings:")) {
@@ -4075,7 +4360,7 @@ async function connectDiscord(): Promise<void> {
             await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
             return;
           }
-          await handleUniformAssistanceModal(interaction);
+          await withUniformInteractionActivity(interaction.guildId, () => handleUniformAssistanceModal(interaction));
           return;
         }
         if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
