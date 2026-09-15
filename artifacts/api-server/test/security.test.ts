@@ -67,6 +67,8 @@ let providerRequests = 0;
 let roleMutationCalls = 0;
 let trelloCards: Array<Record<string, unknown>> = [];
 let client: Client | undefined;
+let componentMessageSequence = 0;
+let latestComponentMessageId = "component-message-0";
 
 function presentationReplyText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -185,6 +187,7 @@ function command(
   discordUserId?: string,
 ) {
   const localReplies: unknown[] = [];
+  const messageId = `component-message-${++componentMessageSequence}`;
   return {
     inGuild: () => true,
     isChatInputCommand: () => true,
@@ -206,8 +209,10 @@ function command(
     },
     deferReply: async () => undefined,
     editReply: async (value: unknown) => {
+      latestComponentMessageId = messageId;
       localReplies.push(value);
       recordReply(value);
+      return { id: messageId };
     },
     reply: async (value: unknown) => {
       localReplies.push(value);
@@ -217,7 +222,7 @@ function command(
   };
 }
 
-function button(userId: string, customId: string) {
+function button(userId: string, customId: string, messageId = latestComponentMessageId) {
   const localReplies: unknown[] = [];
   const interaction = {
     isChatInputCommand: () => false,
@@ -225,6 +230,7 @@ function button(userId: string, customId: string) {
     isStringSelectMenu: () => false,
     isModalSubmit: () => false,
     customId,
+    message: { id: messageId },
     guild,
     guildId: guild.id,
     user: { id: userId },
@@ -249,7 +255,7 @@ function button(userId: string, customId: string) {
   return interaction;
 }
 
-function select(userId: string, customId: string, values: string[]) {
+function select(userId: string, customId: string, values: string[], messageId = latestComponentMessageId) {
   const localReplies: unknown[] = [];
   const interaction = {
     isChatInputCommand: () => false,
@@ -257,6 +263,7 @@ function select(userId: string, customId: string, values: string[]) {
     isStringSelectMenu: () => true,
     isModalSubmit: () => false,
     customId,
+    message: { id: messageId },
     values,
     guild,
     guildId: guild.id,
@@ -388,14 +395,144 @@ function lastSettingsSelectId(interaction: { localReplies: unknown[] }): string 
   return id;
 }
 
+type ComponentNode = {
+  custom_id?: string;
+  label?: string;
+  options?: Array<{ value?: string; label?: string; data?: { value?: string; label?: string } }>;
+  data?: {
+    custom_id?: string;
+    label?: string;
+    options?: Array<{ value?: string; label?: string; data?: { value?: string; label?: string } }>;
+  };
+  components?: ComponentNode[];
+};
+
+type ComponentPayload = {
+  components: ComponentNode[];
+};
+
+function latestComponentPayload(interaction: { localReplies: unknown[] }): ComponentPayload {
+  const payload = [...interaction.localReplies].reverse().find(
+    (reply): reply is ComponentPayload =>
+      typeof reply === "object" &&
+      reply !== null &&
+      "components" in reply &&
+      Array.isArray((reply as { components?: unknown }).components),
+  );
+  assert.ok(payload, "interaction should render Discord components");
+  return payload;
+}
+
+function componentRows(payload: ComponentPayload): ComponentNode[] {
+  return payload.components.flatMap((row) => row.components ?? []);
+}
+
+function renderedSelect(
+  payload: ComponentPayload,
+  expectedCustomId?: string,
+): { customId: string; options: Array<{ value?: string; label?: string; data?: { value?: string; label?: string } }> } {
+  const selectMenu = componentRows(payload).find((component) =>
+    (component.data?.custom_id ?? component.custom_id)?.startsWith("settings:") &&
+    Array.isArray(component.data?.options ?? component.options) &&
+    (!expectedCustomId || (component.data?.custom_id ?? component.custom_id) === expectedCustomId),
+  );
+  const customId = selectMenu?.data?.custom_id ?? selectMenu?.custom_id;
+  assert.ok(customId, "expected a rendered settings select menu");
+  return { customId, options: selectMenu.data?.options ?? selectMenu.options ?? [] };
+}
+
+function renderedOption(
+  payload: ComponentPayload,
+  expectedValue: string,
+): string {
+  const option = renderedSelect(payload).options.find((candidate) =>
+    (candidate.value ?? candidate.data?.value)?.replace(/:[a-f0-9]{32}$/, "") === expectedValue,
+  );
+  const value = option?.value ?? option?.data?.value;
+  assert.ok(value, `expected rendered option ${expectedValue}`);
+  return value;
+}
+
+function renderedButton(
+  payload: ComponentPayload,
+  expectedLabel: string,
+  expectedPrefix?: string,
+): string {
+  const button = componentRows(payload).find((component) =>
+    (component.data?.label ?? component.label) === expectedLabel &&
+    (!expectedPrefix || (component.data?.custom_id ?? component.custom_id)?.startsWith(expectedPrefix)),
+  );
+  const customId = button?.data?.custom_id ?? button?.custom_id;
+  assert.ok(customId, `expected rendered settings button ${expectedLabel}`);
+  return customId;
+}
+
+function renderedOptions(payload: ComponentPayload): string[] {
+  return renderedSelect(payload).options.map((option) =>
+    (option.value ?? option.data?.value ?? "").replace(/:[a-f0-9]{32}$/, ""));
+}
+
+async function openSettings(userId: string): Promise<{
+  root: ReturnType<typeof command>;
+  payload: ComponentPayload;
+}> {
+  const root = command(userId, "settings");
+  await dispatch(root);
+  return { root, payload: latestComponentPayload(root) };
+}
+
+async function chooseSettingsCategory(
+  userId: string,
+  root: { localReplies: unknown[] },
+  category: string,
+): Promise<{
+  interaction: ReturnType<typeof select>;
+  payload: ComponentPayload;
+}> {
+  const rootPayload = latestComponentPayload(root);
+  const rootSelect = renderedSelect(rootPayload);
+  const categoryValue = renderedOption(rootPayload, `settings-category:${category}`);
+  const interaction = select(userId, rootSelect.customId, [categoryValue]);
+  await dispatchRaw(interaction);
+  return { interaction, payload: latestComponentPayload(interaction) };
+}
+
+async function chooseSettingsAction(
+  userId: string,
+  category: { interaction: { localReplies: unknown[] }; payload: ComponentPayload },
+  action: string,
+): Promise<ReturnType<typeof select>> {
+  const menu = renderedSelect(category.payload);
+  const value = renderedOption(category.payload, action);
+  const interaction = select(userId, menu.customId, [value]);
+  await dispatchRaw(interaction);
+  return interaction;
+}
+
+function assertDiscordComponentLimits(payload: ComponentPayload): void {
+  assert.ok(payload.components.length <= 5, "Discord messages may contain at most five action rows");
+  for (const row of payload.components) {
+    assert.ok((row.components ?? []).length <= 5, "Discord action rows may contain at most five components");
+    for (const component of row.components ?? []) {
+      const label = component.data?.label ?? component.label;
+      const customId = component.data?.custom_id ?? component.custom_id;
+      if (label) assert.ok(label.length <= 80, `button label is too long: ${label}`);
+      if (customId) assert.ok(customId.length <= 100, `custom ID is too long: ${customId}`);
+      for (const option of component.data?.options ?? component.options ?? []) {
+        const optionLabel = option.label ?? option.data?.label;
+        const optionValue = option.value ?? option.data?.value;
+        if (optionLabel) assert.ok(optionLabel.length <= 100, `select label is too long: ${optionLabel}`);
+        if (optionValue) assert.ok(optionValue.length <= 100, `select value is too long: ${optionValue}`);
+      }
+    }
+  }
+}
+
 async function setMaintenance(active: boolean, actor = "admin-a", reason = "maintenance test"): Promise<void> {
-  const settings = command(actor, "settings");
-  await dispatch(settings);
-  const selectId = lastSettingsSelectId(settings);
-  const nonce = selectId.split(":").at(-1)!;
+  const { root } = await openSettings(actor);
+  const system = await chooseSettingsCategory(actor, root, "system");
   const action = active ? "settings-action:maintenance-enable" : "settings-action:maintenance-disable";
-  const menu = select(actor, selectId, [`${action}:${nonce}`]);
-  await dispatchRaw(menu);
+  const menu = await chooseSettingsAction(actor, system, action);
   if (active) {
     const maintenanceModal = shownModals.at(-1);
     assert.ok(maintenanceModal?.customId.startsWith("settings-modal:maintenance-enable:"));
@@ -567,12 +704,12 @@ test("server owner is authorized but remains subject to the same limit", async (
 test("audits an Administrator security-setting change through the setup interaction handler", async () => {
   await setSecurity({ confirmationsRequired: true });
   const beforeAudits = auditEvents.length;
-  const settings = command("setup-owner", "settings");
-  await dispatch(settings);
-  const selectId = lastSettingsSelectId(settings);
-  const nonce = selectId.split(":").at(-1)!;
-  await dispatchRaw(select("setup-owner", selectId, [`setup:security:${nonce}`]));
-  await dispatchRaw(button("setup-owner", `setup:confirmation:${nonce}`));
+  const { root } = await openSettings("setup-owner");
+  const security = await chooseSettingsCategory("setup-owner", root, "security");
+  const securityPage = await chooseSettingsAction("setup-owner", security, "setup:security");
+  const securityPayload = latestComponentPayload(securityPage);
+  const confirmationButton = renderedButton(securityPayload, "Toggle Confirmation");
+  await dispatchRaw(button("setup-owner", confirmationButton));
   const saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
   assert.equal(saved?.security?.confirmationsRequired, false);
   assert.ok(auditEvents.length > beforeAudits, "configuration change must emit an audit event");
@@ -622,20 +759,23 @@ test("setup unlock always presents and requires a confirmation, even if normal c
       startedBy: "admin-a",
     };
   });
-  const settings = command("setup-owner", "settings");
-  await dispatch(settings);
-  const selectId = lastSettingsSelectId(settings);
-  const nonce = selectId.split(":").at(-1)!;
-  await dispatchRaw(select("setup-owner", selectId, [`setup:security:${nonce}`]));
-  await dispatchRaw(button("setup-owner", `setup:lockdown:${nonce}`));
-  await dispatchRaw(button("setup-owner", `setup:unlock-now:${nonce}`));
+  const { root } = await openSettings("setup-owner");
+  const security = await chooseSettingsCategory("setup-owner", root, "security");
+  const securityPage = await chooseSettingsAction("setup-owner", security, "setup:security");
+  const lockdown = button("setup-owner", renderedButton(latestComponentPayload(securityPage), "Lockdown Settings"));
+  await dispatchRaw(lockdown);
+  const lockdownPayload = latestComponentPayload(lockdown);
+  const unlock = button("setup-owner", renderedButton(lockdownPayload, "Unlock", "setup:"));
+  await dispatchRaw(unlock);
   assert.equal(
     (await getSecurityState(guild.id)).lockdown.active,
     true,
     "opening setup unlock must not unlock the server",
   );
 
-  client!.emit("interactionCreate", button("setup-owner", `setup:confirm-unlock:${nonce}`));
+  const confirmationPayload = latestComponentPayload(unlock);
+  const confirmation = button("setup-owner", renderedButton(confirmationPayload, "Confirm Unlock", "setup:"));
+  client!.emit("interactionCreate", confirmation);
   await settle();
   assert.equal((await getSecurityState(guild.id)).lockdown.active, false);
 });
@@ -702,71 +842,144 @@ test("a target holding a configured protected role is denied before any Trello w
 
 test("rejects setup controls clicked by another administrator and expired setup controls", async () => {
   await setSecurity({});
-  const setup = command("setup-owner", "settings");
-  await dispatch(setup);
-  const selectId = lastSettingsSelectId(setup);
-  const nonce = selectId.split(":").at(-1)!;
-  await dispatchRaw(select("setup-other", selectId, [`setup:security:${nonce}`]));
+  const { root } = await openSettings("setup-owner");
+  const rootPayload = latestComponentPayload(root);
+  const rootSelect = renderedSelect(rootPayload);
+  const securityCategory = renderedOption(rootPayload, "settings-category:security");
+  const category = select("setup-owner", rootSelect.customId, [securityCategory]);
+  await dispatchRaw(category);
+  const categoryPayload = latestComponentPayload(category);
+  const categorySelect = renderedSelect(categoryPayload);
+  const securityPage = renderedOption(categoryPayload, "setup:security");
+  await dispatchRaw(select("setup-other", categorySelect.customId, [securityPage]));
   assert.match(replies.at(-1) ?? "", /setup session has expired|belongs to another administrator/i);
+  await dispatchRaw(select("setup-owner", categorySelect.customId, [securityPage], "component-message-stale"));
+  assert.match(replies.at(-1) ?? "", /older settings message|expired session/i);
 
   const realNow = Date.now;
   Date.now = () => realNow() + 11 * 60_000;
   try {
-    await dispatchRaw(select("setup-owner", selectId, [`setup:security:${nonce}`]));
+    await dispatchRaw(select("setup-owner", categorySelect.customId, [securityPage]));
     assert.match(replies.at(-1) ?? "", /settings session has expired/i);
   } finally {
     Date.now = realNow;
   }
 });
 
-test("/settings exposes every consolidated action and opens nonce-bound parameter modals", async () => {
+test("/settings traverses categories and opens nonce-bound parameter modals", async () => {
   await setSecurity({ confirmationsRequired: true });
   shownModals.splice(0);
-  const settings = command("admin-a", "settings");
-  await dispatch(settings);
-  const selectId = lastSettingsSelectId(settings);
-  const nonce = selectId.split(":").at(-1)!;
-  const menu = settings.localReplies.find(
-    (reply): reply is { components: Array<{ components: Array<{ data: { options: Array<{ value: string }> } }> }> } =>
-      typeof reply === "object" && reply !== null && "components" in reply,
-  );
-  const selectData = menu?.components[0]?.components[0] as unknown as {
-    data?: { options?: Array<{ value: string }> };
-    options?: Array<{ value: string }>;
-  } | undefined;
-  const choices = (selectData?.data?.options ?? selectData?.options ?? [])
-    .map((choice) => (choice.value ?? (choice as unknown as { data?: { value?: string } }).data?.value ?? "")
-      .replace(/:[a-f0-9]{32}$/, ""));
-  for (const required of [
-    "setup:blacklist", "setup:trello", "setup:security", "setup:audit",
-    "setup:discord", "setup:identity", "setup:view",
-    "settings-action:group", "settings-action:note", "settings-action:sync",
-    "settings-action:identity-lookup", "settings-action:status",
-    "settings-action:maintenance-enable", "settings-action:maintenance-disable",
-    "settings-action:lockdown", "settings-action:unlock",
-  ]) assert.ok(choices.includes(required), `missing consolidated action ${required}`);
+  const expectedCategories: Record<string, string[]> = {
+    moderation: [
+      "setup:blacklist", "settings-action:group", "settings-action:note",
+      "settings-action:identity-lookup",
+    ],
+    integrations: ["setup:trello", "settings-action:sync"],
+    security: [
+      "setup:security", "settings-action:lockdown", "settings-action:unlock",
+      "setup:identity",
+    ],
+    logs: ["setup:audit", "setup:discord"],
+    system: [
+      "settings-action:status", "settings-action:maintenance-enable",
+      "settings-action:maintenance-disable", "setup:bot-state", "setup:view",
+    ],
+  };
+  const rootResult = await openSettings("admin-a");
+  assert.deepEqual(renderedOptions(rootResult.payload), [
+    "settings-category:moderation",
+    "settings-category:integrations",
+    "settings-category:security",
+    "settings-category:logs",
+    "settings-category:system",
+  ]);
+  for (const [categoryName, expectedOptions] of Object.entries(expectedCategories)) {
+    const { payload } = await chooseSettingsCategory("admin-a", rootResult.root, categoryName);
+    assert.deepEqual(
+      renderedOptions(payload),
+      expectedOptions,
+      `${categoryName} should expose only its related settings`,
+    );
+  }
 
-  for (const [action, expectedModal] of [
-    ["settings-action:group", "settings-modal:group:"],
-    ["settings-action:note", "settings-modal:note:"],
-    ["settings-action:identity-lookup", "settings-modal:identity-lookup:"],
-    ["settings-action:maintenance-enable", "settings-modal:maintenance-enable:"],
-    ["settings-action:lockdown", "settings-modal:lockdown:"],
-    ["settings-action:unlock", "settings-modal:unlock:"],
+  for (const [categoryName, action, expectedModal] of [
+    ["moderation", "settings-action:group", "settings-modal:group:"],
+    ["moderation", "settings-action:note", "settings-modal:note:"],
+    ["moderation", "settings-action:identity-lookup", "settings-modal:identity-lookup:"],
+    ["system", "settings-action:maintenance-enable", "settings-modal:maintenance-enable:"],
+    ["security", "settings-action:lockdown", "settings-modal:lockdown:"],
+    ["security", "settings-action:unlock", "settings-modal:unlock:"],
   ] as const) {
-    await dispatchRaw(select("admin-a", selectId, [`${action}:${nonce}`]));
+    const { root } = await openSettings("admin-a");
+    const category = await chooseSettingsCategory("admin-a", root, categoryName);
+    await chooseSettingsAction("admin-a", category, action);
     assert.ok(shownModals.at(-1)?.customId.startsWith(expectedModal), `${action} should open its modal`);
   }
+});
+
+test("settings navigation returns through categories, nested pages, and saved results", async () => {
+  await setSecurity({ confirmationsRequired: false });
+
+  const first = await openSettings("admin-a");
+  assertDiscordComponentLimits(first.payload);
+  const moderation = await chooseSettingsCategory("admin-a", first.root, "moderation");
+  assert.equal(moderation.interaction.replied, true, "category selection must acknowledge with update");
+  assertDiscordComponentLimits(moderation.payload);
+  const categoryBack = renderedButton(moderation.payload, "Back to Categories", "settings:");
+  await dispatchRaw(button("admin-a", categoryBack));
+  const rootAfterCategoryBack = latestComponentPayload(first.root);
+  assert.ok(renderedSelect(rootAfterCategoryBack).customId.startsWith("settings:select:"));
+
+  const security = await chooseSettingsCategory("admin-a", first.root, "security");
+  const securityPage = await chooseSettingsAction("admin-a", security, "setup:security");
+  assert.equal(securityPage.replied, true, "deeper settings page must acknowledge with update");
+  const securityPayload = latestComponentPayload(securityPage);
+  assertDiscordComponentLimits(securityPayload);
+  const lockdownButton = renderedButton(securityPayload, "Lockdown Settings");
+  const lockdown = button("admin-a", lockdownButton);
+  await dispatchRaw(lockdown);
+  assert.equal(lockdown.replied, true, "nested settings page must acknowledge with update");
+  const lockdownPayload = latestComponentPayload(lockdown);
+  assertDiscordComponentLimits(lockdownPayload);
+  const lockdownBack = renderedButton(lockdownPayload, "Back", "settings:");
+  const lockdownBackInteraction = button("admin-a", lockdownBack);
+  await dispatchRaw(lockdownBackInteraction);
+  const securityAgain = latestComponentPayload(lockdownBackInteraction);
+  assert.ok(renderedButton(securityAgain, "Back to Category", "settings:"));
+  const securityBack = renderedButton(securityAgain, "Back to Category", "settings:");
+  const securityBackInteraction = button("admin-a", securityBack);
+  await dispatchRaw(securityBackInteraction);
+  const securityCategoryAgain = latestComponentPayload(securityBackInteraction);
+  assert.ok(renderedSelect(securityCategoryAgain).customId.startsWith("settings:option:security:"));
+  const rootBack = renderedButton(securityCategoryAgain, "Back to Categories", "settings:");
+  const rootBackInteraction = button("admin-a", rootBack);
+  await dispatchRaw(rootBackInteraction);
+  assert.ok(renderedSelect(latestComponentPayload(rootBackInteraction)).customId.startsWith("settings:select:"));
+
+  const integrationRoot = await openSettings("admin-a");
+  const integrations = await chooseSettingsCategory("admin-a", integrationRoot.root, "integrations");
+  const sync = await chooseSettingsAction("admin-a", integrations, "settings-action:sync");
+  assert.equal(sync.deferred, true, "report-only sync must acknowledge with deferUpdate");
+
+  const saveRoot = await openSettings("admin-a");
+  const saveIntegrations = await chooseSettingsCategory("admin-a", saveRoot.root, "integrations");
+  const trelloPage = await chooseSettingsAction("admin-a", saveIntegrations, "setup:trello");
+  const trelloPayload = latestComponentPayload(trelloPage);
+  const toggle = renderedButton(trelloPayload, "Toggle manual alerts");
+  const saved = button("admin-a", toggle);
+  await dispatchRaw(saved);
+  assert.equal(saved.replied, true, "save action must acknowledge with update");
+  const savedPayload = latestComponentPayload(saved);
+  assertDiscordComponentLimits(savedPayload);
+  assert.ok(renderedButton(savedPayload, "Back to Category", "settings:"));
 });
 
 test("a /settings group-blacklist modal preserves confirmation binding and executes real moderation", async () => {
   await setSecurity({ confirmationsRequired: true, perAdminLimit: 20, globalLimit: 20 });
   const before = trelloCardCreations.length;
-  const settings = command("admin-a", "settings");
-  await dispatch(settings);
-  const selectId = lastSettingsSelectId(settings);
-  const nonce = selectId.split(":").at(-1)!;
-  await dispatchRaw(select("admin-a", selectId, [`settings-action:group:${nonce}`]));
+  const { root } = await openSettings("admin-a");
+  const category = await chooseSettingsCategory("admin-a", root, "moderation");
+  await chooseSettingsAction("admin-a", category, "settings-action:group");
   const groupModal = shownModals.at(-1);
   assert.ok(groupModal?.customId.startsWith("settings-modal:group:"));
   const submitted = modal("admin-a", groupModal!.customId, { id: "777001", reason: "settings modal regression" });
@@ -780,34 +993,37 @@ test("a /settings group-blacklist modal preserves confirmation binding and execu
 
 test("/settings restricts the maintenance menu while allowing emergency status", async () => {
   await setSecurity({});
+  const preMaintenance = await openSettings("admin-a");
+  const moderation = await chooseSettingsCategory("admin-a", preMaintenance.root, "moderation");
+  const staleNormalControl = {
+    customId: renderedSelect(moderation.payload).customId,
+    value: renderedOption(moderation.payload, "settings-action:group"),
+    messageId: latestComponentMessageId,
+  };
   await setMaintenance(true, "admin-a", "settings emergency restriction");
-  const settings = command("admin-a", "settings");
-  await dispatch(settings);
-  const selectId = lastSettingsSelectId(settings);
-  const nonce = selectId.split(":").at(-1)!;
-  const menu = settings.localReplies.find(
-    (reply): reply is { components: Array<{ components: Array<{ data: { options: Array<{ value: string }> } }> }> } =>
-      typeof reply === "object" && reply !== null && "components" in reply,
-  );
-  const selectData = menu?.components[0]?.components[0] as unknown as {
-    data?: { options?: Array<{ value: string }> };
-    options?: Array<{ value: string }>;
-  } | undefined;
-  const choices = (selectData?.data?.options ?? selectData?.options ?? [])
-    .map((choice) => (choice.value ?? (choice as unknown as { data?: { value?: string } }).data?.value ?? "")
-      .replace(/:[a-f0-9]{32}$/, ""));
-  assert.deepEqual(choices.sort(), [
-    "settings-action:status", "settings-action:maintenance-enable",
-    "settings-action:maintenance-disable", "settings-action:lockdown",
-    "settings-action:unlock",
-  ].sort());
-  const status = select("admin-a", selectId, [`settings-action:status:${nonce}`]);
-  await dispatchRaw(status);
+  const { root } = await openSettings("admin-a");
+  assert.deepEqual(renderedOptions(latestComponentPayload(root)).sort(), [
+    "settings-category:security", "settings-category:system",
+  ]);
+  const system = await chooseSettingsCategory("admin-a", root, "system");
+  assert.deepEqual(renderedOptions(system.payload), [
+    "settings-action:status", "settings-action:maintenance-disable",
+  ]);
+  const status = await chooseSettingsAction("admin-a", system, "settings-action:status");
   assert.ok(status.replied, "status selection must acknowledge with update");
+  await dispatchRaw(select(
+    "admin-a",
+    staleNormalControl.customId,
+    [staleNormalControl.value],
+    staleNormalControl.messageId,
+  ));
   const beforeRequests = providerRequests;
-  await dispatchRaw(select("admin-a", selectId, [`settings-action:group:${nonce}`]));
   assert.equal(providerRequests, beforeRequests, "maintenance must block forged normal actions before providers");
-  assert.match(replies.at(-1) ?? "", /BOT UNDER MAINTENANCE/i);
+  assert.match(
+    replies.at(-1) ?? "",
+    /BOT UNDER MAINTENANCE|expired session/i,
+    "maintenance must block stale normal navigation without invoking a provider",
+  );
   await setMaintenance(false, "admin-a", "restriction test complete");
 });
 
@@ -819,11 +1035,9 @@ test("/settings performs first-time audit-channel setup through its modal", asyn
       revision: state.maintenance.revision + 1,
     };
   });
-  const settings = command("admin-a", "settings");
-  await dispatch(settings);
-  const selectId = lastSettingsSelectId(settings);
-  const nonce = selectId.split(":").at(-1)!;
-  await dispatchRaw(select("admin-a", selectId, [`settings-action:initial-audit:${nonce}`]));
+  const { root } = await openSettings("admin-a");
+  const system = await chooseSettingsCategory("admin-a", root, "system");
+  await chooseSettingsAction("admin-a", system, "settings-action:initial-audit");
   const initial = shownModals.at(-1);
   assert.ok(initial?.customId.startsWith("settings-modal:initial-audit:"));
   await dispatchRaw(modal("admin-a", initial!.customId, { audit_channel_id: "12345678901234567" }));

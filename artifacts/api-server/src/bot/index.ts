@@ -190,7 +190,14 @@ let recoveryAttempt: Promise<BotRefreshResult> | null = null;
 let trelloRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let blacklistSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let shutdownHooksInstalled = false;
-const setupSessions = new Map<string, {
+type SettingsCategory = "moderation" | "integrations" | "security" | "logs" | "system";
+
+type SettingsLocation =
+  | { kind: "root" }
+  | { kind: "category"; category: SettingsCategory }
+  | { kind: "page"; id: string; parent: SettingsLocation };
+
+interface SetupSession {
   userId: string;
   guildId: string;
   expiresAt: number;
@@ -199,7 +206,10 @@ const setupSessions = new Map<string, {
   messageId?: string;
   /** `/settings` controls always carry the session nonce in their custom ID. */
   nonceRequired?: boolean;
-}>();
+  /** `/settings` keeps a small, explicit navigation stack for safe Back controls. */
+  navigation?: SettingsLocation[];
+}
+const setupSessions = new Map<string, SetupSession>();
 const confirmations = new Map<string, {
   userId: string;
   guildId: string;
@@ -593,53 +603,259 @@ function errorResponse(message: string, title = "Command Error") {
   return responseWithEmbed(message, title, "error");
 }
 
+const settingsCategories: Array<{
+  id: SettingsCategory;
+  label: string;
+  description: string;
+}> = [
+  { id: "moderation", label: "Moderation", description: "Blacklist rules, records, and identity lookup" },
+  { id: "integrations", label: "Integrations", description: "Trello configuration and monitoring" },
+  { id: "security", label: "Security", description: "Lockdown, access safeguards, and identity detection" },
+  { id: "logs", label: "Logs & Server", description: "Audit destinations and Discord policy" },
+  { id: "system", label: "System", description: "Status, maintenance, bot state, and configuration" },
+];
+
+type SettingsOption = {
+  label: string;
+  value: string;
+  description: string;
+};
+
+function settingsRootCategories(configured: boolean, maintenance: boolean): typeof settingsCategories {
+  // A maintenance page must not reveal ordinary configuration controls. Before
+  // setup the same small emergency surface remains available so a broken or
+  // partially configured guild can still recover.
+  if (maintenance || !configured) {
+    return settingsCategories.filter((category) =>
+      category.id === "system" || category.id === "security");
+  }
+  return settingsCategories;
+}
+
+function settingsCategoryOptions(
+  category: SettingsCategory,
+  configured: boolean,
+  maintenance: boolean,
+): SettingsOption[] {
+  if (maintenance) {
+    if (category === "system") {
+      return [
+        { label: "System Status", value: "settings-action:status", description: "View current emergency and command status" },
+        { label: "Disable Maintenance", value: "settings-action:maintenance-disable", description: "Restore normal administration" },
+      ];
+    }
+    if (category === "security") {
+      return [
+        { label: "Security Lockdown", value: "settings-action:lockdown", description: "Immediately stop destructive actions" },
+        { label: "Security Unlock", value: "settings-action:unlock", description: "Unlock after confirmation" },
+      ];
+    }
+    return [];
+  }
+
+  if (!configured) {
+    if (category === "system") {
+      return [
+        { label: "Complete First-time Setup", value: "settings-action:initial-audit", description: "Verify an audit channel before enabling commands" },
+        { label: "System Status", value: "settings-action:status", description: "View setup and command registration status" },
+        { label: "Enable Maintenance", value: "settings-action:maintenance-enable", description: "Temporarily lock normal administration" },
+        { label: "Disable Maintenance", value: "settings-action:maintenance-disable", description: "Restore normal administration" },
+      ];
+    }
+    if (category === "security") {
+      return [
+        { label: "Security Lockdown", value: "settings-action:lockdown", description: "Immediately stop destructive actions" },
+        { label: "Security Unlock", value: "settings-action:unlock", description: "Unlock after confirmation" },
+      ];
+    }
+    return [];
+  }
+
+  switch (category) {
+    case "moderation":
+      return [
+        { label: "Blacklist Rules", value: "setup:blacklist", description: "Discord role and Trello list mappings" },
+        { label: "Blacklist a Group", value: "settings-action:group", description: "Create a group blacklist record" },
+        { label: "Add Blacklist Note", value: "settings-action:note", description: "Record a durable moderation note" },
+        { label: "Identity Lookup", value: "settings-action:identity-lookup", description: "Search recorded associations" },
+      ];
+    case "integrations":
+      return [
+        { label: "Trello Configuration", value: "setup:trello", description: "Monitoring and polling configuration" },
+        { label: "Sync Monitoring Report", value: "settings-action:sync", description: "Run a monitoring-only Trello report" },
+      ];
+    case "security":
+      return [
+        { label: "Security Configuration", value: "setup:security", description: "Limits, protections, and confirmations" },
+        { label: "Security Lockdown", value: "settings-action:lockdown", description: "Immediately stop destructive actions" },
+        { label: "Security Unlock", value: "settings-action:unlock", description: "Unlock after confirmation" },
+        { label: "Identity Detection", value: "setup:identity", description: "Warning-only association controls" },
+      ];
+    case "logs":
+      return [
+        { label: "Audit Configuration", value: "setup:audit", description: "Destinations and retained log categories" },
+        { label: "Discord Configuration", value: "setup:discord", description: "View server authorization policy" },
+      ];
+    case "system":
+      return [
+        { label: "System Status", value: "settings-action:status", description: "View command, Trello, and security status" },
+        { label: "Enable Maintenance", value: "settings-action:maintenance-enable", description: "Temporarily lock normal administration" },
+        { label: "Disable Maintenance", value: "settings-action:maintenance-disable", description: "Restore normal administration" },
+        { label: "Bot State", value: "setup:bot-state", description: "View emergency availability and controls" },
+        { label: "View Configuration", value: "setup:view", description: "Review active server configuration" },
+      ];
+  }
+}
+
 function settingsMenu(nonce: string, configured: boolean, maintenance = false): {
   embeds: EmbedBuilder[];
   components: Array<ActionRowBuilder<StringSelectMenuBuilder>>;
 } {
-  const emergency = [
-    { label: "System Status", value: "settings-action:status", description: "View command, Trello, and security status" },
-    { label: "Enable Maintenance", value: "settings-action:maintenance-enable", description: "Temporarily lock normal administration" },
-    { label: "Disable Maintenance", value: "settings-action:maintenance-disable", description: "Restore normal administration" },
-    { label: "Security Lockdown", value: "settings-action:lockdown", description: "Immediately stop destructive actions" },
-    { label: "Security Unlock", value: "settings-action:unlock", description: "Unlock after a confirmation" },
-  ];
-  const configuredOptions = [
-    { label: "Blacklist Settings", value: "setup:blacklist", description: "Roles and Trello mapping" },
-    { label: "Trello Monitoring", value: "setup:trello", description: "Monitoring and polling configuration" },
-    { label: "Security Settings", value: "setup:security", description: "Limits, protections, and confirmations" },
-    { label: "Audit Settings", value: "setup:audit", description: "Audit channels and log categories" },
-    { label: "Discord Settings", value: "setup:discord", description: "View Discord configuration" },
-    { label: "Identity / Alt Detection", value: "setup:identity", description: "Warning-only association controls" },
-    { label: "View Configuration", value: "setup:view", description: "Review active configuration" },
-    { label: "Blacklist a Group", value: "settings-action:group", description: "Create a group blacklist record" },
-    { label: "Add Blacklist Note", value: "settings-action:note", description: "Record a durable audit note" },
-    { label: "Sync Monitoring Report", value: "settings-action:sync", description: "Run a monitoring-only Trello report" },
-    { label: "Identity Lookup", value: "settings-action:identity-lookup", description: "Search recorded associations" },
-  ];
-  const options = maintenance
-    ? emergency
-    : configured
-      ? [...configuredOptions, ...emergency]
-      : [
-          { label: "Complete First-time Setup", value: "settings-action:initial-audit", description: "Verify the audit channel before enabling commands" },
-          ...emergency,
-        ];
+  const categories = settingsRootCategories(configured, maintenance);
   return {
     embeds: [brandedEmbed(
-      maintenance ? "EMERGENCY SETTINGS" : "ADMINISTRATION",
+      maintenance ? "EMERGENCY SETTINGS" : "QUARTERMASTER SETTINGS",
       maintenance
-        ? "Maintenance is active. Only status, maintenance, and security emergency controls are available."
+        ? "Maintenance is active. Choose an emergency category. Normal configuration and moderation controls are hidden and remain unavailable."
         : configured
-           ? "Select an administration action. Every control is private, expires after 10 minutes, and re-checks your current Administrator permission.\n\n**Configuration:** Blacklist, Trello Monitoring, Security, Audit, Discord, Identity / Alt Detection, View Configuration\n**Operations:** Blacklist a Group, Add Blacklist Note, Sync Monitoring Report, Identity Lookup\n**Emergency:** System Status, Enable / Disable Maintenance, Security Lockdown, Security Unlock\n**Standalone commands:** `/blacklist`, `/revoke_blacklist`, and `/blacklist_lookup`."
-          : "Initial setup is required. Start by supplying a verified audit-channel ID; emergency and status controls remain available.\n\n**Available here:** first-time audit setup, System Status, Enable / Disable Maintenance, Security Lockdown, and Security Unlock.",
+          ? "Choose a category to manage Quartermaster. Controls are private, expire after 10 minutes, and re-check your current Administrator permission.\n\n**Moderation** covers blacklist rules and records. **Integrations** covers Trello. **Security** covers safeguards and identity detection. **Logs & Server** covers audit and Discord policy. **System** covers status and maintenance."
+          : "Initial setup is required. Open System to verify an audit channel; emergency status and security controls remain available.",
     )],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
       new StringSelectMenuBuilder()
         .setCustomId(`settings:select:${nonce}`)
-        .setPlaceholder("Choose a Quartermaster action")
-        .addOptions(options.map((option) => ({ ...option, value: `${option.value}:${nonce}` }))),
+        .setPlaceholder("Choose a settings category")
+        .addOptions(categories.map((category) => ({
+          label: category.label,
+          value: `settings-category:${category.id}:${nonce}`,
+          description: category.description,
+        }))),
     )],
+  };
+}
+
+function settingsCategoryMenu(
+  nonce: string,
+  category: SettingsCategory,
+  configured: boolean,
+  maintenance: boolean,
+): {
+  embeds: EmbedBuilder[];
+  components: Array<ActionRowBuilder<StringSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>>;
+} {
+  const definition = settingsCategories.find((candidate) => candidate.id === category);
+  if (!definition) throw new Error("That settings category is not available.");
+  const options = settingsCategoryOptions(category, configured, maintenance);
+  if (!options.length) {
+    throw new Error("That settings category is unavailable while maintenance or initial setup is active.");
+  }
+  return {
+    embeds: [brandedEmbed(
+      definition.label,
+      maintenance
+        ? "Only emergency controls are available while maintenance is active. Choose an action or return to categories."
+        : `Choose a ${definition.label.toLowerCase()} setting or action. Related controls are grouped here; use Back to return to categories.`,
+    )],
+    // Discord select menus and buttons cannot share a row. Keep Back in its
+    // own row so every category page has an obvious, safe parent.
+    components: [
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`settings:option:${category}:${nonce}`)
+          .setPlaceholder(`Choose a ${definition.label.toLowerCase()} option`)
+          .addOptions(options.map((option) => ({
+            ...option,
+            value: `${option.value}:${nonce}`,
+          }))),
+      ),
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`settings:back:root:${nonce}`)
+          .setLabel("Back to Categories")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  };
+}
+
+function settingsRootLocation(): SettingsLocation {
+  return { kind: "root" };
+}
+
+function settingsCategoryLocation(category: SettingsCategory): SettingsLocation {
+  return { kind: "category", category };
+}
+
+function settingsPageLocation(id: string, parent: SettingsLocation): SettingsLocation {
+  return { kind: "page", id, parent };
+}
+
+function settingsNavigation(session: SetupSession): SettingsLocation[] {
+  return session.navigation?.length ? session.navigation : [settingsRootLocation()];
+}
+
+function settingsCurrentParent(session: SetupSession): SettingsLocation {
+  const stack = settingsNavigation(session);
+  const current = stack.at(-1)!;
+  if (current.kind === "page") return current.parent;
+  if (current.kind === "category") return stack.at(-2) ?? settingsRootLocation();
+  return settingsRootLocation();
+}
+
+function settingsBackButton(target: SettingsLocation, nonce: string): ButtonBuilder {
+  if (target.kind === "root") {
+    return new ButtonBuilder()
+      .setCustomId(`settings:back:root:${nonce}`)
+      .setLabel("Back to Categories")
+      .setStyle(ButtonStyle.Secondary);
+  }
+  if (target.kind === "category") {
+    return new ButtonBuilder()
+      .setCustomId(`settings:back:category:${target.category}:${nonce}`)
+      .setLabel("Back to Category")
+      .setStyle(ButtonStyle.Secondary);
+  }
+  return new ButtonBuilder()
+    .setCustomId(`settings:back:page:${target.id}:${nonce}`)
+    .setLabel("Back")
+    .setStyle(ButtonStyle.Secondary);
+}
+
+function settingsPayloadHasConfirmation(payload: unknown): boolean {
+  const found = (value: unknown): boolean => {
+    if (!value || typeof value !== "object") return false;
+    const candidate = value as { data?: { custom_id?: string }; components?: unknown[] };
+    if (candidate.data?.custom_id &&
+        /^(?:confirm|cancel|maintenance-confirm|maintenance-cancel):/.test(candidate.data.custom_id)) {
+      return true;
+    }
+    return (candidate.components ?? []).some(found);
+  };
+  return found(payload);
+}
+
+function withSettingsBack(payload: unknown, session: SetupSession): unknown {
+  if (!payload || typeof payload !== "object" || settingsPayloadHasConfirmation(payload)) return payload;
+  // The root has no parent. This guard also keeps compatibility requests that
+  // invoke an old action value directly from producing a dead Back button.
+  if (settingsNavigation(session).at(-1)?.kind === "root") return payload;
+  const data = payload as { components?: unknown[] };
+  const components = Array.isArray(data.components) ? data.components : [];
+  if (components.some((component) => {
+    const candidate = component as { components?: unknown[] };
+    return (candidate.components ?? []).some((child) => {
+      const id = (child as { data?: { custom_id?: string } }).data?.custom_id;
+      return id?.startsWith("settings:back:");
+    });
+  })) return payload;
+  return {
+    ...data,
+    components: [
+      ...components,
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        settingsBackButton(settingsCurrentParent(session), session.nonce),
+      ),
+    ],
   };
 }
 
@@ -683,7 +899,7 @@ function setupMenu(nonce: string): {
 
 async function requireSettingsSession(
   interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
-): Promise<{ session: NonNullable<(typeof setupSessions extends Map<string, infer T> ? T : never)>; setup?: GuildSetup }> {
+): Promise<{ session: SetupSession; setup?: GuildSetup }> {
   if (!interaction.guild) throw new Error("Settings are only available in the configured server.");
   const session = setupSessions.get(setupSessionId(interaction.guild.id, interaction.user.id));
   if (!session || session.expiresAt <= Date.now() || session.guildId !== interaction.guild.id) {
@@ -718,6 +934,7 @@ async function handleSettings(
   setupSessions.set(setupSessionId(guild.id, interaction.user.id), {
     userId: interaction.user.id, guildId: guild.id, expiresAt: Date.now() + setupSessionLifetimeMs,
     messageId: response?.id, nonce, nonceRequired: true,
+    navigation: [settingsRootLocation()],
   });
 }
 
@@ -860,10 +1077,128 @@ async function renderSecurityStatus(
   });
 }
 
+function settingsCategoryForAction(id: string): SettingsCategory | undefined {
+  if (
+    id === "setup:blacklist" ||
+    id === "settings-action:group" ||
+    id === "settings-action:note" ||
+    id === "settings-action:identity-lookup"
+  ) return "moderation";
+  if (id === "setup:trello" || id === "settings-action:sync") return "integrations";
+  if (
+    id === "setup:security" ||
+    id === "setup:lockdown" ||
+    id === "setup:identity" ||
+    id === "settings-action:lockdown" ||
+    id === "settings-action:unlock"
+  ) return "security";
+  if (id === "setup:audit" || id === "setup:discord") return "logs";
+  if (
+    id === "setup:bot-state" ||
+    id === "setup:view" ||
+    id === "settings-action:status" ||
+    id === "settings-action:initial-audit" ||
+    id === "settings-action:maintenance-enable" ||
+    id === "settings-action:maintenance-disable"
+  ) return "system";
+  return undefined;
+}
+
+function settingsNavigationId(id: string): boolean {
+  return id.startsWith("settings:back:") || id.startsWith("settings-category:");
+}
+
+function setSettingsPage(
+  session: SetupSession,
+  id: string,
+  category = settingsCategoryForAction(id),
+): void {
+  if (!category) return;
+  const categoryLocation = settingsCategoryLocation(category);
+  const current = settingsNavigation(session).at(-1);
+  if (current?.kind === "page" && current.id === id) return;
+  session.navigation = [
+    settingsRootLocation(),
+    categoryLocation,
+    settingsPageLocation(id, categoryLocation),
+  ];
+}
+
+async function renderSettingsBack(
+  interaction: ButtonInteraction | StringSelectMenuInteraction,
+  session: SetupSession,
+  setup: GuildSetup | undefined,
+  target: string,
+): Promise<void> {
+  const guild = interaction.guild!;
+  if (target === "root") {
+    const state = await getSecurityState(guild.id);
+    session.navigation = [settingsRootLocation()];
+    await interaction.update(settingsMenu(session.nonce, Boolean(setup), state.maintenance.active));
+    return;
+  }
+  if (target.startsWith("category:")) {
+    const category = target.slice("category:".length) as SettingsCategory;
+    if (!settingsCategories.some((candidate) => candidate.id === category)) {
+      throw new Error("That settings category is not available.");
+    }
+    const state = await getSecurityState(guild.id);
+    if (!settingsRootCategories(Boolean(setup), state.maintenance.active)
+      .some((candidate) => candidate.id === category)) {
+      throw new Error(maintenanceMessage);
+    }
+    session.navigation = [settingsRootLocation(), settingsCategoryLocation(category)];
+    await interaction.update(settingsCategoryMenu(
+      session.nonce,
+      category,
+      Boolean(setup),
+      state.maintenance.active,
+    ));
+    return;
+  }
+  // The only currently nested settings page is Security Lockdown. Keep this
+  // explicit rather than allowing an arbitrary page ID to become a renderer.
+  // This is also what prevents a stale Back control from bypassing a modal or
+  // confirmation flow.
+  if (target === "page:setup:security") {
+    if (!setup) throw new Error("Complete first-time setup before changing these settings.");
+    const state = await getSecurityState(guild.id);
+    if (state.maintenance.active) throw new Error(maintenanceMessage);
+    const categoryLocation = settingsCategoryLocation("security");
+    session.navigation = [
+      settingsRootLocation(),
+      categoryLocation,
+      settingsPageLocation("setup:security", categoryLocation),
+    ];
+    const payload = {
+      embeds: [securityEmbed(setup, state)],
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId("setup:rates").setLabel("Edit Rate Limits").setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId("setup:lockdown").setLabel("Lockdown Settings").setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId("setup:protected-users").setLabel("Protected Users").setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId("setup:protected-roles").setLabel("Protected Roles").setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId("setup:confirmation").setLabel("Toggle Confirmation").setStyle(ButtonStyle.Secondary),
+        ),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId("setup:escalation-protection").setLabel("Permission Escalation Guard").setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId("setup:security-reset").setLabel("Reset Security Defaults").setStyle(ButtonStyle.Secondary),
+        ),
+      ],
+    };
+    await interaction.update(sealSettingsComponents(
+      withSettingsBack(payload, session),
+      session.nonce,
+    ) as never);
+    return;
+  }
+  throw new Error("That settings page is no longer available. Run /settings again.");
+}
+
 async function handleSettingsComponent(
   interaction: ButtonInteraction | StringSelectMenuInteraction,
 ): Promise<void> {
-  const { setup } = await requireSettingsSession(interaction);
+  const { session, setup } = await requireSettingsSession(interaction);
   const raw = interaction.isStringSelectMenu() ? interaction.values[0]! : interaction.customId;
   const id = raw.replace(/:([a-f0-9]{32})$/, "");
   const state = await getSecurityState(interaction.guild!.id);
@@ -871,9 +1206,65 @@ async function handleSettingsComponent(
     "settings-action:status", "settings-action:maintenance-enable", "settings-action:maintenance-disable",
     "settings-action:lockdown", "settings-action:unlock",
   ]);
-  if (state.maintenance.active && !emergency.has(id)) {
+  if (id === "settings:back:root") {
+    const current = settingsNavigation(session).at(-1);
+    if (current?.kind !== "category") {
+      throw new Error("This settings control is stale. Return to /settings and choose a category again.");
+    }
+    await renderSettingsBack(interaction, session, setup, "root");
+    return;
+  }
+  if (id.startsWith("settings:back:category:")) {
+    const targetCategory = id.slice("settings:back:category:".length) as SettingsCategory;
+    const expected = settingsCurrentParent(session);
+    if (expected.kind !== "category" || expected.category !== targetCategory) {
+      throw new Error("This settings control is stale. Return to /settings and choose a category again.");
+    }
+    await renderSettingsBack(interaction, session, setup, `category:${targetCategory}`);
+    return;
+  }
+  if (id.startsWith("settings:back:page:")) {
+    const targetPage = id.slice("settings:back:page:".length);
+    const expected = settingsCurrentParent(session);
+    if (expected.kind !== "page" || expected.id !== targetPage) {
+      throw new Error("This settings control is stale. Return to /settings and choose a page again.");
+    }
+    await renderSettingsBack(interaction, session, setup, `page:${targetPage}`);
+    return;
+  }
+  if (id.startsWith("settings-category:")) {
+    const category = id.slice("settings-category:".length) as SettingsCategory;
+    if (!settingsCategories.some((candidate) => candidate.id === category)) {
+      throw new Error("That settings category is not available.");
+    }
+    if (!settingsRootCategories(Boolean(setup), state.maintenance.active)
+      .some((candidate) => candidate.id === category)) {
+      throw new Error(maintenanceMessage);
+    }
+    session.navigation = [settingsRootLocation(), settingsCategoryLocation(category)];
+    await interaction.update(settingsCategoryMenu(
+      session.nonce,
+      category,
+      Boolean(setup),
+      state.maintenance.active,
+    ));
+    return;
+  }
+  if (state.maintenance.active && !emergency.has(id) && !settingsNavigationId(id)) {
     throw new Error(maintenanceMessage);
   }
+  const category = settingsCategoryForAction(id);
+  if (interaction.isStringSelectMenu() && interaction.customId.startsWith("settings:option:")) {
+    const selectedCategory = interaction.customId.split(":")[2] as SettingsCategory | undefined;
+    if (!category || category !== selectedCategory) {
+      throw new Error("That settings option does not belong to this category.");
+    }
+  }
+  // Modal and report actions leave the category message in place; its
+  // existing Back control must remain valid while the modal/confirmation is
+  // being completed. A setup:* selection renders a deeper page and therefore
+  // advances the explicit navigation stack.
+  if (category && id.startsWith("setup:")) setSettingsPage(session, id, category);
   if (id.startsWith("setup:")) {
     if (!setup) throw new Error("Complete first-time setup before changing these settings.");
     // Existing category handlers contain the durable validation and audit
@@ -887,7 +1278,9 @@ async function handleSettingsComponent(
       user: interaction.user,
       // A select must be acknowledged with update/deferUpdate, not editReply
       // before its initial response.
-      editReply: async (payload) => interaction.update(payload),
+      editReply: async (payload) => interaction.update(
+        sealSettingsComponents(withSettingsBack(payload, session), session.nonce) as never,
+      ),
     }, setup);
     return;
   }
@@ -949,7 +1342,7 @@ async function handleSettingsComponent(
     await interaction.deferUpdate();
     await runGuildBlacklistSync(interaction.guild!, "manual");
     const sync = getBlacklistSyncStatus();
-    await interaction.editReply({
+    await interaction.editReply(sealSettingsComponents(withSettingsBack({
       embeds: [outcomeEmbed("Trello Monitoring", "Report-only synchronization is complete. Manual Trello changes never modify Discord state.", sync.counts.issues ? "warning" : "success", [
         { name: "State", value: titleCaseHeading(sync.state), inline: true },
         { name: "Indexed", value: String(sync.counts.indexed), inline: true },
@@ -957,7 +1350,7 @@ async function handleSettingsComponent(
       ])],
       allowedMentions: noMentions,
       components: [],
-    });
+    }, session), session.nonce) as never);
     await auditBestEffort(interaction.guild!, setup, {
       action: "Blacklist sync report requested", status: "success", actorId: interaction.user.id,
       fields: [{ name: "Mode", value: "Monitoring-only" }],
@@ -977,7 +1370,12 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
     const showModal = interaction.showModal.bind(interaction);
     Object.defineProperties(interaction, {
       update: {
-        value: (payload: unknown) => update(sealSettingsComponents(payload, activeSession.nonce) as never),
+        value: (payload: unknown) => update(
+          sealSettingsComponents(
+            withSettingsBack(payload, activeSession),
+            activeSession.nonce,
+          ) as never,
+        ),
       },
       showModal: {
         value: (modal: unknown) => showModal(sealSettingsComponents(modal, activeSession.nonce) as ModalBuilder),
@@ -990,6 +1388,38 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
   const nonce = rawId.match(/:([a-f0-9]{32})$/)?.[1];
   if (nonce && activeSession?.nonce !== nonce) {
     throw new Error("This settings control belongs to an expired settings session. Run /settings again.");
+  }
+  if (activeSession?.nonceRequired && id.startsWith("setup:")) {
+    const pageIds = new Set([
+      "setup:blacklist", "setup:trello", "setup:security", "setup:lockdown",
+      "setup:audit", "setup:discord", "setup:identity", "setup:bot-state", "setup:view",
+    ]);
+    if (pageIds.has(id)) {
+      const current = settingsNavigation(activeSession).at(-1);
+      if (current?.kind === "page" && current.id === id) {
+        // The category select has already established this page.
+      } else if (current?.kind === "page" && id === "setup:security") {
+        const categoryLocation = settingsCategoryLocation("security");
+        activeSession.navigation = [
+          settingsRootLocation(),
+          categoryLocation,
+          settingsPageLocation(id, categoryLocation),
+        ];
+      } else {
+        const category = settingsCategoryForAction(id);
+        if (category) {
+          const categoryLocation = settingsCategoryLocation(category);
+          const parent = current?.kind === "page"
+            ? current
+            : categoryLocation;
+          activeSession.navigation = [
+            settingsRootLocation(),
+            categoryLocation,
+            settingsPageLocation(id, parent),
+          ];
+        }
+      }
+    }
   }
   const lockdown = await getSecurityState(guild.id);
   if (
