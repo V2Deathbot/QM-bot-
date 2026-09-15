@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, beforeEach, test } from "node:test";
 import { ChannelType, Collection, PermissionFlagsBits } from "discord.js";
+import { purchaseFooterLines } from "../src/bot/purchase-footers";
 
 const directory = await mkdtemp(path.join(os.tmpdir(), "uniform-command-tests-"));
 process.env.BOT_SETUP_FILE = path.join(directory, "setup.json");
@@ -361,7 +362,7 @@ test("confirms purchase once, credits frozen names, and upgrades its original au
     { name: "Uploaded by", value: "SEQM", inline: true },
     { name: "Published by", value: "Publisher", inline: true },
   ]);
-  assert.equal(confirmation.embeds[0]!.data.footer?.text, "QM tried to take a bite of your tie.");
+  assert.ok(purchaseFooterLines.some((line) => confirmation.embeds[0]!.data.footer?.text === `QM ${line}`));
   assert.equal(auditMessageEdits.length, 1);
   const soldAudit = auditMessageEdits[0]!.payload as { content: string; allowedMentions: { parse: unknown[] }; embeds: Array<{ data: { title: string } }> };
   assert.equal(soldAudit.content, "");
@@ -390,7 +391,7 @@ test("uses only moderated uploader and publisher credits in a quiet purchase con
     { name: "Uploaded by", value: "Uploader", inline: true },
     { name: "Published by", value: "Publisher", inline: true },
   ]);
-  assert.equal(confirmation.embeds[0]!.data.footer?.text, "Publisher tried to take a bite of your tie.");
+  assert.ok(purchaseFooterLines.some((line) => confirmation.embeds[0]!.data.footer?.text === `Publisher ${line}`));
   assert.doesNotMatch(JSON.stringify(confirmation.embeds[0]!.data.fields), /Quartermaster|SEQM/);
 });
 

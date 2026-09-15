@@ -21,6 +21,7 @@ import {
   type UserSelectMenuInteraction,
 } from "discord.js";
 import { randomBytes } from "node:crypto";
+import { purchaseFooter } from "./purchase-footers";
 import { findRobloxUser, type RobloxUser } from "./roblox";
 import {
   defaultUniformSettings,
@@ -1374,7 +1375,7 @@ function purchaseConfirmationEmbed(record: UniformDeliveryRecord): EmbedBuilder 
     "success",
     undefined,
     fields,
-  ).setFooter({ text: `${safePresentationText(footerName, 200)} tried to take a bite of your tie.` });
+  ).setFooter({ text: purchaseFooter(footerName) });
 }
 
 function customerDeliveryButtons(record: UniformDeliveryRecord, disabled = false) {
