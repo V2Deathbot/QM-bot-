@@ -59,8 +59,12 @@
       "blacklistReason": "yes",
       "source": "command",
       "blacklistNotificationAttemptedAt": "2026-09-15T00:28:16.261Z",
-      "status": "active",
-      "createdAt": "2026-09-15T00:28:16.261Z"
+      "status": "revoked",
+      "createdAt": "2026-09-15T00:28:16.261Z",
+      "cardUpdatedAt": "2026-09-15T00:28:15.385Z",
+      "revocationCardMovedAt": "2026-09-15T00:58:30.577Z",
+      "revokedAt": "2026-09-15T00:58:30.872Z",
+      "revocationNotificationAttemptedAt": "2026-09-15T00:58:30.872Z"
     },
     {
       "key": "1114860005334716422:18906408",
@@ -98,6 +102,25 @@
       "source": "command",
       "status": "active",
       "createdAt": "2026-09-15T00:44:20.421Z"
+    },
+    {
+      "key": "1114860005334716422:9775124504",
+      "guildId": "1114860005334716422",
+      "discordUserId": "1359330813577134121",
+      "robloxUserId": 9775124504,
+      "robloxUsername": "dragon_4seddd",
+      "roleIds": [],
+      "cardId": "6aa896bc84217cd867256bd0",
+      "cardUrl": "https://trello.com/c/qjVSnbST/10-dragon4seddd-9775124504",
+      "blacklistType": "conditional",
+      "blacklistReason": "Hi dragon",
+      "source": "command",
+      "status": "revoked",
+      "createdAt": "2026-09-15T00:52:11.831Z",
+      "cardUpdatedAt": "2026-09-15T00:52:13.172Z",
+      "revocationCardMovedAt": "2026-09-15T00:58:26.884Z",
+      "revokedAt": "2026-09-15T00:58:26.886Z",
+      "revocationNotificationAttemptedAt": "2026-09-15T00:58:26.886Z"
     }
   ],
   "notes": [
