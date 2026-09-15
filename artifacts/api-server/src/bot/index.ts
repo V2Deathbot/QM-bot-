@@ -3,6 +3,8 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ChannelSelectMenuBuilder,
+  ChannelType,
   ComponentType,
   EmbedBuilder,
   Events,
@@ -10,15 +12,18 @@ import {
   ModalBuilder,
   Partials,
   PermissionFlagsBits,
+  RoleSelectMenuBuilder,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
   type ButtonInteraction,
+  type ChannelSelectMenuInteraction,
   type ChatInputCommandInteraction,
   type Guild,
   type GuildMember,
   type ModalSubmitInteraction,
+  type RoleSelectMenuInteraction,
   type StringSelectMenuInteraction,
   type UserSelectMenuInteraction,
 } from "discord.js";
@@ -129,6 +134,11 @@ import {
 } from "./payout";
 import { activePayoutRunForGuild, getPayoutRun, payoutLockForWorkbook, type PayoutRun } from "./payout-store";
 
+const setupCommand = new SlashCommandBuilder()
+  .setName("setup")
+  .setDescription("Open the private Quartermaster setup wizard.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
+
 const settingsCommand = new SlashCommandBuilder()
   .setName("settings")
   .setDescription("Quartermaster administration, setup, security, and records.")
@@ -183,8 +193,8 @@ const moderationCommands = [
 
 // These recovery controls must remain reachable before first-time setup. In
 // particular, maintenance must never make a partially configured guild stuck.
-const setupOnlyCommands = [settingsCommand].map((command) => command.toJSON());
-const enabledCommands = [settingsCommand, payoutCommand, ...moderationCommands].map((command) =>
+const setupOnlyCommands = [setupCommand, settingsCommand].map((command) => command.toJSON());
+const enabledCommands = [setupCommand, settingsCommand, payoutCommand, ...moderationCommands].map((command) =>
   command.toJSON(),
 );
 const enabledUniformCommands = uniformCommands.map((command) => command.toJSON());
@@ -249,6 +259,12 @@ interface SetupSession {
   nonceRequired?: boolean;
   /** `/settings` keeps a small, explicit navigation stack for safe Back controls. */
   navigation?: SettingsLocation[];
+  /** Unsaved, server-native first-time setup selections. */
+  initialSetup?: {
+    auditChannelId?: string;
+    seniorQuartermasterRoleId?: string;
+    quartermasterRoleId?: string;
+  };
 }
 const setupSessions = new Map<string, SetupSession>();
 interface ModerationTarget {
@@ -484,6 +500,30 @@ function cleanText(value: string, label: string, maximum = 500): string {
     throw new Error(`${label} must contain 1–${maximum} printable characters.`);
   }
   return cleaned;
+}
+
+function trelloBoardIdFromInput(value: string): string {
+  const input = value.trim();
+  if (!input) throw new Error("Provide a Trello board ID or https://trello.com/b/ board URL.");
+  let boardId = input;
+  if (/^https?:\/\//i.test(input)) {
+    let url: URL;
+    try {
+      url = new URL(input);
+    } catch {
+      throw new Error("Provide a valid Trello board URL.");
+    }
+    if (!/(^|\.)trello\.com$/i.test(url.hostname)) {
+      throw new Error("The board URL must be on trello.com.");
+    }
+    const match = /^\/b\/([^/]+)/.exec(url.pathname);
+    if (!match) throw new Error("Use a Trello board URL in the form https://trello.com/b/BOARD_ID/...");
+    boardId = match[1]!;
+  }
+  if (!/^[A-Za-z0-9_-]{5,100}$/.test(boardId)) {
+    throw new Error("The Trello board ID must contain 5–100 letters, numbers, underscores, or hyphens.");
+  }
+  return boardId;
 }
 
 async function reserveDestructiveAction(
@@ -880,7 +920,7 @@ function settingsCategoryOptions(
   if (!configured) {
     if (category === "system") {
       return [
-        { label: "Complete First-time Setup", value: "settings-action:initial-audit", description: "Verify an audit channel before enabling commands" },
+        { label: "Complete First-time Setup", value: "settings-action:initial-audit", description: "Select required audit and Quartermaster roles" },
         { label: "System Status", value: "settings-action:status", description: "View setup and command registration status" },
         { label: "Enable Maintenance", value: "settings-action:maintenance-enable", description: "Temporarily lock normal administration" },
         { label: "Disable Maintenance", value: "settings-action:maintenance-disable", description: "Restore normal administration" },
@@ -918,7 +958,7 @@ function settingsCategoryOptions(
     case "logs":
       return [
         { label: "Audit Configuration", value: "setup:audit", description: "Destinations and retained log categories" },
-        { label: "Discord Configuration", value: "setup:discord", description: "View server authorization policy" },
+        { label: "Discord Roles & Policy", value: "setup:discord", description: "Edit moderator, Senior QM, and QM roles" },
       ];
     case "uniforms":
       return [
@@ -935,7 +975,12 @@ function settingsCategoryOptions(
   }
 }
 
-function settingsMenu(nonce: string, configured: boolean, maintenance = false): {
+function settingsMenu(
+  nonce: string,
+  configured: boolean,
+  maintenance = false,
+  setup?: GuildSetup,
+): {
   embeds: EmbedBuilder[];
   components: Array<ActionRowBuilder<StringSelectMenuBuilder>>;
 } {
@@ -946,8 +991,10 @@ function settingsMenu(nonce: string, configured: boolean, maintenance = false): 
       maintenance
         ? "Maintenance is active. Choose an emergency category. Normal configuration and moderation controls are hidden and remain unavailable."
         : configured
-          ? "Choose a category to manage Quartermaster. Controls are private, expire after 10 minutes, and re-check your current Administrator permission.\n\n**Moderation** covers blacklist rules and records. **Integrations** covers Trello. **Security** covers safeguards and identity detection. **Logs & Server** covers audit and Discord policy. **Uniforms** covers upload logging destinations and access. **System** covers status and maintenance."
-          : "Initial setup is required. Open System to verify an audit channel; emergency status and security controls remain available.",
+          ? `**Core setup: ${setup?.auditChannelId && setup?.seniorQuartermasterRoleId && setup?.quartermasterRoleId ? "complete" : "legacy configuration—review Discord Identity & Uniform Roles"}**\n` +
+            `**Optional locations: ${setup?.uniforms?.spreadsheet ? "spreadsheet configured" : "spreadsheet not configured"}; ${setup?.uniforms?.logChannelId || setup?.uniforms?.moderatedChannelId ? "uniform channel configured" : "uniform channels not configured"}**\n\n` +
+            "Choose a category to manage Quartermaster. Controls are private, expire after 10 minutes, and re-check your current Administrator permission. **Moderation** covers blacklist rules and records. **Integrations** covers Trello. **Security** covers safeguards and identity detection. **Logs & Server** covers audit and Discord policy. **Uniforms** covers upload logging destinations and access. **System** covers the full configuration overview and maintenance."
+          : "Initial setup is required. Open System to select the required audit channel, Senior Quartermaster, and Quartermaster roles. Emergency status and security controls remain available.",
     )],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
       new StringSelectMenuBuilder()
@@ -959,6 +1006,130 @@ function settingsMenu(nonce: string, configured: boolean, maintenance = false): 
           description: category.description,
         }))),
     )],
+  };
+}
+
+type SettingsSelectInteraction =
+  | StringSelectMenuInteraction
+  | RoleSelectMenuInteraction
+  | ChannelSelectMenuInteraction;
+type SettingsComponentInteraction = ButtonInteraction | SettingsSelectInteraction;
+
+function selectedSettingsValue(interaction: SettingsSelectInteraction): string {
+  const value = interaction.values[0];
+  if (!value) throw new Error("Select one server role or channel and try again.");
+  return value;
+}
+
+function initialSetupPanel(session: SetupSession): {
+  embeds: EmbedBuilder[];
+  components: Array<
+    | ActionRowBuilder<ChannelSelectMenuBuilder>
+    | ActionRowBuilder<RoleSelectMenuBuilder>
+    | ActionRowBuilder<ButtonBuilder>
+  >;
+} {
+  const selected = session.initialSetup ?? {};
+  const ready = Boolean(
+    selected.auditChannelId &&
+    selected.seniorQuartermasterRoleId &&
+    selected.quartermasterRoleId,
+  );
+  const status = (value: string | undefined, prefix: "#" | "@&") =>
+    value ? `<${prefix}${value}> — selected` : "Required — not selected";
+  return {
+    embeds: [brandedEmbed(
+      "Complete Quartermaster Setup",
+      "Select the required server resources, then save. Each selector is limited to this server. " +
+      "Senior Quartermaster and Quartermaster roles authorize **uniform logging only**; " +
+      "Discord Administrator permission remains required for settings, payouts, and blacklists.",
+    ).addFields(
+      { name: "Audit Channel", value: status(selected.auditChannelId, "#"), inline: true },
+      { name: "Senior Quartermaster", value: status(selected.seniorQuartermasterRoleId, "@&"), inline: true },
+      { name: "Quartermaster", value: status(selected.quartermasterRoleId, "@&"), inline: true },
+      { name: "Next step", value: ready ? "All required selections are ready. Choose **Save Core Setup**." : "Choose all three required selections before saving." },
+    )],
+    components: [
+      new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(
+        new ChannelSelectMenuBuilder()
+          .setCustomId(`settings:initial-audit:${session.nonce}`)
+          .setPlaceholder("Select the audit text channel")
+          .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+          .setMinValues(1)
+          .setMaxValues(1),
+      ),
+      new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
+        new RoleSelectMenuBuilder()
+          .setCustomId(`settings:initial-senior-quartermaster:${session.nonce}`)
+          .setPlaceholder("Select the Senior Quartermaster role")
+          .setMinValues(1)
+          .setMaxValues(1),
+      ),
+      new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
+        new RoleSelectMenuBuilder()
+          .setCustomId(`settings:initial-quartermaster:${session.nonce}`)
+          .setPlaceholder("Select the Quartermaster role")
+          .setMinValues(1)
+          .setMaxValues(1),
+      ),
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`settings:initial-save:${session.nonce}`)
+          .setLabel("Save Core Setup")
+          .setStyle(ButtonStyle.Success)
+          .setDisabled(!ready),
+        new ButtonBuilder()
+          .setCustomId(`settings:back:root:${session.nonce}`)
+          .setLabel("Back to Categories")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  };
+}
+
+function discordRolePanel(setup: GuildSetup, nonce: string): {
+  embeds: EmbedBuilder[];
+  components: Array<ActionRowBuilder<RoleSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>>;
+} {
+  const role = (id: string | undefined) => id ? `<@&${id}>` : "Not configured";
+  return {
+    embeds: [outcomeEmbed(
+      "Discord Identity & Uniform Roles",
+      "These named roles are persistent, narrowly scoped uniform submitter access. " +
+      "They do not grant Discord Administrator access, settings access, payout access, or blacklist privileges. " +
+      "The moderator-role record remains separate and also does not replace current Discord Administrator checks. " +
+      "Choose a replacement role to save it immediately.",
+      "info",
+      [
+        { name: "Moderation role record", value: role(setup.moderatorRoleId === setup.guildId ? undefined : setup.moderatorRoleId), inline: true },
+        { name: "Senior Quartermaster", value: role(setup.seniorQuartermasterRoleId), inline: true },
+        { name: "Quartermaster", value: role(setup.quartermasterRoleId), inline: true },
+        { name: "Administrative authorization", value: "Current Discord Administrator or server owner only" },
+      ],
+    )],
+    components: [
+      new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
+        new RoleSelectMenuBuilder()
+          .setCustomId(`setup:discord-moderator:${nonce}`)
+          .setPlaceholder("Select recorded moderator role")
+          .setMinValues(1)
+          .setMaxValues(1),
+      ),
+      new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
+        new RoleSelectMenuBuilder()
+          .setCustomId(`setup:discord-senior-quartermaster:${nonce}`)
+          .setPlaceholder("Select Senior Quartermaster role")
+          .setMinValues(1)
+          .setMaxValues(1),
+      ),
+      new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
+        new RoleSelectMenuBuilder()
+          .setCustomId(`setup:discord-quartermaster:${nonce}`)
+          .setPlaceholder("Select Quartermaster role")
+          .setMinValues(1)
+          .setMaxValues(1),
+      ),
+    ],
   };
 }
 
@@ -1127,14 +1298,18 @@ function setupMenu(nonce: string): {
 }
 
 async function requireSettingsSession(
-  interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
+  interaction: SettingsComponentInteraction | ModalSubmitInteraction,
 ): Promise<{ session: SetupSession; setup?: GuildSetup }> {
   if (!interaction.guild) throw new Error("Settings are only available in the configured server.");
   const session = setupSessions.get(setupSessionId(interaction.guild.id, interaction.user.id));
   if (!session || session.expiresAt <= Date.now() || session.guildId !== interaction.guild.id) {
     throw new Error("This settings session has expired or belongs to another administrator. Run /settings again.");
   }
-  const raw = interaction.isStringSelectMenu?.() ? interaction.values[0] : interaction.customId;
+  // String-menu option values carry the nonce; native role/channel selector
+  // values are resource IDs, so their nonce must always come from customId.
+  const raw = interaction.isStringSelectMenu?.()
+    ? interaction.values[0]
+    : interaction.customId;
   const nonce = raw.match(/:([a-f0-9]{32})$/)?.[1];
   if (!nonce || nonce !== session.nonce) {
     throw new Error("This settings control belongs to an expired session. Run /settings again.");
@@ -1159,7 +1334,7 @@ async function handleSettings(
   await requireCurrentAdministrator(guild, interaction.user.id, existing, "/settings");
   const state = await getSecurityState(guild.id);
   const nonce = crypto.randomUUID().replaceAll("-", "");
-  const response = await interaction.editReply(settingsMenu(nonce, Boolean(existing), state.maintenance.active));
+  const response = await interaction.editReply(settingsMenu(nonce, Boolean(existing), state.maintenance.active, existing));
   setupSessions.set(setupSessionId(guild.id, interaction.user.id), {
     userId: interaction.user.id, guildId: guild.id, expiresAt: Date.now() + setupSessionLifetimeMs,
     messageId: response?.id, nonce, nonceRequired: true,
@@ -1199,7 +1374,7 @@ async function saveSetupChange(
 }
 
 async function requireSetupSession(
-  interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
+  interaction: SettingsComponentInteraction | ModalSubmitInteraction,
 ): Promise<GuildSetup> {
   if (!interaction.guild) throw new Error("Setup is only available in the configured server.");
   const session = setupSessions.get(setupSessionId(interaction.guild.id, interaction.user.id));
@@ -1371,7 +1546,7 @@ async function renderSettingsBack(
   if (target === "root") {
     const state = await getSecurityState(guild.id);
     session.navigation = [settingsRootLocation()];
-    await interaction.update(settingsMenu(session.nonce, Boolean(setup), state.maintenance.active));
+    await interaction.update(settingsMenu(session.nonce, Boolean(setup), state.maintenance.active, setup));
     return;
   }
   if (target.startsWith("category:")) {
@@ -1433,10 +1608,12 @@ async function renderSettingsBack(
 }
 
 async function handleSettingsComponent(
-  interaction: ButtonInteraction | StringSelectMenuInteraction,
+  interaction: SettingsComponentInteraction,
 ): Promise<void> {
   const { session, setup } = await requireSettingsSession(interaction);
-  const raw = interaction.isStringSelectMenu() ? interaction.values[0]! : interaction.customId;
+  const raw = interaction.isStringSelectMenu()
+    ? selectedSettingsValue(interaction)
+    : interaction.customId;
   const id = raw.replace(/:([a-f0-9]{32})$/, "");
   const state = await getSecurityState(interaction.guild!.id);
   const emergency = new Set([
@@ -1448,7 +1625,7 @@ async function handleSettingsComponent(
     if (current?.kind !== "category") {
       throw new Error("This settings control is stale. Return to /settings and choose a category again.");
     }
-    await renderSettingsBack(interaction, session, setup, "root");
+    await renderSettingsBack(interaction as ButtonInteraction, session, setup, "root");
     return;
   }
   if (id.startsWith("settings:back:category:")) {
@@ -1457,7 +1634,7 @@ async function handleSettingsComponent(
     if (expected.kind !== "category" || expected.category !== targetCategory) {
       throw new Error("This settings control is stale. Return to /settings and choose a category again.");
     }
-    await renderSettingsBack(interaction, session, setup, `category:${targetCategory}`);
+    await renderSettingsBack(interaction as ButtonInteraction, session, setup, `category:${targetCategory}`);
     return;
   }
   if (id.startsWith("settings:back:page:")) {
@@ -1466,8 +1643,86 @@ async function handleSettingsComponent(
     if (expected.kind !== "page" || expected.id !== targetPage) {
       throw new Error("This settings control is stale. Return to /settings and choose a page again.");
     }
-    await renderSettingsBack(interaction, session, setup, `page:${targetPage}`);
+    await renderSettingsBack(interaction as ButtonInteraction, session, setup, `page:${targetPage}`);
     return;
+  }
+  if (id === "settings-action:initial-audit") {
+    if (setup) throw new Error("Setup is already complete. Use Discord Identity & Uniform Roles to update role assignments.");
+    session.initialSetup ??= {};
+    await interaction.update(initialSetupPanel(session));
+    return;
+  }
+  if (id.startsWith("settings:initial-")) {
+    if (setup) throw new Error("Setup is already complete. Run /settings to change saved configuration.");
+    session.initialSetup ??= {};
+    if (id === "settings:initial-audit") {
+      const channelId = selectedSettingsValue(interaction as SettingsSelectInteraction);
+      await requireAuditChannel(interaction.guild!, {
+        guildId: interaction.guild!.id,
+        moderatorRoleId: interaction.guild!.id,
+        auditChannelId: channelId,
+        updatedBy: interaction.user.id,
+        updatedAt: new Date().toISOString(),
+      });
+      session.initialSetup.auditChannelId = channelId;
+      await interaction.update(initialSetupPanel(session));
+      return;
+    }
+    if (id === "settings:initial-senior-quartermaster" || id === "settings:initial-quartermaster") {
+      const roleId = selectedSettingsValue(interaction as SettingsSelectInteraction);
+      const role = await interaction.guild!.roles.fetch(roleId);
+      if (!role) throw new Error("The selected role does not exist in this server.");
+      validateModeratorRole(interaction.guild!, role);
+      if (id === "settings:initial-senior-quartermaster") {
+        session.initialSetup.seniorQuartermasterRoleId = roleId;
+      } else {
+        session.initialSetup.quartermasterRoleId = roleId;
+      }
+      await interaction.update(initialSetupPanel(session));
+      return;
+    }
+    if (id === "settings:initial-save") {
+      const selected = session.initialSetup;
+      if (!selected.auditChannelId || !selected.seniorQuartermasterRoleId || !selected.quartermasterRoleId) {
+        throw new Error("Select an audit channel, Senior Quartermaster role, and Quartermaster role before saving.");
+      }
+      const initial: GuildSetup = {
+        guildId: interaction.guild!.id,
+        // Kept for compatibility with older records; it grants no authorization.
+        moderatorRoleId: interaction.guild!.id,
+        auditChannelId: selected.auditChannelId,
+        seniorQuartermasterRoleId: selected.seniorQuartermasterRoleId,
+        quartermasterRoleId: selected.quartermasterRoleId,
+        security: defaultSecuritySettings(),
+        monitoring: defaultMonitoringSettings(),
+        trello: defaultTrelloMappings(),
+        audit: defaultAuditSettings(),
+        identity: defaultIdentitySettings(),
+        updatedBy: interaction.user.id,
+        updatedAt: new Date().toISOString(),
+      };
+      await requireAuditChannel(interaction.guild!, initial);
+      await saveGuildSetup(initial);
+      await sendAuditEvent(interaction.guild!, initial, {
+        action: "Bot setup completed", status: "success", actorId: interaction.user.id,
+        fields: [
+          { name: "Audit channel", value: `<#${initial.auditChannelId}>` },
+          { name: "Senior Quartermaster", value: `<@&${initial.seniorQuartermasterRoleId}>` },
+          { name: "Quartermaster", value: `<@&${initial.quartermasterRoleId}>` },
+        ],
+      });
+      await registerGuildCommands(interaction.guild!, true);
+      commandsRegistered = true;
+      setupCommandRegistered = true;
+      guildSetupComplete = true;
+      setRecoveryStatus("successful");
+      await interaction.update(responseWithEmbed(
+        "Core setup is saved. Open /settings to configure Trello, blacklist mappings, audit destinations, and uniform spreadsheet settings.",
+        "Setup Complete",
+        "success",
+      ));
+      return;
+    }
   }
   if (id.startsWith("settings-category:")) {
     const category = id.slice("settings-category:".length) as SettingsCategory;
@@ -1595,7 +1850,7 @@ async function handleSettingsComponent(
   }
 }
 
-async function handleSetupComponent(interaction: ButtonInteraction | StringSelectMenuInteraction): Promise<void> {
+async function handleSetupComponent(interaction: SettingsComponentInteraction): Promise<void> {
   const setup = await requireSetupSession(interaction);
   const guild = interaction.guild!;
   const activeSession = setupSessions.get(setupSessionId(guild.id, interaction.user.id));
@@ -1697,7 +1952,43 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
     return;
   }
   if (id === "setup:uniforms") {
-    await renderUniformSettings(interaction, setup, botAvatarUrl());
+    await renderUniformSettings(interaction as ButtonInteraction, setup, botAvatarUrl());
+    return;
+  }
+  if (id === "setup:discord") {
+    await interaction.update(discordRolePanel(setup, activeSession?.nonce ?? nonce ?? ""));
+    return;
+  }
+  if (
+    id === "setup:discord-moderator" ||
+    id === "setup:discord-senior-quartermaster" ||
+    id === "setup:discord-quartermaster"
+  ) {
+    if (!interaction.isRoleSelectMenu()) {
+      throw new Error("Choose the Quartermaster role with the server role selector.");
+    }
+    const roleId = selectedSettingsValue(interaction);
+    const role = await guild.roles.fetch(roleId);
+    if (!role) throw new Error("The selected role does not exist in this server.");
+    validateModeratorRole(guild, role);
+    const key = id === "setup:discord-moderator"
+      ? "moderatorRoleId"
+      : id === "setup:discord-senior-quartermaster"
+        ? "seniorQuartermasterRoleId"
+        : "quartermasterRoleId";
+    const updated = await saveSetupChange(
+      guild,
+      { ...setup, [key]: roleId },
+      interaction.user.id,
+      key === "moderatorRoleId"
+        ? "Recorded moderator role"
+        : key === "seniorQuartermasterRoleId"
+          ? "Senior Quartermaster uniform role"
+          : "Quartermaster uniform role",
+      setup[key] ?? "Not configured",
+      roleId,
+    );
+    await interaction.update(discordRolePanel(updated, activeSession?.nonce ?? nonce ?? ""));
     return;
   }
   if (
@@ -1929,7 +2220,35 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
       new ButtonBuilder().setCustomId("setup:trello-labels").setLabel("Trello Labels 1–5").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("setup:trello-group-label").setLabel("Group Label").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("setup:trello-reset").setLabel("Reset Mapping").setStyle(ButtonStyle.Secondary),
+    ), new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
+      new RoleSelectMenuBuilder()
+        .setCustomId(`setup:blacklist-role-select:${activeSession?.nonce ?? nonce ?? ""}`)
+        .setPlaceholder("Select blacklisted Discord role")
+        .setMinValues(1)
+        .setMaxValues(1),
     )] });
+    return;
+  }
+  if (id === "setup:blacklist-role-select") {
+    if (!interaction.isRoleSelectMenu()) {
+      throw new Error("Choose the blacklist role with the server role selector.");
+    }
+    const roleId = selectedSettingsValue(interaction);
+    const role = await guild.roles.fetch(roleId);
+    if (!role) throw new Error("The selected blacklist role does not exist in this server.");
+    validateModeratorRole(guild, role);
+    await saveSetupChange(
+      guild,
+      { ...setup, blacklistRoleId: roleId },
+      interaction.user.id,
+      "Blacklisted Discord role",
+      setup.blacklistRoleId ?? "None",
+      roleId,
+    );
+    await interaction.update({
+      ...responseWithEmbed("Blacklist role mapping saved and validated.", "Blacklist Role Saved", "success"),
+      components: [],
+    });
     return;
   }
   if (id === "setup:blacklist-role") {
@@ -1968,9 +2287,17 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
     return;
   }
   if (id === "setup:trello-reset") {
-    const mapping = defaultTrelloMappings();
+    const current = trelloMappingsFor(setup);
+    const defaults = defaultTrelloMappings();
+    // Reset names only. A board is independently selected and must never be
+    // silently switched back to an environment legacy fallback.
+    const mapping = {
+      boardId: current.boardId,
+      lists: defaults.lists,
+      labels: defaults.labels,
+    };
     await validateTrelloMappings(mapping);
-    await saveSetupChange(guild, { ...setup, trello: mapping }, interaction.user.id, "Trello mappings", JSON.stringify(trelloMappingsFor(setup)), JSON.stringify(mapping));
+    await saveSetupChange(guild, { ...setup, trello: mapping }, interaction.user.id, "Trello mappings", JSON.stringify(current), JSON.stringify(mapping));
     await interaction.update({
       ...responseWithEmbed("Default Trello mappings were validated against the board and saved.", "Trello Mappings Saved", "success"),
       components: [],
@@ -1979,17 +2306,37 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
   }
   if (id === "setup:trello") {
     const monitoring = { ...defaultMonitoringSettings(), ...setup.monitoring };
+    const mapping = trelloMappingsFor(setup);
     await interaction.update({ embeds: [outcomeEmbed("Trello Monitoring", "Monitoring is report-only for manual Trello edits; Discord state changes require approved bot actions.", "info", [
+      { name: "Board", value: mapping.boardId ? safePresentationText(mapping.boardId) : "Not configured", inline: true },
+      { name: "Connection", value: getTrelloReadiness().ready ? "Connected and verified" : "Not currently verified", inline: true },
       { name: "Manual Change Alerts", value: monitoring.manualChangeDetection ? "Enabled" : "Disabled", inline: true },
       { name: "Database Sync Checks", value: monitoring.desyncDetection ? "Enabled" : "Disabled", inline: true },
       { name: "Polling Interval", value: `${monitoring.pollingIntervalSeconds} seconds`, inline: true },
       { name: "Discord Role Changes", value: "Approved bot actions only", inline: true },
     ])], components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("setup:trello-board").setLabel("Board & Connection").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("setup:trello-toggle").setLabel("Toggle manual alerts").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("setup:trello-desync").setLabel("Toggle desync checks").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("setup:trello-interval").setLabel("Polling interval").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("setup:trello-monitoring-reset").setLabel("Reset Defaults").setStyle(ButtonStyle.Secondary),
     )] });
+    return;
+  }
+  if (id === "setup:trello-board") {
+    const mapping = trelloMappingsFor(setup);
+    await interaction.showModal(new ModalBuilder()
+      .setCustomId(scopedSetupModalId(guild.id, interaction.user.id, "setup-modal:trello-board"))
+      .setTitle("Trello Board")
+      .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("board")
+          .setLabel("Trello board URL or board ID")
+          .setStyle(TextInputStyle.Short)
+          .setValue(mapping.boardId ?? "")
+          .setRequired(true)
+          .setMaxLength(300),
+      )));
     return;
   }
   if (id === "setup:trello-toggle") {
@@ -2053,12 +2400,14 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
     });
     return;
   }
-  if (id === "setup:view" || id === "setup:discord") {
+  if (id === "setup:view") {
     const uniforms = uniformSettingsFor(setup);
-    await interaction.update({ embeds: [outcomeEmbed(id === "setup:view" ? "Configuration" : "Discord Settings", "Saved server configuration and authorization policy.", "info", [
+    await interaction.update({ embeds: [outcomeEmbed("Configuration", "Saved server configuration and authorization policy.", "info", [
       { name: "Audit Channel", value: `<#${setup.auditChannelId}>` },
       { name: "Blacklist Role", value: setup.blacklistRoleId ? `<@&${setup.blacklistRoleId}>` : "Not configured" },
-      { name: "Authorization", value: "Current Administrator permission only" },
+       { name: "Administration", value: "Current Administrator permission only" },
+       { name: "Senior Quartermaster", value: setup.seniorQuartermasterRoleId ? `<@&${setup.seniorQuartermasterRoleId}> — uniform logging only` : "Not configured" },
+       { name: "Quartermaster", value: setup.quartermasterRoleId ? `<@&${setup.quartermasterRoleId}> — uniform logging only` : "Not configured" },
       { name: "Uniform /log", value: uniforms.logChannelId ? `<#${uniforms.logChannelId}>` : "Not configured", inline: true },
       { name: "Uniform /moderated", value: uniforms.moderatedChannelId ? `<#${uniforms.moderatedChannelId}>` : "Not configured", inline: true },
     ])], components: [] });
@@ -2165,6 +2514,27 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
     await interaction.reply({ ...responseWithEmbed("Blacklist role mapping saved and audited.", "Blacklist Role Saved", "success"), ephemeral: true });
     return;
   }
+  if (id === "setup-modal:trello-board") {
+    const current = trelloMappingsFor(setup);
+    const boardId = trelloBoardIdFromInput(interaction.fields.getTextInputValue("board"));
+    const trello = { ...current, boardId };
+    // This is a read-only credentials check: no token is displayed or
+    // accepted, and mapping validation only reads the selected board.
+    await validateTrelloMappings(trello);
+    await saveSetupChange(
+      guild,
+      { ...setup, trello },
+      interaction.user.id,
+      "Trello board",
+      current.boardId ?? "Not configured",
+      boardId,
+    );
+    await interaction.reply({
+      ...responseWithEmbed("The Trello board and existing list/label mappings were verified with the connected account and saved.", "Trello Board Saved", "success"),
+      ephemeral: true,
+    });
+    return;
+  }
   if (id === "setup-modal:trello-interval") {
     const seconds = Number(interaction.fields.getTextInputValue("seconds"));
     if (!Number.isInteger(seconds) || seconds < 15 || seconds > 3600) {
@@ -2192,7 +2562,7 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
     } else {
       labels.group = cleanText(interaction.fields.getTextInputValue("group"), "Trello label name", 100);
     }
-    const trello = { lists, labels };
+    const trello = { boardId: current.boardId, lists, labels };
     await validateTrelloMappings(trello);
     await saveSetupChange(guild, { ...setup, trello }, interaction.user.id, "Trello list and label mappings", JSON.stringify(current), JSON.stringify(trello));
     await interaction.reply({ ...responseWithEmbed("Trello mapping was verified against the board, saved, and will be used by subsequent operations.", "Trello Mapping Saved", "success"), ephemeral: true });
@@ -2211,36 +2581,9 @@ async function handleSettingsModal(interaction: ModalSubmitInteraction): Promise
   if (state.maintenance.active && !emergency.has(id)) throw new Error(maintenanceMessage);
 
   if (id === "settings-modal:initial-audit") {
-    if (setup) throw new Error("Setup is already complete.");
-    const auditChannelId = interaction.fields.getTextInputValue("audit_channel_id").trim();
-    if (!/^\d{5,25}$/.test(auditChannelId)) throw new Error("The audit channel ID must contain only numbers.");
-    const initial: GuildSetup = {
-      guildId: guild.id, moderatorRoleId: guild.id, auditChannelId,
-      security: defaultSecuritySettings(), monitoring: defaultMonitoringSettings(),
-      trello: defaultTrelloMappings(), audit: defaultAuditSettings(),
-      identity: defaultIdentitySettings(),
-      updatedBy: interaction.user.id, updatedAt: new Date().toISOString(),
-    };
-    await requireAuditChannel(guild, initial);
-    await saveGuildSetup(initial);
-    await sendAuditEvent(guild, initial, {
-      action: "Bot setup completed", status: "success", actorId: interaction.user.id,
-      fields: [{ name: "Audit channel", value: `<#${auditChannelId}> (${auditChannelId})` }],
-    });
-    await registerGuildCommands(guild, true);
-    commandsRegistered = true;
-    setupCommandRegistered = true;
-    guildSetupComplete = true;
-    setRecoveryStatus("successful");
-    await interaction.reply({
-      embeds: [outcomeEmbed("Setup Complete", "Audit logging is verified. /settings now contains all Quartermaster administration controls.", "success", [
-        { name: "Audit Channel", value: `<#${auditChannelId}>` },
-      ])],
-      allowedMentions: noMentions,
-      ephemeral: true,
-    });
-    await runGuildBlacklistSync(guild, "setup");
-    return;
+    // Old messages may outlive a deployment. Do not let their ID-only modal
+    // bypass the required native audit/Quartermaster selections.
+    throw new Error("This first-time setup form is obsolete. Run /setup or /settings and use the server selectors.");
   }
   if (id === "settings-modal:maintenance-enable") {
     await createMaintenanceConfirmation(
@@ -2858,6 +3201,14 @@ export async function handleSetup(
   const previous = await getGuildSetup(guild.id);
   const selectedRole = interaction.options.getRole("role");
   const selectedAuditChannel = interaction.options.getString("audit_channel_id");
+  // `/setup` is the first-time-friendly alias for the same private settings
+  // wizard.  It remains registered after setup so administrators never need a
+  // separate, divergent configuration path.  The option compatibility below
+  // is retained only for old in-flight command payloads from previous builds.
+  if (!selectedRole && !selectedAuditChannel) {
+    await handleSettings(interaction);
+    return;
+  }
   if (!selectedRole && !selectedAuditChannel && previous) {
     const nonce = crypto.randomUUID().replaceAll("-", "");
     const response = await interaction.editReply(setupMenu(nonce));
@@ -2878,6 +3229,7 @@ export async function handleSetup(
   const auditChannelId = (selectedAuditChannel ?? previous?.auditChannelId ?? "").trim();
   if (!/^\d{5,25}$/.test(auditChannelId)) throw new Error("The audit channel ID must contain only numbers.");
   const setup: GuildSetup = {
+    ...previous,
     guildId: guild.id,
     moderatorRoleId: role?.id ?? previous?.moderatorRoleId ?? guild.id,
     auditChannelId,
@@ -4153,7 +4505,8 @@ async function observeExistingAdministrators(guild: Guild): Promise<void> {
 }
 
 async function replyInteractionError(
-  interaction: ButtonInteraction | StringSelectMenuInteraction | UserSelectMenuInteraction | ModalSubmitInteraction,
+  interaction: ButtonInteraction | StringSelectMenuInteraction | UserSelectMenuInteraction |
+    RoleSelectMenuInteraction | ChannelSelectMenuInteraction | ModalSubmitInteraction,
   error: unknown,
 ): Promise<void> {
   const message = error instanceof Error ? error.message : "The interaction failed unexpectedly.";
@@ -4310,6 +4663,21 @@ async function connectDiscord(): Promise<void> {
           return;
         }
         await handleSetupComponent(interaction);
+      })().catch((error) => replyInteractionError(interaction, error));
+    } else if (
+      (typeof interaction.isRoleSelectMenu === "function" && interaction.isRoleSelectMenu()) ||
+      (typeof interaction.isChannelSelectMenu === "function" && interaction.isChannelSelectMenu())
+    ) {
+      void (async () => {
+        if (interaction.customId.startsWith("settings:")) {
+          await handleSettingsComponent(interaction as RoleSelectMenuInteraction | ChannelSelectMenuInteraction);
+          return;
+        }
+        if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
+          await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
+          return;
+        }
+        await handleSetupComponent(interaction as RoleSelectMenuInteraction | ChannelSelectMenuInteraction);
       })().catch((error) => replyInteractionError(interaction, error));
     } else if (typeof interaction.isUserSelectMenu === "function" && interaction.isUserSelectMenu()) {
       void (async () => {

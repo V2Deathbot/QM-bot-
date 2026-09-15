@@ -114,6 +114,7 @@ test("recovery keeps restrictions through Trello failures, retries the exact car
       const id = pathname.split("/").at(-1)!;
       return json({
         id,
+        idBoard: "recovery-board",
         name: "Builder | 1",
         desc: "- policy",
         idList: "active-list",

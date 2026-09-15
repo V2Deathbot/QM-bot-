@@ -27,7 +27,7 @@ process.env.TRELLO_TOKEN = "test-token";
 process.env.TRELLO_BOARD_ID = "test-board";
 process.env.TRELLO_LIST_REVOKED = "Revoked Blacklist";
 
-const { config } = await import("../src/bot/config.ts");
+const { config, getMissingConfiguration } = await import("../src/bot/config.ts");
 const { findActiveSnapshot, revokeRoleSnapshot, saveRoleSnapshot } =
   await import("../src/bot/role-store.ts");
 const { getGuildSetup, saveGuildSetup } =
@@ -230,6 +230,7 @@ test("persists and safely updates guild setup", async () => {
 
 test("validates and persists all per-guild Trello list and label mappings", async () => {
   const mappings = {
+    boardId: "custom-board-id",
     lists: {
       appealable: "Appeals",
       conditional: "Conditions",
@@ -247,7 +248,9 @@ test("validates and persists all per-guild Trello list and label mappings", asyn
     },
   };
   const originalFetch = globalThis.fetch;
+  let selectedCustomBoard = false;
   globalThis.fetch = async (input, init) => {
+    if (String(input).includes("/boards/custom-board-id/")) selectedCustomBoard = true;
     const pathname = requestPath(input);
     if (pathname.endsWith("/lists")) {
       return jsonResponse(Object.values(mappings.lists).map((name, index) => ({ id: `list-${index}`, name })));
@@ -270,6 +273,75 @@ test("validates and persists all per-guild Trello list and label mappings", asyn
     });
     assert.deepEqual((await getGuildSetup("mapping-guild"))?.trello, mappings);
     await createBlacklistCard({ name: "Builder | 9", reason: "policy", type: "permanent", mappings });
+    assert.equal(selectedCustomBoard, true, "saved mapping board must select Trello board reads");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a selected Trello board validates without a legacy environment board", async () => {
+  const originalBoardId = config.trelloBoardId;
+  Object.defineProperty(config, "trelloBoardId", { value: undefined, configurable: true });
+  const originalFetch = globalThis.fetch;
+  const mappings = {
+    boardId: "setup-selected-board",
+    lists: {
+      appealable: "Appeals", conditional: "Conditions", permanent: "Permanent",
+      group: "Groups", revoked: "Revoked",
+    },
+    labels: {
+      blacklisted: "Blacklisted", appealable: "Appealable", conditional: "Conditional",
+      permanent: "Permanent", group: "Group", revoked: "Revoked",
+    },
+  };
+  globalThis.fetch = async (input) => {
+    assert.match(String(input), /setup-selected-board/);
+    const pathname = requestPath(input);
+    if (pathname.endsWith("/lists")) {
+      return jsonResponse(Object.values(mappings.lists).map((name, index) => ({ id: `list-${index}`, name })));
+    }
+    if (pathname.endsWith("/labels")) {
+      return jsonResponse(Object.values(mappings.labels).map((name, index) => ({ id: `label-${index}`, name, color: "blue" })));
+    }
+    throw new Error(`Unexpected selected-board request: ${pathname}`);
+  };
+  try {
+    assert.equal(getMissingConfiguration().includes("TRELLO_BOARD_ID"), false);
+    await validateTrelloMappings(mappings);
+  } finally {
+    Object.defineProperty(config, "trelloBoardId", { value: originalBoardId, configurable: true });
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("refuses an exact-card revoke from a different Trello board", async () => {
+  const originalFetch = globalThis.fetch;
+  let writes = 0;
+  globalThis.fetch = async (input, init) => {
+    const pathname = requestPath(input);
+    if (pathname === "/1/cards/cross-board-card") {
+      return jsonResponse({
+        id: "cross-board-card", idBoard: "other-board", name: "Builder | 1",
+        desc: "- policy", idList: "list-0", idLabels: [], url: "https://trello.test/card",
+        dateLastActivity: "2026-01-01T00:00:00.000Z", closed: false,
+      });
+    }
+    if (pathname.endsWith("/lists")) {
+      return jsonResponse(Object.values(config.trelloListNames).map((name, index) => ({ id: `list-${index}`, name })));
+    }
+    if ((init?.method ?? "GET") === "PUT") writes += 1;
+    return jsonResponse([]);
+  };
+  try {
+    await assert.rejects(
+      () => revokeBlacklistCard({
+        id: "cross-board-card", idBoard: "other-board", name: "Builder | 1",
+        desc: "- policy", idList: "list-0", idLabels: [], url: "https://trello.test/card",
+        dateLastActivity: "2026-01-01T00:00:00.000Z", closed: false,
+      }),
+      /not on the configured board/i,
+    );
+    assert.equal(writes, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -445,7 +517,7 @@ test("setup persists settings, audits the change, and enables moderation command
   assert.equal(saved?.auditChannelId, "12345678901234567");
   assert.equal(auditMessages.length, 1);
   assert.deepEqual(registeredCommandNames, [
-    ["settings", "payout", "blacklist", "revoke_blacklist", "blacklist_lookup", "log", "moderated", "relog"],
+    ["setup", "settings", "payout", "blacklist", "revoke_blacklist", "blacklist_lookup", "log", "moderated", "relog"],
   ]);
   const setupReply = replies[0] as {
     content?: string;
@@ -1341,7 +1413,7 @@ test("keeps commands disabled after registration failure and enables them on ret
     assert.equal(setupOnlyBody.commandsEnabled, false);
     assert.equal(setupOnlyBody.setupCommandAvailable, true);
     assert.equal(setupOnlyBody.recoveryStatus, "blocked");
-    assert.deepEqual(registeredCommandNames[1], ["settings"]);
+    assert.deepEqual(registeredCommandNames[1], ["setup", "settings"]);
 
     await saveGuildSetup({
       guildId: "test-guild",
@@ -1364,6 +1436,7 @@ test("keeps commands disabled after registration failure and enables them on ret
     assert.equal(getBotStatus().commandsEnabled, true);
     assert.equal(registrationAttempts, 3);
     assert.deepEqual(registeredCommandNames[2], [
+      "setup",
       "settings",
       "payout",
       "blacklist",

@@ -332,6 +332,9 @@ function button(userId: string, customId: string, messageId = latestComponentMes
     showModal: async (value: { toJSON: () => unknown }) => {
       captureShownModal(userId, value);
     },
+    showModal: async (value: { toJSON: () => unknown }) => {
+      captureShownModal(userId, value);
+    },
     reply: async (value: unknown) => {
       interaction.replied = true;
       localReplies.push(value);
@@ -373,6 +376,44 @@ function select(userId: string, customId: string, values: string[], messageId = 
       recordReply(value);
     },
     followUp: async (value: unknown) => {
+      localReplies.push(value);
+      recordReply(value);
+    },
+    localReplies,
+  };
+  return interaction;
+}
+
+function nativeSelect(
+  kind: "role" | "channel",
+  userId: string,
+  customId: string,
+  values: string[],
+  messageId = latestComponentMessageId,
+) {
+  const localReplies: unknown[] = [];
+  const interaction = {
+    isChatInputCommand: () => false,
+    isButton: () => false,
+    isStringSelectMenu: () => false,
+    isRoleSelectMenu: () => kind === "role",
+    isChannelSelectMenu: () => kind === "channel",
+    isModalSubmit: () => false,
+    customId,
+    message: { id: messageId },
+    values,
+    guild,
+    guildId: guild.id,
+    user: { id: userId },
+    deferred: false,
+    replied: false,
+    deferUpdate: async () => { interaction.deferred = true; },
+    update: async (value: unknown) => { interaction.replied = true; localReplies.push(value); },
+    showModal: async (value: { toJSON: () => unknown }) => {
+      captureShownModal(userId, value);
+    },
+    reply: async (value: unknown) => {
+      interaction.replied = true;
       localReplies.push(value);
       recordReply(value);
     },
@@ -764,9 +805,10 @@ test.before(async () => {
   await refreshBot();
 });
 
-test("registers exactly eight commands with the requested moderation and uniform options", () => {
+test("registers setup plus requested moderation and uniform commands", () => {
   const definitions = getRegisteredCommandDefinitions();
   assert.deepEqual(definitions.map((command) => command.name), [
+    "setup",
     "settings",
     "payout",
     "blacklist",
@@ -1970,7 +2012,7 @@ test("/settings restricts the maintenance menu while allowing emergency status",
   await setMaintenance(false, "admin-a", "restriction test complete");
 });
 
-test("/settings performs first-time audit-channel setup through its modal", async () => {
+test("/settings performs first-time setup with native audit and Quartermaster selectors", async () => {
   await writeFile(config.setupFile, JSON.stringify({ guilds: [] }), "utf8");
   await mutateSecurityState(guild.id, (state) => {
     state.maintenance = {
@@ -1980,13 +2022,108 @@ test("/settings performs first-time audit-channel setup through its modal", asyn
   });
   const { root } = await openSettings("admin-a");
   const system = await chooseSettingsCategory("admin-a", root, "system");
-  await chooseSettingsAction("admin-a", system, "settings-action:initial-audit");
-  const initial = shownModals.at(-1);
-  assert.ok(initial?.customId.startsWith("settings-modal:initial-audit:"));
-  await dispatchRaw(modal("admin-a", initial!.customId, { audit_channel_id: "12345678901234567" }));
+  const launch = await chooseSettingsAction("admin-a", system, "settings-action:initial-audit");
+  const customId = (payload: ComponentPayload, prefix: string) => {
+    const component = componentRows(payload).find((item) =>
+      (item.data?.custom_id ?? item.custom_id)?.startsWith(prefix),
+    );
+    const id = component?.data?.custom_id ?? component?.custom_id;
+    assert.ok(id, `expected ${prefix} native selector`);
+    return id;
+  };
+  const initial = latestComponentPayload(launch);
+  assertDiscordComponentLimits(initial);
+  const audit = nativeSelect("channel", "admin-a", customId(initial, "settings:initial-audit:"), ["12345678901234567"]);
+  await dispatchRaw(audit);
+  const senior = nativeSelect("role", "admin-a", customId(latestComponentPayload(audit), "settings:initial-senior-quartermaster:"), ["senior-quartermaster-role"]);
+  await dispatchRaw(senior);
+  const quartermaster = nativeSelect("role", "admin-a", customId(latestComponentPayload(senior), "settings:initial-quartermaster:"), ["quartermaster-role"]);
+  await dispatchRaw(quartermaster);
+  const save = button("admin-a", renderedButton(latestComponentPayload(quartermaster), "Save Core Setup"));
+  await dispatchRaw(save);
   const persisted = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
   assert.equal(persisted?.auditChannelId, "12345678901234567");
+  assert.equal(persisted?.seniorQuartermasterRoleId, "senior-quartermaster-role");
+  assert.equal(persisted?.quartermasterRoleId, "quartermaster-role");
   assert.equal("presence" in (persisted ?? {}), false);
+});
+
+test("Discord role policy edits remain administrator-only and preserve named role separation", async () => {
+  await setSecurity({});
+  await mutateSecurityState(guild.id, (state) => {
+    state.maintenance = {
+      active: false, reason: "", startedAt: null, startedBy: null,
+      revision: state.maintenance.revision + 1,
+    };
+  });
+  const { root } = await openSettings("admin-a");
+  const logs = await chooseSettingsCategory("admin-a", root, "logs");
+  const policy = await chooseSettingsAction("admin-a", logs, "setup:discord");
+  const policyPayload = latestComponentPayload(policy);
+  const selectorId = (prefix: string) => {
+    const component = componentRows(policyPayload).find((item) =>
+      (item.data?.custom_id ?? item.custom_id)?.startsWith(prefix),
+    );
+    const id = component?.data?.custom_id ?? component?.custom_id;
+    assert.ok(id, `expected ${prefix} role selector`);
+    return id;
+  };
+  const senior = nativeSelect(
+    "role", "admin-a", selectorId("setup:discord-senior-quartermaster:"), ["senior-role-updated"],
+  );
+  await dispatchRaw(senior);
+  assert.equal(senior.localReplies.length, 1, `role selector did not respond: ${JSON.stringify(senior.localReplies)}`);
+  let saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  assert.equal(saved?.seniorQuartermasterRoleId, "senior-role-updated");
+  assert.notEqual(saved?.moderatorRoleId, "senior-role-updated");
+
+  // A copied native selector ID still carries the session owner/message guard.
+  const copied = nativeSelect(
+    "role", "moderator", selectorId("setup:discord-quartermaster:"), ["forbidden-quartermaster"],
+  );
+  await dispatchRaw(copied);
+  saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  assert.notEqual(saved?.quartermasterRoleId, "forbidden-quartermaster");
+  assert.match(replies.at(-1) ?? "", /settings session|administrator/i);
+});
+
+test("Trello mapping edits and resets retain the independently selected board", async () => {
+  await setSecurity({});
+  const current = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  assert.ok(current);
+  await saveGuildSetup({
+    ...current,
+    trello: {
+      boardId: "custom-security-board",
+      lists: { ...config.trelloListNames },
+      labels: {
+        blacklisted: "blacklisted", appealable: "appealable", conditional: "conditional",
+        permanent: "permanent", group: "group blacklist", revoked: "revoked",
+      },
+    },
+  });
+  const { root } = await openSettings("admin-a");
+  const moderation = await chooseSettingsCategory("admin-a", root, "moderation");
+  const blacklist = await chooseSettingsAction("admin-a", moderation, "setup:blacklist");
+  await dispatchRaw(button("admin-a", renderedButton(
+    latestComponentPayload(blacklist), "Trello Lists", "setup:",
+  )));
+  const listModal = shownModals.at(-1);
+  assert.ok(listModal?.customId);
+  await dispatchRaw(modal("admin-a", listModal.customId!, {
+    appealable: config.trelloListNames.appealable,
+    conditional: config.trelloListNames.conditional,
+    permanent: config.trelloListNames.permanent,
+    group: config.trelloListNames.group,
+    revoked: config.trelloListNames.revoked,
+  }));
+  let saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  assert.equal(saved?.trello?.boardId, "custom-security-board");
+
+  const nonce = listModal.customId!.split(":").at(-1)!;
+  await dispatchRaw(button("admin-a", `setup:trello-reset:${nonce}`));
+  saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  assert.equal(saved?.trello?.boardId, "custom-security-board");
 });
 
 test("settings and the Discord client constructor have no custom presence controls", async () => {
@@ -2165,10 +2302,12 @@ test("maintenance blocks every normal command and old interactive work before pr
   await dispatch(oldBlacklist);
   const oldBlacklistConfirmation = lastConfirmationId(oldBlacklist);
 
-  const setupStart = command("admin-a", "setup");
-  await dispatch(setupStart);
-  await dispatchRaw(button("admin-a", "setup:bot-state"));
-  await dispatchRaw(button("admin-a", "setup:enable-maintenance"));
+  const setupRoot = await openSettings("admin-a");
+  const setupSystem = await chooseSettingsCategory("admin-a", setupRoot.root, "system");
+  const setupState = await chooseSettingsAction("admin-a", setupSystem, "setup:bot-state");
+  await dispatchRaw(button("admin-a", renderedButton(
+    latestComponentPayload(setupState), "Enable Maintenance", "setup:",
+  )));
   const oldModal = shownModals.at(-1);
   assert.ok(oldModal?.customId.startsWith("setup-modal:maintenance-reason:"));
 
@@ -2259,10 +2398,12 @@ test("security status reports setup-required before setup and persisted maintena
 
 test("setup BOT STATE opens a reason modal and background join/recovery work continues in maintenance", async () => {
   await setSecurity({});
-  const setupStart = command("admin-a", "setup");
-  await dispatch(setupStart);
-  await dispatchRaw(button("admin-a", "setup:bot-state"));
-  await dispatchRaw(button("admin-a", "setup:enable-maintenance"));
+  const setupRoot = await openSettings("admin-a");
+  const setupSystem = await chooseSettingsCategory("admin-a", setupRoot.root, "system");
+  const setupState = await chooseSettingsAction("admin-a", setupSystem, "setup:bot-state");
+  await dispatchRaw(button("admin-a", renderedButton(
+    latestComponentPayload(setupState), "Enable Maintenance", "setup:",
+  )));
   const setupModal = shownModals.at(-1);
   assert.ok(setupModal?.customId.startsWith("setup-modal:maintenance-reason:"));
   const submitted = modal("admin-a", setupModal!.customId, { reason: "setup initiated" });

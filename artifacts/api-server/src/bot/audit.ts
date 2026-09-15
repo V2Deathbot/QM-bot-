@@ -107,6 +107,18 @@ export async function validateGuildSetup(
     throw new Error("The bot needs the Manage Roles permission before moderation.");
   }
   await requireAuditChannel(guild, setup);
+  // Named Quartermaster roles grant only uniform-submission participation, but
+  // are still validated on startup so a deleted/managed/out-of-hierarchy role
+  // is reported before the configuration is treated as ready.
+  for (const [label, roleId] of [
+    ["Senior Quartermaster", setup.seniorQuartermasterRoleId],
+    ["Quartermaster", setup.quartermasterRoleId],
+  ] as const) {
+    if (!roleId) continue; // Legacy records remain editable through /settings.
+    const role = await guild.roles.fetch(roleId);
+    if (!role) throw new Error(`The configured ${label} role no longer exists in this server.`);
+    validateModeratorRole(guild, role);
+  }
 }
 
 export async function sendAuditEvent(

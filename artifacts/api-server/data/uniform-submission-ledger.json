@@ -16,7 +16,8 @@
       ],
       "state": "written",
       "notified": true,
-      "createdAt": "2026-09-15T02:57:09.110Z"
+      "createdAt": "2026-09-15T02:57:09.110Z",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Moderated Uniforms\u0000A2:D\u00001549270688257282118",
@@ -33,7 +34,8 @@
       ],
       "state": "written",
       "notified": true,
-      "createdAt": "2026-09-15T04:08:37.433Z"
+      "createdAt": "2026-09-15T04:08:37.433Z",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549283213653053481",
@@ -51,7 +53,8 @@
       ],
       "state": "written",
       "notified": true,
-      "createdAt": "2026-09-15T04:58:34.561Z"
+      "createdAt": "2026-09-15T04:58:34.561Z",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549283945688993903",
@@ -69,7 +72,8 @@
       ],
       "state": "written",
       "notified": true,
-      "createdAt": "2026-09-15T05:01:30.851Z"
+      "createdAt": "2026-09-15T05:01:30.851Z",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549284276166721546",
@@ -87,7 +91,8 @@
       ],
       "state": "written",
       "notified": true,
-      "createdAt": "2026-09-15T05:02:50.995Z"
+      "createdAt": "2026-09-15T05:02:50.995Z",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549284883770245272",
@@ -105,7 +110,8 @@
       ],
       "state": "written",
       "notified": true,
-      "createdAt": "2026-09-15T05:05:13.345Z"
+      "createdAt": "2026-09-15T05:05:13.345Z",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549294433856655400",
@@ -137,7 +143,8 @@
       ],
       "state": "written",
       "notified": true,
-      "createdAt": "2026-09-15T05:43:05.259Z"
+      "createdAt": "2026-09-15T05:43:05.259Z",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549294552727289876",
@@ -169,7 +176,8 @@
       ],
       "state": "written",
       "notified": true,
-      "createdAt": "2026-09-15T05:43:34.191Z"
+      "createdAt": "2026-09-15T05:43:34.191Z",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549306560545689641",
@@ -187,7 +195,8 @@
       ],
       "state": "written",
       "notified": true,
-      "createdAt": "2026-09-15T06:31:19.899Z"
+      "createdAt": "2026-09-15T06:31:19.899Z",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549306895674777630",
@@ -205,7 +214,8 @@
       ],
       "state": "written",
       "notified": true,
-      "createdAt": "2026-09-15T06:32:36.914Z"
+      "createdAt": "2026-09-15T06:32:36.914Z",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     }
   ]
 }

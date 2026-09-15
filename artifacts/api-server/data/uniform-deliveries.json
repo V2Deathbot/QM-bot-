@@ -36,7 +36,8 @@
       "customerName": "26138z",
       "logNoticeState": "unresolved",
       "customerDeliveryState": "pending",
-      "createdAt": "2026-09-15T04:48:36.288Z"
+      "createdAt": "2026-09-15T04:48:36.288Z",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "submissionId": "1549283213653053481",
@@ -75,7 +76,8 @@
       "logNoticeState": "sent",
       "customerDeliveryState": "sent",
       "createdAt": "2026-09-15T04:58:33.845Z",
-      "customerMessageId": "1549283271639171195"
+      "customerMessageId": "1549283271639171195",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "submissionId": "1549283945688993903",
@@ -120,7 +122,8 @@
         "state": "sent",
         "nonce": "u-purchased-1969ae139e8c5"
       },
-      "terminal": "purchased"
+      "terminal": "purchased",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "submissionId": "1549284276166721546",
@@ -166,7 +169,8 @@
         "state": "sent",
         "nonce": "u-assistance-3797f53c237a"
       },
-      "terminal": "assistance"
+      "terminal": "assistance",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "submissionId": "1549284883770245272",
@@ -223,7 +227,8 @@
         "state": "sent",
         "nonce": "u-purchased-6db1b1075f577"
       },
-      "terminal": "purchased"
+      "terminal": "purchased",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "submissionId": "1549294433856655400",
@@ -290,7 +295,8 @@
         "state": "sent",
         "nonce": "u-purchased-1001c51830f97"
       },
-      "terminal": "purchased"
+      "terminal": "purchased",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "submissionId": "1549294552727289876",
@@ -372,7 +378,8 @@
         "auditState": "sent"
       },
       "terminal": "purchased",
-      "auditMessageId": "1549307777862733825"
+      "auditMessageId": "1549307777862733825",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "submissionId": "1549306560545689641",
@@ -420,7 +427,8 @@
         "nonce": "u-purchased-242137d01bdb2",
         "auditState": "sent"
       },
-      "terminal": "purchased"
+      "terminal": "purchased",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     },
     {
       "submissionId": "1549306895674777630",
@@ -468,7 +476,8 @@
         "nonce": "u-purchased-3bb0546d3cc21",
         "auditState": "sent"
       },
-      "terminal": "purchased"
+      "terminal": "purchased",
+      "invalidatedByPayoutRunId": "e43cee48-e025-46cd-978c-b9c33c041e32"
     }
   ]
 }

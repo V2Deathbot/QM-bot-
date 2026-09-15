@@ -67,7 +67,6 @@ export function getMissingConfiguration(): string[] {
     ["DISCORD_GUILD_ID", config.discordGuildId],
     ["TRELLO_API_KEY", config.trelloApiKey],
     ["TRELLO_TOKEN", config.trelloToken],
-    ["TRELLO_BOARD_ID", config.trelloBoardId],
   ] as const;
 
   return required.filter(([, value]) => !value).map(([key]) => key);

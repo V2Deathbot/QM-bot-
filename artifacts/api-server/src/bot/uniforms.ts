@@ -28,6 +28,7 @@ import {
   getGuildSetup,
   saveGuildSetup,
   updateGuildSetup,
+  quartermasterUniformRoleIds,
   uniformSettingsFor,
   type GuildSetup,
   type UniformSettings,
@@ -546,6 +547,22 @@ function memberHasRole(member: GuildMember, roleIds: string[]): boolean {
   return Boolean(cache?.has && roleIds.some((id) => cache.has!(id)));
 }
 
+/**
+ * Named Quartermaster roles are a convenience authorization layer for uniform
+ * work only.  They are combined at the point of authorization, never copied
+ * into the editable generic role list.
+ */
+function uniformAccessSettings(setup: GuildSetup): UniformSettings {
+  const settings = uniformSettingsFor(setup);
+  return {
+    ...settings,
+    authorizedRoleIds: [...new Set([
+      ...settings.authorizedRoleIds,
+      ...quartermasterUniformRoleIds(setup),
+    ])],
+  };
+}
+
 async function currentMember(
   guild: Guild,
   userId: string,
@@ -802,7 +819,7 @@ export async function handleUniformCommand(
   if (!uniformCommandNames.has(command)) {
     throw new Error("That is not a uniform logging command.");
   }
-  const settings = uniformSettingsFor(setup);
+  const settings = uniformAccessSettings(setup);
   await requireUniformSubmitter(interaction.guild!, interaction.user.id, settings);
   // Validate both the configured audit destination and the explicitly chosen
   // customer destination before opening the private confirmation.
@@ -1567,7 +1584,7 @@ export async function handleUniformSubmitButton(
   }
   const latest = await getGuildSetup(pending.guildId);
   if (!latest) throw new Error("This server no longer has a valid bot setup.");
-  const settings = uniformSettingsFor(latest);
+  const settings = uniformAccessSettings(latest);
   await requireUniformSubmitter(interaction.guild!, pending.actorId, settings);
   if (settings.spreadsheet && pending.workbookGeneration !== undefined &&
       pending.workbookGeneration !== await payoutWorkbookGeneration(settings.spreadsheet.spreadsheetId)) {
@@ -1676,7 +1693,7 @@ export async function handleUniformRetryButton(
     }
     const latest = await getGuildSetup(record.guildId);
     if (!latest) throw new Error("This server no longer has a valid bot setup.");
-    const settings = uniformSettingsFor(latest);
+    const settings = uniformAccessSettings(latest);
     if (record.relog) {
       if (!await relogAuthorized(interaction.guild!, interaction.user.id, record)) {
         throw new Error(record.command === "log"

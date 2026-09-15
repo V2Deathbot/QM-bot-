@@ -4,6 +4,13 @@ import { config } from "./config";
 
 export interface GuildSetup {
   guildId: string;
+  /**
+   * Named uniform leadership roles.  These are deliberately separate from
+   * moderatorRoleId: they permit uniform logging only, never bot settings,
+   * payouts, or blacklist administration.
+   */
+  seniorQuartermasterRoleId?: string;
+  quartermasterRoleId?: string;
   moderatorRoleId: string;
   auditChannelId: string;
   securityAlertChannelId?: string;
@@ -43,6 +50,8 @@ export interface TrelloMonitoringSettings {
 }
 
 export interface TrelloMappings {
+  /** Board ID selected through the setup panel; credentials remain external. */
+  boardId?: string;
   lists: {
     appealable: string;
     conditional: string;
@@ -124,6 +133,14 @@ export function uniformSettingsFor(setup: GuildSetup): UniformSettings {
   };
 }
 
+/** Roles which receive the narrowly-scoped uniform submitter permission. */
+export function quartermasterUniformRoleIds(setup: GuildSetup): string[] {
+  return [...new Set([
+    setup.seniorQuartermasterRoleId,
+    setup.quartermasterRoleId,
+  ].filter((id): id is string => Boolean(id)))];
+}
+
 export const defaultSecuritySettings = (): SecuritySettings => ({
   perAdminLimit: 3,
   globalLimit: 8,
@@ -147,6 +164,7 @@ export const defaultMonitoringSettings = (): TrelloMonitoringSettings => ({
 });
 
 export const defaultTrelloMappings = (): TrelloMappings => ({
+  boardId: config.trelloBoardId,
   lists: { ...config.trelloListNames },
   labels: {
     blacklisted: "blacklisted",
@@ -181,6 +199,7 @@ export function securitySettingsFor(setup: GuildSetup): SecuritySettings {
 export function trelloMappingsFor(setup: GuildSetup): TrelloMappings {
   const defaults = defaultTrelloMappings();
   return {
+    boardId: setup.trello?.boardId || defaults.boardId,
     lists: { ...defaults.lists, ...setup.trello?.lists },
     labels: { ...defaults.labels, ...setup.trello?.labels },
   };
