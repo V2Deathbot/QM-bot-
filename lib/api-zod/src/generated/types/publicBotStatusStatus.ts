@@ -5,9 +5,6 @@
  * API specification
  * OpenAPI spec version: 0.1.0
  */
-export interface HealthStatus {
-  status: string;
-}
 
 export type PublicBotStatusStatus = typeof PublicBotStatusStatus[keyof typeof PublicBotStatusStatus];
 
@@ -17,9 +14,3 @@ export const PublicBotStatusStatus = {
   maintenance: 'maintenance',
   offline: 'offline',
 } as const;
-
-export interface PublicBotStatus {
-  status: PublicBotStatusStatus;
-  checkedAt: string;
-}
-

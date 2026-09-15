@@ -30,6 +30,10 @@ import {
 } from "discord.js";
 import { logger } from "../lib/logger";
 import { config, getMissingConfiguration, type BlacklistType } from "./config";
+import {
+  mapDiscordPresenceToPublicStatus,
+  type PublicBotStatus,
+} from "./public-status";
 import { acquireBotRuntimeLease, type BotRuntimeLease } from "./runtime-lease";
 import { isFileBotStorage } from "./persistent-store";
 import {
@@ -3200,6 +3204,7 @@ async function completeMaintenanceChange(
       state.maintenanceAudit = state.maintenanceAudit.slice(-100);
     });
   });
+  setDiscordOperationalPresence(active);
   invalidateGuildInteractiveState(guild.id);
   if (setup) {
     const duration = durationSeconds !== null
@@ -4581,6 +4586,34 @@ export function getBotStatus() {
   };
 }
 
+function setDiscordOperationalPresence(maintenance: boolean): void {
+  const user = discordClient?.user;
+  if (!user) return;
+  user.setPresence({
+    status: maintenance ? "idle" : "online",
+    activities: [],
+  });
+}
+
+export async function getPublicBotStatus(): Promise<{
+  status: PublicBotStatus;
+  checkedAt: string;
+}> {
+  if (!discordClient?.isReady() || !config.discordGuildId) {
+    return { status: "offline", checkedAt: new Date().toISOString() };
+  }
+
+  const maintenance = await maintenanceActive(config.discordGuildId);
+  return {
+    status: mapDiscordPresenceToPublicStatus(
+      discordClient.user.presence.status,
+      maintenance,
+      true,
+    ),
+    checkedAt: new Date().toISOString(),
+  };
+}
+
 function setRecoveryStatus(
   status: BotRecoveryStatus,
   error: string | null = null,
@@ -4736,6 +4769,11 @@ async function connectDiscord(): Promise<void> {
             throw new Error("PostgreSQL leadership was lost before Discord became ready.");
           }
           const moderationEnabled = await registerCommands(readyClient);
+            setDiscordOperationalPresence(
+              config.discordGuildId
+                ? await maintenanceActive(config.discordGuildId)
+                : false,
+            );
             if (moderationEnabled) {
               setRecoveryStatus("successful");
               const guild = await readyClient.guilds.fetch(

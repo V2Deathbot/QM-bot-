@@ -1,4 +1,4 @@
-import { getHealthCheckQueryKey, useHealthCheck } from "@workspace/api-client-react";
+import { getHealthCheckQueryKey, useHealthCheck, getGetPublicBotStatusQueryKey, useGetPublicBotStatus } from "@workspace/api-client-react";
 import { Server, Activity, ShieldAlert, TerminalSquare, RefreshCw, Clock, CheckCircle2, AlertTriangle, XCircle } from "lucide-react";
 import { SiDiscord } from "react-icons/si";
 import { useEffect, useState } from "react";
@@ -19,8 +19,64 @@ export default function Home() {
     }
   });
 
+  const { data: botData, isLoading: isBotLoading, isError: isBotError, refetch: refetchBot, isFetching: isBotFetching } = useGetPublicBotStatus({
+    query: {
+      queryKey: getGetPublicBotStatusQueryKey(),
+      refetchInterval: 15000,
+    }
+  });
+
+  const handleRefresh = () => {
+    refetch();
+    refetchBot();
+  };
+
   const apiStatus = isLoading ? 'CONNECTING' : isError ? 'UNREACHABLE' : 'OPERATIONAL';
   
+  let botStatusText = 'UNKNOWN';
+  let BotStatusIcon = ShieldAlert;
+  let botStatusColorClass = 'text-amber-600';
+  let botBgClass = 'bg-[#5865F2]/10 border-[#5865F2]/30 text-[#5865F2]';
+  let botActionText = 'Check API Connection';
+
+  if (isBotLoading) {
+    botStatusText = 'CONNECTING';
+    BotStatusIcon = RefreshCw;
+    botStatusColorClass = 'text-muted-foreground';
+    botBgClass = 'bg-secondary border-border text-muted-foreground';
+    botActionText = 'Awaiting telemetry...';
+  } else if (isBotError) {
+    botStatusText = 'UNREACHABLE';
+    BotStatusIcon = XCircle;
+    botStatusColorClass = 'text-destructive';
+    botBgClass = 'bg-destructive/10 border-destructive/30 text-destructive';
+    botActionText = 'Investigate backend logs';
+  } else if (botData) {
+    switch (botData.status) {
+      case 'online':
+        botStatusText = 'ONLINE';
+        BotStatusIcon = CheckCircle2;
+        botStatusColorClass = 'text-emerald-600';
+        botBgClass = 'bg-emerald-500/10 border-emerald-500/30 text-emerald-600';
+        botActionText = 'None (Nominal)';
+        break;
+      case 'maintenance':
+        botStatusText = 'MAINTENANCE';
+        BotStatusIcon = AlertTriangle;
+        botStatusColorClass = 'text-amber-600 dark:text-amber-500';
+        botBgClass = 'bg-amber-500/10 border-amber-500/30 text-amber-600 dark:text-amber-500';
+        botActionText = 'Scheduled or forced downtime';
+        break;
+      case 'offline':
+        botStatusText = 'OFFLINE';
+        BotStatusIcon = XCircle;
+        botStatusColorClass = 'text-destructive';
+        botBgClass = 'bg-destructive/10 border-destructive/30 text-destructive';
+        botActionText = 'Check bot process host';
+        break;
+    }
+  }
+
   const timeString = currentTime.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
 
   return (
@@ -70,14 +126,14 @@ export default function Home() {
              className="border border-border bg-card p-6 md:p-8 flex flex-col relative group shadow-sm hover:shadow-md transition-shadow"
            >
              <div className="absolute top-0 right-0 p-6 opacity-0 group-hover:opacity-100 transition-opacity focus-within:opacity-100">
-               <button 
-                 onClick={() => refetch()} 
+                <button
+                  onClick={handleRefresh}
                  className="text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50 border border-border p-2 bg-background hover:bg-secondary cursor-pointer"
-                 disabled={isFetching}
+                 disabled={isFetching || isBotFetching}
                  data-testid="button-refresh-api"
                  title="Force manual refresh"
                >
-                 <RefreshCw className={`w-4 h-4 ${isFetching ? 'animate-spin' : ''}`} />
+                 <RefreshCw className={`w-4 h-4 ${(isFetching || isBotFetching) ? 'animate-spin' : ''}`} />
                </button>
              </div>
              
@@ -131,11 +187,23 @@ export default function Home() {
              initial={{ opacity: 0, y: 10 }}
              animate={{ opacity: 1, y: 0 }}
              transition={{ duration: 0.4, delay: 0.2 }}
-             className="border border-border bg-card p-6 md:p-8 flex flex-col relative shadow-sm"
+             className="border border-border bg-card p-6 md:p-8 flex flex-col relative group shadow-sm hover:shadow-md transition-shadow"
            >
+             <div className="absolute top-0 right-0 p-6 opacity-0 group-hover:opacity-100 transition-opacity focus-within:opacity-100">
+                <button
+                  onClick={handleRefresh}
+                 className="text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50 border border-border p-2 bg-background hover:bg-secondary cursor-pointer"
+                 disabled={isFetching || isBotFetching}
+                 data-testid="button-refresh-bot"
+                 title="Force manual refresh"
+               >
+                 <RefreshCw className={`w-4 h-4 ${(isFetching || isBotFetching) ? 'animate-spin' : ''}`} />
+               </button>
+             </div>
+
              <div className="flex items-start justify-between mb-8">
                <div className="flex items-center gap-4">
-                 <div className="p-3 border bg-[#5865F2]/10 border-[#5865F2]/30 text-[#5865F2]">
+                 <div className={`p-3 border transition-colors ${botBgClass}`}>
                    <SiDiscord className="w-6 h-6" />
                  </div>
                  <div>
@@ -145,36 +213,28 @@ export default function Home() {
                </div>
              </div>
 
-             <div className="bg-amber-500/10 border border-amber-500/30 p-4 mb-8 flex gap-3 items-start text-amber-800 dark:text-amber-400">
-               <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
-               <div className="text-sm leading-relaxed">
-                 <strong className="block mb-1 font-semibold uppercase font-mono text-[10px] tracking-wider">Manual Verification Required</strong>
-                 Gateway status cannot be automatically verified from this terminal. An operational API does not guarantee the Discord process is currently connected.
-               </div>
-             </div>
-
              <div className="mt-auto space-y-0 text-sm">
                <div className="flex items-center justify-between py-4 border-t border-border">
                  <span className="font-medium text-muted-foreground">Connection State</span>
                  <span className="flex items-center gap-2">
-                   <ShieldAlert className="w-4 h-4 text-amber-600" />
-                   <span className="font-mono font-bold text-amber-600">
-                     UNKNOWN
+                   <BotStatusIcon className={`w-4 h-4 ${botStatusColorClass} ${isBotLoading ? 'animate-spin' : ''}`} />
+                   <span className={`font-mono font-bold ${botStatusColorClass}`}>
+                     {botStatusText}
                    </span>
                  </span>
                </div>
                
                <div className="flex items-center justify-between py-4 border-t border-border">
-                 <span className="font-medium text-muted-foreground">Discord Heartbeat</span>
-                 <span className="font-mono text-muted-foreground bg-secondary px-2 py-0.5 border border-border line-through opacity-70">
-                   AWAITING
+                 <span className="font-medium text-muted-foreground">Gateway Heartbeat</span>
+                 <span className="font-mono text-muted-foreground bg-secondary px-2 py-0.5 border border-border">
+                   {isBotLoading ? '...' : isBotError ? 'ERR_CONNECTION_REFUSED' : (botData?.checkedAt ? new Date(botData.checkedAt).toISOString().replace('T', ' ').substring(0, 19) + ' UTC' : 'UNKNOWN')}
                  </span>
                </div>
 
                <div className="flex items-center justify-between py-4 border-t border-b border-border">
                  <span className="font-medium text-muted-foreground">Action Required</span>
                  <span className="font-mono text-muted-foreground">
-                   Check Discord client
+                   {botActionText}
                  </span>
                </div>
              </div>

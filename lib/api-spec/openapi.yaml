@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: bot
+    description: Public bot status
 paths:
   /healthz:
     get:
@@ -24,6 +26,19 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /bot/status/public:
+    get:
+      operationId: getPublicBotStatus
+      tags: [bot]
+      summary: Public bot status
+      description: Returns the Discord bot state for websites and status displays
+      responses:
+        "200":
+          description: Current bot status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicBotStatus"
 components:
   schemas:
     HealthStatus:
@@ -33,4 +48,16 @@ components:
           type: string
       required:
         - status
+    PublicBotStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [online, maintenance, offline]
+        checkedAt:
+          type: string
+          format: date-time
+      required:
+        - status
+        - checkedAt
 
