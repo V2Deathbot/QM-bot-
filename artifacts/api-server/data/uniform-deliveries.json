@@ -1,0 +1,43 @@
+{
+  "records": [
+    {
+      "submissionId": "1549280653907066992",
+      "guildId": "1114860005334716422",
+      "command": "log",
+      "actorId": "555727322695860234",
+      "customerId": "555727322695860234",
+      "seqmId": "1170780243754242199",
+      "destinationChannelId": "1549280467847618600",
+      "uploadLogChannelId": "1549233954136006737",
+      "spreadsheet": {
+        "spreadsheetId": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98",
+        "logTab": "Uniform Logging",
+        "moderatedTab": "Moderated Uniforms",
+        "logRange": "A2:E",
+        "moderatedRange": "A2:D",
+        "createMissingTabs": false
+      },
+      "rows": [
+        [
+          "26138z",
+          "26138z",
+          "26138z",
+          "26138z",
+          "https://www.roblox.com/catalog/60668685"
+        ]
+      ],
+      "sheetState": "saved",
+      "assets": [
+        {
+          "id": 60668685,
+          "url": "https://www.roblox.com/catalog/60668685"
+        }
+      ],
+      "customerName": "26138z",
+      "logNoticeState": "unresolved",
+      "customerDeliveryState": "pending",
+      "legacyNonceRejected": true,
+      "createdAt": "2026-09-15T04:48:36.288Z"
+    }
+  ]
+}

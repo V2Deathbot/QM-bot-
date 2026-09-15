@@ -26,6 +26,7 @@ process.env.BOT_SETUP_FILE = path.join(directory, "setup.json");
 process.env.BOT_SECURITY_FILE = path.join(directory, "security.json");
 process.env.ROLE_SNAPSHOT_FILE = path.join(directory, "snapshots.json");
 process.env.UNIFORM_SUBMISSION_LEDGER_FILE = path.join(directory, "uniform-submission-ledger.json");
+process.env.UNIFORM_DELIVERY_FILE = path.join(directory, "uniform-deliveries.json");
 
 const { config } = await import("../src/bot/config.ts");
 const { saveGuildSetup } = await import("../src/bot/setup-store.ts");
@@ -786,7 +787,7 @@ test("registers exactly six commands with the requested moderation and uniform o
   assert.deepEqual(log?.options?.map((option) => option.name), [
     "qm", "seqm", "publisher", "customer",
     "shirtid1", "channel", "shirtid2", "shirtid3", "shirtid4", "shirtid5",
-    "shirtid6", "shirtid7", "shirtid8", "shirtid9", "shirtid10", "channel",
+    "shirtid6", "shirtid7", "shirtid8", "shirtid9", "shirtid10",
   ]);
   assert.deepEqual(moderated?.options?.map((option) => option.name), [
     "uploader", "publisher", "customer", "shirtid", "channel",
@@ -964,6 +965,52 @@ test("navigates to Uniforms uploading configuration, seals modal fields, saves, 
   const backInteraction = button("setup-owner", backToCategory);
   await dispatchRaw(backInteraction);
   assert.match(presentationReplyText(backInteraction.localReplies.at(-1)), /Uniforms/);
+});
+
+test("limits legacy uniform delivery recovery to its scoped Administrator settings modal", async () => {
+  await setSecurity({});
+  const { getGuildSetup } = await import("../src/bot/setup-store.ts");
+  const { getUniformDelivery, saveUniformDelivery } = await import("../src/bot/uniform-delivery-store.ts");
+  const current = await getGuildSetup(guild.id);
+  assert.ok(current);
+  const submissionId = "1234567890123456789";
+  await saveUniformDelivery({
+    submissionId, guildId: guild.id, command: "log", actorId: "original-submitter",
+    customerId: "customer", seqmId: "seqm", destinationChannelId: "customer-channel",
+    uploadLogChannelId: "upload-log", spreadsheet: {
+      spreadsheetId: "sheet", logTab: "Uniform Logs", moderatedTab: "Moderated Logs",
+    }, rows: [["a", "b", "c", "d", "e"]], sheetState: "saved", customerName: "Customer",
+    assets: [{ id: 1, url: "https://www.roblox.com/catalog/1" }],
+    logNoticeState: "unresolved", customerDeliveryState: "pending", legacyNonceRejected: true,
+    createdAt: new Date().toISOString(),
+  });
+  const rowCount = spreadsheetRows.get("Uniform Logs")?.length;
+  const { root } = await openSettings("setup-owner");
+  const uniforms = await chooseSettingsCategory("setup-owner", root, "uniforms");
+  const pageInteraction = await chooseSettingsAction("setup-owner", uniforms, "setup:uniforms");
+  const page = latestComponentPayload(pageInteraction);
+  assert.match(presentationReplyText(page), new RegExp(submissionId));
+  const recover = renderedButton(page, "Recover Delivery", "setup:");
+  await dispatchRaw(button("setup-owner", recover));
+  const shown = shownModals.at(-1)!;
+  assert.deepEqual(modalTextInputIds(shown), ["submission_id"]);
+  assert.deepEqual(modalTextInputValues(shown), [submissionId]);
+
+  await dispatchRaw(modal("admin-a", shown.customId, { submission_id: submissionId }));
+  assert.match(replies.at(-1) ?? "", /expired|another administrator/i);
+  assert.equal((await getUniformDelivery(submissionId))?.logNoticeState, "unresolved");
+
+  await dispatchRaw(modal("setup-owner", shown.customId, { submission_id: submissionId }));
+  const recovered = await getUniformDelivery(submissionId);
+  assert.equal(recovered?.sheetState, "saved");
+  assert.equal(recovered?.logNoticeState, "pending");
+  assert.equal(recovered?.customerDeliveryState, "pending");
+  assert.equal(recovered?.legacyNonceRejected, undefined);
+  assert.equal(spreadsheetRows.get("Uniform Logs")?.length, rowCount);
+
+  await dispatchRaw(modal("setup-owner", shown.customId, { submission_id: submissionId }));
+  assert.match(replies.at(-1) ?? "", /not eligible/i);
+  assert.equal((await getUniformDelivery(submissionId))?.logNoticeState, "pending");
 });
 
 test("configures Spreadsheet Configuration with stable nonce-bound fields and preserves uploading access", async () => {

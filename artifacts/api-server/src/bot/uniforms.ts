@@ -33,10 +33,14 @@ import {
 import {
   getUniformDelivery,
   claimUniformDeliveryAction,
+  findLegacyNonceRejectedDelivery,
+  recoverLegacyNonceRejectedDelivery,
   saveUniformDelivery,
+  uniformDiscordNonce,
   updateUniformDelivery,
   type UniformDeliveryRecord,
 } from "./uniform-delivery-store";
+import { logger } from "../lib/logger";
 import {
   displayId,
   noMentions,
@@ -194,6 +198,72 @@ export class UniformNotificationError extends Error {
     );
     this.name = "UniformNotificationError";
   }
+}
+
+type DiscordDeliveryStage = "upload-log notice" | "customer delivery";
+
+interface DiscordFailureDetails {
+  status?: number;
+  code?: number;
+}
+
+/**
+ * This deliberately exposes only Discord's stable status and API code.
+ * Request payloads can contain names, mentions, and component data, while
+ * Discord error objects can retain the complete request configuration.
+ */
+function discordFailureDetails(error: unknown): DiscordFailureDetails {
+  if (!error || typeof error !== "object") return {};
+  const value = error as {
+    status?: unknown;
+    code?: unknown;
+    rawError?: { status?: unknown; code?: unknown };
+  };
+  const statusValue = value.status ?? value.rawError?.status;
+  const codeValue = value.code ?? value.rawError?.code;
+  return {
+    ...(typeof statusValue === "number" && Number.isInteger(statusValue)
+      ? { status: statusValue }
+      : {}),
+    ...(typeof codeValue === "number" && Number.isInteger(codeValue)
+      ? { code: codeValue }
+      : {}),
+  };
+}
+
+export class UniformDiscordDeliveryError extends Error {
+  readonly retryable: boolean;
+
+  constructor(
+    readonly stage: DiscordDeliveryStage,
+    readonly status?: number,
+    readonly code?: number,
+  ) {
+    const details = [
+      status === undefined ? "" : `HTTP ${status}`,
+      code === undefined ? "" : `Discord code ${code}`,
+    ].filter(Boolean).join(", ");
+    const retryable = status === 400 || status === 403;
+    super(
+      retryable
+        ? `Discord rejected the ${stage}${details ? ` (${details})` : ""}. Correct the destination or bot permissions, then choose Retry Delivery.`
+        : `The ${stage} outcome could not be confirmed${details ? ` (${details})` : ""}. It will not be retried automatically.`,
+    );
+    this.name = "UniformDiscordDeliveryError";
+    this.retryable = retryable;
+  }
+}
+
+function discordDeliveryFailure(stage: DiscordDeliveryStage, error: unknown): UniformDiscordDeliveryError {
+  const { status, code } = discordFailureDetails(error);
+  // Do not attach `error`: Discord.js error objects can include the request
+  // body and authorization metadata. The structured fields are sufficient for
+  // operations without logging customer data or secrets.
+  logger.error(
+    { stage, discordStatus: status, discordCode: code },
+    "Discord uniform delivery failed",
+  );
+  return new UniformDiscordDeliveryError(stage, status, code);
 }
 
 const activeUniformSubmissions = new Set<string>();
@@ -805,6 +875,16 @@ function deliveryRetryComponents(record: UniformDeliveryRecord) {
   )];
 }
 
+function hasRetryableDelivery(record: UniformDeliveryRecord | undefined): boolean {
+  return Boolean(
+    record &&
+    record.sheetState === "saved" &&
+    (record.logNoticeState === "pending" || record.customerDeliveryState === "pending") &&
+    record.logNoticeState !== "unresolved" &&
+    record.customerDeliveryState !== "unresolved",
+  );
+}
+
 function sentMessageId(value: unknown): string {
   if (!value || typeof value !== "object") return "";
   return typeof (value as { id?: unknown }).id === "string" ? (value as { id: string }).id : "";
@@ -833,11 +913,20 @@ async function sendPendingDelivery(
   }
   if (current.logNoticeState !== "sent") {
     current = await updateUniformDelivery(record.submissionId, (item) => { item.logNoticeState = "claimed"; });
+    let notice: unknown;
     try {
-      const notice = await logChannel.send({
+      notice = await logChannel.send({
         content: `Uniform logged: /${record.command} (${record.assets.length} asset${record.assets.length === 1 ? "" : "s"}).`,
-        allowedMentions: noMentions, nonce: `${record.submissionId}-notice`, enforceNonce: true,
+        allowedMentions: noMentions, nonce: uniformDiscordNonce("notice", record.submissionId), enforceNonce: true,
       });
+    } catch (error) {
+      const failure = discordDeliveryFailure("upload-log notice", error);
+      await updateUniformDelivery(record.submissionId, (item) => {
+        item.logNoticeState = failure.retryable ? "pending" : "unresolved";
+      });
+      throw failure;
+    }
+    try {
       await markUniformRowsNotified(record.spreadsheet, record.command, record.submissionId, sentMessageId(notice));
       current = await updateUniformDelivery(record.submissionId, (item) => { item.logNoticeState = "sent"; });
     } catch (error) {
@@ -847,12 +936,21 @@ async function sendPendingDelivery(
   }
   if (current.customerDeliveryState !== "sent") {
     current = await updateUniformDelivery(record.submissionId, (item) => { item.customerDeliveryState = "claimed"; });
+    let message: unknown;
     try {
-      const message = await destination.send({
+      message = await destination.send({
         content: `<@${record.customerId}>`, embeds: [customerDeliveryEmbed(current)],
         components: customerDeliveryButtons(current), allowedMentions: { parse: [], users: [record.customerId] },
-        nonce: `${record.submissionId}-customer`, enforceNonce: true,
+        nonce: uniformDiscordNonce("customer", record.submissionId), enforceNonce: true,
       });
+    } catch (error) {
+      const failure = discordDeliveryFailure("customer delivery", error);
+      await updateUniformDelivery(record.submissionId, (item) => {
+        item.customerDeliveryState = failure.retryable ? "pending" : "unresolved";
+      });
+      throw failure;
+    }
+    try {
       const messageId = sentMessageId(message);
       if (!messageId) throw new Error("Discord did not return a message ID for the customer delivery.");
       current = await updateUniformDelivery(record.submissionId, (item) => {
@@ -940,14 +1038,18 @@ export async function handleUniformSubmitButton(
       const current = await getUniformDelivery(record.submissionId);
       await interaction.editReply({
         embeds: [presentationEmbed(
-          current?.sheetState === "saved" ? "Saved, Delivery Unresolved" : "Submission Outcome Unresolved",
-          current?.sheetState === "saved"
+          hasRetryableDelivery(current)
+            ? "Saved, Delivery Needs Retry"
+            : current?.sheetState === "saved" ? "Saved, Delivery Unresolved" : "Submission Outcome Unresolved",
+          current?.sheetState === "saved" && error instanceof UniformDiscordDeliveryError
+            ? `The uniform rows are saved, but ${error.message} The original rows will not be written again.`
+            : current?.sheetState === "saved"
             ? "The uniform rows are saved, but a Discord delivery outcome could not be confirmed. No duplicate message will be sent automatically; an administrator must verify the recorded channel."
             : "The original Sheets target is durably reserved, but its write outcome could not be confirmed. Do not run the slash command again; an administrator must verify the original sheet target.",
           "warning",
         )],
-        components: current?.sheetState === "saved" && current.logNoticeState !== "unresolved" && current.customerDeliveryState !== "unresolved"
-          ? deliveryRetryComponents(current) : [],
+        components: hasRetryableDelivery(current)
+          ? deliveryRetryComponents(current!) : [],
         allowedMentions: noMentions,
       });
       return;
@@ -973,14 +1075,22 @@ export async function handleUniformRetryButton(
   const [, , submissionId] = interaction.customId.split(":");
   if (!submissionId) throw new Error("That delivery retry is unavailable.");
   const record = await getUniformDelivery(submissionId);
-  if (!record || record.guildId !== interaction.guildId || record.actorId !== interaction.user.id) {
-    throw new Error("Only the original authorized submitter can retry this recorded delivery.");
+  if (!record || record.guildId !== interaction.guildId) {
+    throw new Error("This recorded delivery is unavailable.");
   }
   await interaction.deferUpdate();
   if (await maintenanceIsActive(record.guildId)) throw new Error("Bot maintenance mode is active. Commands are temporarily unavailable.");
   const latest = await getGuildSetup(record.guildId);
   if (!latest) throw new Error("This server no longer has a valid bot setup.");
-  await requireUniformSubmitter(interaction.guild!, record.actorId, uniformSettingsFor(latest));
+  const settings = uniformSettingsFor(latest);
+  if (record.actorId === interaction.user.id) {
+    await requireUniformSubmitter(interaction.guild!, record.actorId, settings);
+  } else {
+    const member = await currentMember(interaction.guild!, interaction.user.id);
+    if (interaction.guild!.ownerId !== member.id && !member.permissions.has(PermissionFlagsBits.Administrator)) {
+      throw new Error("Only the original authorized submitter or a current Administrator can retry this recorded delivery.");
+    }
+  }
   await fetchedMember(interaction.guild!, record.customerId);
   if (record.command === "log") await fetchedMember(interaction.guild!, record.seqmId);
   await requireUniformChannel(interaction.guild!, record.uploadLogChannelId, record.command);
@@ -1234,6 +1344,7 @@ export async function resetUniformSettings(
 export function uniformSettingsEmbed(
   setup: GuildSetup,
   avatarUrl?: string,
+  recoverableSubmissionId?: string,
 ): EmbedBuilder {
   const settings = uniformSettingsFor(setup);
   const mentionList = (ids: string[], prefix: string): string =>
@@ -1255,6 +1366,13 @@ export function uniformSettingsEmbed(
           : "Not configured — submissions require Spreadsheet Configuration",
         inline: false,
       },
+      ...(recoverableSubmissionId
+        ? [{
+            name: "Recoverable saved delivery",
+            value: `Legacy nonce rejection: \`${safePresentationText(recoverableSubmissionId)}\`\nUse Recover Delivery to safely enable its existing delivery retry. No Sheets rows will be written again.`,
+            inline: false,
+          }]
+        : []),
     ],
   );
 }
@@ -1264,8 +1382,9 @@ export async function renderUniformSettings(
   setup: GuildSetup,
   avatarUrl?: string,
 ): Promise<void> {
+  const recoverable = await findLegacyNonceRejectedDelivery(setup.guildId);
   await interaction.update({
-    embeds: [uniformSettingsEmbed(setup, avatarUrl)],
+    embeds: [uniformSettingsEmbed(setup, avatarUrl, recoverable?.submissionId)],
     components: [
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
@@ -1284,6 +1403,11 @@ export async function renderUniformSettings(
           .setCustomId("setup:uniforms-reset")
           .setLabel("Reset Uniforms")
           .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId("setup:uniforms-recover")
+          .setLabel("Recover Delivery")
+          .setStyle(ButtonStyle.Danger)
+          .setDisabled(!recoverable),
       ),
     ],
   });
@@ -1361,6 +1485,29 @@ export async function handleUniformSettingsComponent(
               .setValue(spreadsheet?.moderatedRange ?? "A2:D")
               .setRequired(true)
               .setMaxLength(40),
+          ),
+        ),
+    );
+    return;
+  }
+  if (id === "setup:uniforms-recover") {
+    const recoverable = await findLegacyNonceRejectedDelivery(setup.guildId);
+    if (!recoverable) {
+      throw new Error("There is no saved delivery eligible for legacy nonce recovery.");
+    }
+    await interaction.showModal(
+      new ModalBuilder()
+        .setCustomId("setup-modal:uniforms-recover")
+        .setTitle("Recover Saved Uniform Delivery")
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId("submission_id")
+              .setLabel("Saved delivery submission ID")
+              .setStyle(TextInputStyle.Short)
+              .setValue(recoverable.submissionId)
+              .setRequired(true)
+              .setMaxLength(25),
           ),
         ),
     );
@@ -1470,6 +1617,28 @@ export async function handleUniformSettingsModal(
     ephemeral: true,
   });
   return updated;
+}
+
+export async function handleUniformRecoveryModal(
+  interaction: ModalSubmitInteraction,
+  setup: GuildSetup,
+): Promise<void> {
+  const submissionId = uniformModalValue(interaction, "submission_id").trim();
+  if (!/^\d{17,25}$/.test(submissionId)) {
+    throw new Error("The saved delivery submission ID must contain 17 to 25 digits.");
+  }
+  const recovered = await recoverLegacyNonceRejectedDelivery(setup.guildId, submissionId);
+  await interaction.reply({
+    content: "",
+    embeds: [presentationEmbed(
+      "Delivery Recovery Ready",
+      "The confirmed legacy nonce rejection was reset to pending. Retry Delivery will use the original saved delivery and will not write Google Sheets rows again.",
+      "warning",
+    )],
+    components: deliveryRetryComponents(recovered),
+    allowedMentions: noMentions,
+    ephemeral: true,
+  });
 }
 
 export async function handleUniformSpreadsheetSettingsModal(

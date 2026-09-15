@@ -20,3 +20,9 @@ Do not put operational bookkeeping or automatically generated headers in the uni
 **Why:** The user supplies preformatted worksheets with a separate Sold checkbox column and explicitly wants only participant usernames and the uniform link. Extra metadata breaks that layout.
 
 **How to apply:** Keep delivery tracking outside Sheets. Preserve headers and adjacent columns; never insert entire rows to log uniforms.
+
+Test Discord message idempotency keys with realistic snowflake lengths and the provider's 25-character nonce limit.
+
+**Why:** Appending readable stage suffixes to real interaction IDs exceeded that limit, rejecting delivery after Sheets had saved successfully; short mocked IDs hid the failure.
+
+**How to apply:** Distinguish definitive provider rejection from an uncertain transport outcome. Only the latter warrants blocking retries pending delivery verification.

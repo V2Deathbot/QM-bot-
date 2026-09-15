@@ -1,6 +1,27 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { config } from "./config";
+
+export type UniformDiscordNonceKind = "notice" | "customer" | "purchased" | "assistance";
+
+/**
+ * Discord accepts nonces up to 25 characters. Interaction IDs are already
+ * commonly 19–20 digits, so suffixing one directly can exceed that limit.
+ * Keep a readable type prefix and derive the remaining collision-resistant
+ * portion from both immutable inputs.
+ */
+export function uniformDiscordNonce(
+  kind: UniformDiscordNonceKind,
+  submissionId: string,
+): string {
+  const prefix = `u-${kind}-`;
+  const digestLength = 25 - prefix.length;
+  return `${prefix}${createHash("sha256")
+    .update(`uniform-delivery:${kind}:${submissionId}`)
+    .digest("hex")
+    .slice(0, digestLength)}`;
+}
 
 export interface UniformDeliveryRecord {
   submissionId: string;
@@ -27,6 +48,11 @@ export interface UniformDeliveryRecord {
   logNoticeState: "pending" | "claimed" | "sent" | "unresolved";
   customerDeliveryState: "pending" | "claimed" | "sent" | "unresolved";
   customerMessageId?: string;
+  /**
+   * A one-time, manually confirmed migration marker for a delivery rejected
+   * before Discord accepted the legacy overlong notice nonce.
+   */
+  legacyNonceRejected?: true;
   terminal?: "purchased" | "assistance";
   action?: {
     kind: "purchased" | "assistance";
@@ -106,6 +132,45 @@ export async function updateUniformDelivery(
   });
 }
 
+function canRecoverLegacyNonceRejection(record: UniformDeliveryRecord): boolean {
+  return record.legacyNonceRejected === true &&
+    record.sheetState === "saved" &&
+    record.logNoticeState === "unresolved" &&
+    record.customerDeliveryState === "pending" &&
+    !record.customerMessageId;
+}
+
+export async function findLegacyNonceRejectedDelivery(
+  guildId: string,
+): Promise<UniformDeliveryRecord | undefined> {
+  return mutate((store) => store.records.find((record) =>
+    record.guildId === guildId && canRecoverLegacyNonceRejection(record),
+  ));
+}
+
+/**
+ * This is intentionally narrower than a general unresolved retry. The marker
+ * is surgically applied only after an operator has confirmed Discord rejected
+ * the legacy nonce before message creation. Claimed and generic unresolved
+ * states remain non-replayable.
+ */
+export async function recoverLegacyNonceRejectedDelivery(
+  guildId: string,
+  submissionId: string,
+): Promise<UniformDeliveryRecord> {
+  return mutate((store) => {
+    const record = store.records.find((item) =>
+      item.guildId === guildId && item.submissionId === submissionId,
+    );
+    if (!record || !canRecoverLegacyNonceRejection(record)) {
+      throw new Error("This delivery is not eligible for legacy nonce recovery.");
+    }
+    record.logNoticeState = "pending";
+    delete record.legacyNonceRejected;
+    return record;
+  });
+}
+
 export async function claimUniformDeliveryAction(
   submissionId: string,
   kind: "purchased" | "assistance",
@@ -115,7 +180,7 @@ export async function claimUniformDeliveryAction(
     if (record.terminal || record.action) return;
     record.action = {
       kind, ...(reason ? { reason } : {}), state: "claimed",
-      nonce: `${record.submissionId}-${kind}`,
+      nonce: uniformDiscordNonce(kind, record.submissionId),
     };
   });
 }

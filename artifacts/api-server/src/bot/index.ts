@@ -103,6 +103,7 @@ import {
   handleUniformCustomerButton,
   handleUniformSettingsComponent,
   handleUniformSettingsModal,
+  handleUniformRecoveryModal,
   handleUniformSpreadsheetSettingsModal,
   handleUniformSubmitButton,
   handleUniformRetryButton,
@@ -1295,7 +1296,8 @@ function settingsCategoryForAction(id: string): SettingsCategory | undefined {
     id === "setup:uniforms-config" ||
     id === "setup:uniforms-reset" ||
     id === "setup:uniforms-spreadsheet-config" ||
-    id === "setup:uniforms-spreadsheet-reset"
+    id === "setup:uniforms-spreadsheet-reset" ||
+    id === "setup:uniforms-recover"
   ) return "uniforms";
   if (
     id === "setup:bot-state" ||
@@ -1671,7 +1673,8 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
     id === "setup:uniforms-config" ||
     id === "setup:uniforms-reset" ||
     id === "setup:uniforms-spreadsheet-config" ||
-    id === "setup:uniforms-spreadsheet-reset"
+    id === "setup:uniforms-spreadsheet-reset" ||
+    id === "setup:uniforms-recover"
   ) {
     if (!interaction.isButton()) {
       throw new Error("Uniforms settings controls must be used from their settings page.");
@@ -2048,6 +2051,10 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
   }
   if (id === "setup-modal:uniforms") {
     await handleUniformSettingsModal(interaction, setup);
+    return;
+  }
+  if (id === "setup-modal:uniforms-recover") {
+    await handleUniformRecoveryModal(interaction, setup);
     return;
   }
   if (id === "setup-modal:uniforms-spreadsheet") {

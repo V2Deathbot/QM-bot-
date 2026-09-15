@@ -20,7 +20,8 @@ const {
 const { setGoogleSheetsProxyForTests, resetGoogleSheetsProxyForTests } =
   await import("../src/bot/google-sheets.ts");
 const {
-  getUniformDelivery, resetUniformDeliveryStoreForTests, saveUniformDelivery,
+  getUniformDelivery, recoverLegacyNonceRejectedDelivery, resetUniformDeliveryStoreForTests,
+  saveUniformDelivery, uniformDiscordNonce,
 } = await import("../src/bot/uniform-delivery-store.ts");
 const { getGuildSetup, saveGuildSetup, defaultUniformSettings } =
   await import("../src/bot/setup-store.ts");
@@ -43,6 +44,7 @@ globalThis.fetch = async (_input, init) => {
 const rows = new Map<string, unknown[][]>();
 let sends: unknown[] = [];
 let sendFailure: Error | undefined;
+let rejectLongDiscordNonces = false;
 let sheetFailure: Error | undefined;
 let sheetValidationGate: Promise<void> | undefined;
 let interactionCount = 0;
@@ -91,6 +93,10 @@ const guild = {
       permissionsFor: () => ({ has: () => true }),
       send: async (payload: unknown) => {
         if (sendFailure) throw sendFailure;
+        const nonce = (payload as { nonce?: unknown }).nonce;
+        if (rejectLongDiscordNonces && typeof nonce === "string" && nonce.length > 25) {
+          throw Object.assign(new Error("Invalid Form Body"), { status: 400, code: 50035 });
+        }
         sends.push({ id, payload });
         return { id: `notice-${sends.length}` };
       },
@@ -152,7 +158,8 @@ async function prepareAndSubmit(command: "log" | "moderated", values: Record<str
 }
 beforeEach(() => {
   rows.clear(); sends = []; sendFailure = undefined; sheetFailure = undefined;
-  sheetValidationGate = undefined; resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
+  rejectLongDiscordNonces = false; sheetValidationGate = undefined;
+  resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
 });
 after(() => { globalThis.fetch = originalFetch; resetGoogleSheetsProxyForTests(); });
 
@@ -199,6 +206,7 @@ test("writes before notice and conservatively preserves an unresolved notice", a
   await handleUniformUserSelection({ customId: `uniform:seqm:${nonce}`, guild, guildId: guild.id, user: { id: "submitter" }, values: ["seqm-discord"], update: async () => undefined } as never);
   await handleUniformSubmitButton({ customId: `uniform:submit:${nonce}`, guild, guildId: guild.id, user: { id: "submitter" }, deferUpdate: async () => undefined, editReply: async () => undefined } as never, async () => false);
   assert.deepEqual(rows.get("Uniform Logs"), [["QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/42"]]);
+  assert.equal((await getUniformDelivery("notice-retry"))?.logNoticeState, "unresolved");
   sendFailure = undefined;
   resetUniformSubmissionStateForTests();
   await prepareAndSubmit("log", value, "notice-retry");
@@ -276,6 +284,114 @@ test("writes ten /log rows before one notice and routes /moderated separately", 
   assert.deepEqual(rows.get("Moderated Logs"), [["Uploader", "Publisher", "Customer", "https://www.roblox.com/catalog/77"]]);
   assert.equal((sends[2] as { id: string }).id, "moderated");
   assert.doesNotMatch(JSON.stringify(sends.slice(2)), /seqm-discord/);
+});
+
+test("uses deterministic Discord-safe nonces for 19- and 20-digit delivery IDs", async () => {
+  rejectLongDiscordNonces = true;
+  const nineteenDigits = "1234567890123456789";
+  const twentyDigits = "12345678901234567890";
+  await prepareAndSubmit("log", {
+    qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer", shirtid1: "12",
+  }, nineteenDigits);
+  assert.equal(sends.length, 2);
+  const deliveryNonces = sends.map(({ payload }) => (payload as { nonce: string }).nonce);
+  assert.deepEqual(deliveryNonces, [
+    uniformDiscordNonce("notice", nineteenDigits),
+    uniformDiscordNonce("customer", nineteenDigits),
+  ]);
+  assert.ok(deliveryNonces.every((nonce) => nonce.length <= 25));
+  assert.notEqual(deliveryNonces[0], deliveryNonces[1]);
+  assert.equal(uniformDiscordNonce("notice", nineteenDigits), uniformDiscordNonce("notice", nineteenDigits));
+
+  await saveUniformDelivery({
+    submissionId: twentyDigits, guildId: guild.id, command: "log", actorId: "submitter",
+    customerId: "customer-discord", seqmId: "seqm-discord", destinationChannelId: "customer-channel",
+    uploadLogChannelId: "log", spreadsheet: setup.uniforms!.spreadsheet!, rows: [],
+    sheetState: "saved", customerName: "Customer", assets: [{ id: 98, url: "https://www.roblox.com/catalog/98" }],
+    logNoticeState: "sent", customerDeliveryState: "sent", customerMessageId: "twenty-digit-message", createdAt: new Date().toISOString(),
+  });
+  await handleUniformCustomerButton({
+    customId: `uniform:purchase:${twentyDigits}`, guild, guildId: guild.id, channelId: "customer-channel",
+    message: { id: "twenty-digit-message" }, user: { id: "customer-discord" },
+    deferUpdate: async () => undefined, editReply: async () => undefined,
+  } as never);
+  const actionNonce = ((sends[2] as { payload: { nonce: string } }).payload.nonce);
+  assert.equal(actionNonce, uniformDiscordNonce("purchased", twentyDigits));
+  assert.ok(actionNonce.length <= 25);
+  assert.notEqual(actionNonce, uniformDiscordNonce("assistance", twentyDigits));
+});
+
+test("keeps definitive Discord 400 and 403 delivery failures pending with Retry Delivery", async () => {
+  for (const status of [400, 403]) {
+    const id = `${status}12345678901234567`;
+    sendFailure = Object.assign(new Error("Discord rejected delivery"), { status, code: status === 400 ? 50035 : 50013 });
+    const result = await prepareAndSubmit("log", {
+      qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer", shirtid1: "13",
+    }, id);
+    const saved = await getUniformDelivery(id);
+    assert.equal(saved?.sheetState, "saved");
+    assert.equal(saved?.logNoticeState, "pending");
+    assert.equal(saved?.customerDeliveryState, "pending");
+    const reply = result.edits.at(-1) as {
+      embeds: Array<{ data: { description: string } }>;
+      components: unknown[];
+    };
+    assert.match(reply.embeds[0]!.data.description, new RegExp(`HTTP ${status}`));
+    assert.match(reply.embeds[0]!.data.description, /Retry Delivery/);
+    assert.equal(reply.components.length, 1);
+    sendFailure = undefined;
+  }
+});
+
+test("only a current Administrator can retry a recovered delivery for another submitter", async () => {
+  await saveGuildSetup(setup as never);
+  await saveUniformDelivery({
+    submissionId: "admin-retry", guildId: guild.id, command: "log", actorId: "original-submitter",
+    customerId: "customer-discord", seqmId: "seqm-discord", destinationChannelId: "customer-channel",
+    uploadLogChannelId: "log", spreadsheet: setup.uniforms!.spreadsheet!, rows: [["unchanged"]],
+    sheetState: "saved", customerName: "Customer", assets: [{ id: 14, url: "https://www.roblox.com/catalog/14" }],
+    logNoticeState: "sent", customerDeliveryState: "pending", createdAt: new Date().toISOString(),
+  });
+  await assert.rejects(handleUniformRetryButton({
+    customId: "uniform:retry:admin-retry", guild, guildId: guild.id, user: { id: "other-submitter" },
+    deferUpdate: async () => undefined, editReply: async () => undefined,
+  } as never, async () => false), /original authorized submitter or a current Administrator/i);
+  assert.equal(sends.length, 0);
+
+  const administratorGuild = {
+    ...guild,
+    members: {
+      ...guild.members,
+      fetch: async (request: string | { user: string }) => {
+        const id = typeof request === "string" ? request : request.user;
+        return {
+          ...member, id, guild: { id: guild.id },
+          permissions: { has: () => id === "delivery-admin" },
+        };
+      },
+    },
+  };
+  await handleUniformRetryButton({
+    customId: "uniform:retry:admin-retry", guild: administratorGuild, guildId: guild.id, user: { id: "delivery-admin" },
+    deferUpdate: async () => undefined, editReply: async () => undefined,
+  } as never, async () => false);
+  assert.equal(sends.length, 1);
+  assert.equal(rows.get("Uniform Logs"), undefined, "a saved delivery retry must not write Sheets rows");
+});
+
+test("does not infer legacy recovery eligibility for a generic unresolved delivery", async () => {
+  await saveUniformDelivery({
+    submissionId: "9876543210987654321", guildId: guild.id, command: "log", actorId: "submitter",
+    customerId: "customer-discord", seqmId: "seqm-discord", destinationChannelId: "customer-channel",
+    uploadLogChannelId: "log", spreadsheet: setup.uniforms!.spreadsheet!, rows: [],
+    sheetState: "saved", customerName: "Customer", assets: [{ id: 15, url: "https://www.roblox.com/catalog/15" }],
+    logNoticeState: "unresolved", customerDeliveryState: "pending", createdAt: new Date().toISOString(),
+  });
+  await assert.rejects(
+    recoverLegacyNonceRejectedDelivery(guild.id, "9876543210987654321"),
+    /not eligible/i,
+  );
+  assert.equal((await getUniformDelivery("9876543210987654321"))?.logNoticeState, "unresolved");
 });
 
 test("/moderated asks only for the customer and does not write before Submit", async () => {
