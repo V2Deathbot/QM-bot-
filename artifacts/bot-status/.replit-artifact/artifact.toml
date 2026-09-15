@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Quartermaster Bot Status"
+description = "A lightweight operational status page for the Quartermaster Discord bot, providing a deployable root application while the API service runs the bot continuously."
+version = "1.0.0"
+id = "artifacts/bot-status"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 22053
+
+[services.development]
+run = "pnpm --filter @workspace/bot-status run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/bot-status", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/bot-status/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "22053"
+BASE_PATH = "/"
