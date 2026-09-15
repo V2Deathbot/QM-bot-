@@ -68,6 +68,7 @@ import {
   securitySettingsFor,
   auditSettingsFor,
   trelloMappingsFor,
+  uniformSettingsFor,
   type GuildSetup,
 } from "./setup-store";
 import {
@@ -94,6 +95,14 @@ import {
   safePresentationText,
   titleCaseHeading,
 } from "./presentation";
+import {
+  handleUniformCommand,
+  handleUniformSettingsComponent,
+  handleUniformSettingsModal,
+  renderUniformSettings,
+  uniformCommandNames,
+  uniformCommands,
+} from "./uniforms";
 
 const settingsCommand = new SlashCommandBuilder()
   .setName("settings")
@@ -148,10 +157,12 @@ const setupOnlyCommands = [settingsCommand].map((command) => command.toJSON());
 const enabledCommands = [settingsCommand, ...moderationCommands].map((command) =>
   command.toJSON(),
 );
+const enabledUniformCommands = uniformCommands.map((command) => command.toJSON());
+const allEnabledCommands = [...enabledCommands, ...enabledUniformCommands];
 
 /** Snapshot of the exact command contract sent to Discord. */
 export function getRegisteredCommandDefinitions() {
-  return enabledCommands.map((command) => ({
+  return allEnabledCommands.map((command) => ({
     ...command,
     options: command.options?.map((option) => ({ ...option })),
   }));
@@ -190,7 +201,7 @@ let recoveryAttempt: Promise<BotRefreshResult> | null = null;
 let trelloRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let blacklistSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let shutdownHooksInstalled = false;
-type SettingsCategory = "moderation" | "integrations" | "security" | "logs" | "system";
+type SettingsCategory = "moderation" | "integrations" | "security" | "logs" | "uniforms" | "system";
 
 type SettingsLocation =
   | { kind: "root" }
@@ -783,6 +794,7 @@ const settingsCategories: Array<{
   { id: "integrations", label: "Integrations", description: "Trello configuration and monitoring" },
   { id: "security", label: "Security", description: "Lockdown, access safeguards, and identity detection" },
   { id: "logs", label: "Logs & Server", description: "Audit destinations and Discord policy" },
+  { id: "uniforms", label: "Uniforms", description: "Uniform upload destinations and submitter access" },
   { id: "system", label: "System", description: "Status, maintenance, bot state, and configuration" },
 ];
 
@@ -867,6 +879,10 @@ function settingsCategoryOptions(
         { label: "Audit Configuration", value: "setup:audit", description: "Destinations and retained log categories" },
         { label: "Discord Configuration", value: "setup:discord", description: "View server authorization policy" },
       ];
+    case "uniforms":
+      return [
+        { label: "Uniform Uploading", value: "setup:uniforms", description: "Separate /log and /moderated channels and access" },
+      ];
     case "system":
       return [
         { label: "System Status", value: "settings-action:status", description: "View command, Trello, and security status" },
@@ -889,7 +905,7 @@ function settingsMenu(nonce: string, configured: boolean, maintenance = false): 
       maintenance
         ? "Maintenance is active. Choose an emergency category. Normal configuration and moderation controls are hidden and remain unavailable."
         : configured
-          ? "Choose a category to manage Quartermaster. Controls are private, expire after 10 minutes, and re-check your current Administrator permission.\n\n**Moderation** covers blacklist rules and records. **Integrations** covers Trello. **Security** covers safeguards and identity detection. **Logs & Server** covers audit and Discord policy. **System** covers status and maintenance."
+          ? "Choose a category to manage Quartermaster. Controls are private, expire after 10 minutes, and re-check your current Administrator permission.\n\n**Moderation** covers blacklist rules and records. **Integrations** covers Trello. **Security** covers safeguards and identity detection. **Logs & Server** covers audit and Discord policy. **Uniforms** covers upload logging destinations and access. **System** covers status and maintenance."
           : "Initial setup is required. Open System to verify an audit channel; emergency status and security controls remain available.",
     )],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
@@ -1041,6 +1057,7 @@ function setupMenu(nonce: string): {
     ["audit", "Audit Settings"],
     ["discord", "Discord Settings"],
     ["identity", "Identity / Alt Detection"],
+    ["uniforms", "Uniform Uploading"],
     ["bot-state", "Bot State"],
     ["view", "View Configuration"],
   ] as const;
@@ -1264,6 +1281,11 @@ function settingsCategoryForAction(id: string): SettingsCategory | undefined {
     id === "settings-action:unlock"
   ) return "security";
   if (id === "setup:audit" || id === "setup:discord") return "logs";
+  if (
+    id === "setup:uniforms" ||
+    id === "setup:uniforms-config" ||
+    id === "setup:uniforms-reset"
+  ) return "uniforms";
   if (
     id === "setup:bot-state" ||
     id === "setup:view" ||
@@ -1563,7 +1585,7 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
   if (activeSession?.nonceRequired && id.startsWith("setup:")) {
     const pageIds = new Set([
       "setup:blacklist", "setup:trello", "setup:security", "setup:lockdown",
-      "setup:audit", "setup:discord", "setup:identity", "setup:bot-state", "setup:view",
+      "setup:audit", "setup:discord", "setup:identity", "setup:uniforms", "setup:bot-state", "setup:view",
     ]);
     if (pageIds.has(id)) {
       const current = settingsNavigation(activeSession).at(-1);
@@ -1628,6 +1650,17 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
         new ButtonBuilder().setCustomId("setup:security-reset").setLabel("Reset Security Defaults").setStyle(ButtonStyle.Secondary),
       )],
     });
+    return;
+  }
+  if (id === "setup:uniforms") {
+    await renderUniformSettings(interaction, setup, botAvatarUrl());
+    return;
+  }
+  if (id === "setup:uniforms-config" || id === "setup:uniforms-reset") {
+    if (!interaction.isButton()) {
+      throw new Error("Uniforms settings controls must be used from their settings page.");
+    }
+    await handleUniformSettingsComponent(interaction, setup);
     return;
   }
   if (id === "setup:bot-state") {
@@ -1971,10 +2004,13 @@ async function handleSetupComponent(interaction: ButtonInteraction | StringSelec
     return;
   }
   if (id === "setup:view" || id === "setup:discord") {
+    const uniforms = uniformSettingsFor(setup);
     await interaction.update({ embeds: [outcomeEmbed(id === "setup:view" ? "Configuration" : "Discord Settings", "Saved server configuration and authorization policy.", "info", [
       { name: "Audit Channel", value: `<#${setup.auditChannelId}>` },
       { name: "Blacklist Role", value: setup.blacklistRoleId ? `<@&${setup.blacklistRoleId}>` : "Not configured" },
       { name: "Authorization", value: "Current Administrator permission only" },
+      { name: "Uniform /log", value: uniforms.logChannelId ? `<#${uniforms.logChannelId}>` : "Not configured", inline: true },
+      { name: "Uniform /moderated", value: uniforms.moderatedChannelId ? `<#${uniforms.moderatedChannelId}>` : "Not configured", inline: true },
     ])], components: [] });
   }
 }
@@ -1992,6 +2028,10 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
   if (id === "setup-modal:maintenance-reason") {
     const reason = cleanText(interaction.fields.getTextInputValue("reason"), "Maintenance reason");
     await createMaintenanceConfirmation(interaction, true, reason);
+    return;
+  }
+  if (id === "setup-modal:uniforms") {
+    await handleUniformSettingsModal(interaction, setup);
     return;
   }
   if (
@@ -3503,6 +3543,19 @@ async function handleInteraction(
     return;
   }
 
+  // Uniform logging is intentionally independent of blacklist validation,
+  // Trello readiness, destructive-action limits, and security lockdown.
+  // Maintenance remains the existing global emergency block above.
+  if (uniformCommandNames.has(interaction.commandName)) {
+    try {
+      await handleUniformCommand(interaction, setup, botAvatarUrl());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The uniform log failed unexpectedly.";
+      await interaction.editReply(errorResponse(`Could not complete the uniform log: ${message}`, "Uniform Log Failed"));
+    }
+    return;
+  }
+
   try {
     await validateGuildSetup(interaction.guild, setup);
   } catch (error) {
@@ -3727,7 +3780,7 @@ async function registerGuildCommands(
     throw new Error("The saved setup could not be validated.");
   }
 
-  const commandData = setupValid ? enabledCommands : setupOnlyCommands;
+  const commandData = setupValid ? allEnabledCommands : setupOnlyCommands;
   commandsRegistered = false;
   setupCommandRegistered = false;
   guildSetupComplete = setupValid;

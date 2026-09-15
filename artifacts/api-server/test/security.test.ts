@@ -712,22 +712,34 @@ test.before(async () => {
   await refreshBot();
 });
 
-test("registers exactly four commands with the requested moderation options", () => {
+test("registers exactly six commands with the requested moderation and uniform options", () => {
   const definitions = getRegisteredCommandDefinitions();
   assert.deepEqual(definitions.map((command) => command.name), [
     "settings",
     "blacklist",
     "revoke_blacklist",
     "blacklist_lookup",
+    "log",
+    "moderated",
   ]);
   const blacklist = definitions.find((command) => command.name === "blacklist");
   const revoke = definitions.find((command) => command.name === "revoke_blacklist");
+  const log = definitions.find((command) => command.name === "log");
+  const moderated = definitions.find((command) => command.name === "moderated");
   assert.deepEqual(blacklist?.options?.map((option) => option.name), [
     "username",
     "type",
     "reason",
   ]);
   assert.deepEqual(revoke?.options?.map((option) => option.name), ["username"]);
+  assert.deepEqual(log?.options?.map((option) => option.name), [
+    "customer", "qm", "seqm", "publisher",
+    "shirtid1", "shirtid2", "shirtid3", "shirtid4", "shirtid5",
+    "shirtid6", "shirtid7", "shirtid8", "shirtid9", "shirtid10",
+  ]);
+  assert.deepEqual(moderated?.options?.map((option) => option.name), [
+    "customer", "uploader", "publisher", "shirtid",
+  ]);
 });
 
 test.after(() => {
@@ -816,6 +828,90 @@ test("audits an Administrator security-setting change through the setup interact
   const saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
   assert.equal(saved?.security?.confirmationsRequired, false);
   assert.ok(auditEvents.length > beforeAudits, "configuration change must emit an audit event");
+});
+
+test("navigates to Uniforms uploading configuration, seals modal fields, saves, resets, and rechecks admin permission", async () => {
+  await setSecurity({});
+  const store = await import("../src/bot/setup-store.ts");
+  const current = await store.getGuildSetup(guild.id);
+  assert.ok(current);
+  await saveGuildSetup({
+    ...current!,
+    uniforms: {
+      logChannelId: "12345678901234567",
+      moderatedChannelId: "12345678901234568",
+      authorizedRoleIds: ["moderator-role"],
+      authorizedMemberIds: ["member"],
+    },
+  });
+
+  const { root } = await openSettings("setup-owner");
+  const uniforms = await chooseSettingsCategory("setup-owner", root, "uniforms");
+  const uniformPageInteraction = await chooseSettingsAction("setup-owner", uniforms, "setup:uniforms");
+  const uniformPage = latestComponentPayload(uniformPageInteraction);
+  const configure = renderedButton(uniformPage, "Uploading Configuration", "setup:");
+  const modalCount = shownModals.length;
+  await dispatchRaw(button("setup-owner", configure));
+  const shown = shownModals.at(-1);
+  assert.equal(shownModals.length, modalCount + 1);
+  assert.deepEqual(modalTextInputIds(shown!), [
+    "log_channel_id",
+    "moderated_channel_id",
+    "authorized_role_ids",
+    "authorized_member_ids",
+  ]);
+
+  await dispatchRaw(modal("setup-owner", shown!.customId, {
+    log_channel_id: "12345678901234567",
+    moderated_channel_id: "12345678901234568",
+    authorized_role_ids: "moderator-role",
+    authorized_member_ids: "member",
+  }));
+  let saved = await store.getGuildSetup(guild.id);
+  assert.equal(saved?.uniforms?.logChannelId, "12345678901234567");
+  assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["member"]);
+
+  // A modal captured while the user was an administrator cannot be used after
+  // the member is demoted.
+  await dispatchRaw(button("setup-owner", configure));
+  const staleForDemotion = shownModals.at(-1)!;
+  members.set("setup-owner", { administrator: false });
+  await dispatchRaw(modal("setup-owner", staleForDemotion.customId, {
+    log_channel_id: "",
+    moderated_channel_id: "",
+    authorized_role_ids: "",
+    authorized_member_ids: "",
+  }));
+  saved = await store.getGuildSetup(guild.id);
+  assert.equal(saved?.uniforms?.logChannelId, "12345678901234567");
+  members.set("setup-owner", { administrator: true });
+
+  await dispatchRaw(modal("setup-owner", staleForDemotion.customId, {
+    log_channel_id: "",
+    moderated_channel_id: "",
+    authorized_role_ids: "",
+  }));
+  assert.match(replies.at(-1) ?? "", /Missing Uniforms configuration field.*authorized_member_ids/i);
+
+  // Serialized modal field IDs are stable, while the modal itself remains
+  // nonce-bound to this settings session.
+  await dispatchRaw(modal("setup-owner", shown!.customId.replace(/[a-f0-9]{32}$/, "00000000000000000000000000000000"), {
+    log_channel_id: "",
+    moderated_channel_id: "",
+    authorized_role_ids: "",
+    authorized_member_ids: "",
+  }));
+  assert.match(replies.at(-1) ?? "", /expired|another administrator/i);
+
+  const resetInteraction = button("setup-owner", renderedButton(uniformPage, "Reset Uniforms", "setup:"));
+  await dispatchRaw(resetInteraction);
+  saved = await store.getGuildSetup(guild.id);
+  assert.equal(saved?.uniforms, undefined);
+  const resetPayload = latestComponentPayload(resetInteraction);
+  const backToCategory = renderedButton(resetPayload, "Back to Category", "settings:back:");
+  const backInteraction = button("setup-owner", backToCategory);
+  await dispatchRaw(backInteraction);
+  assert.match(presentationReplyText(backInteraction.localReplies.at(-1)), /Uniforms/);
 });
 
 test("manual lockdown stops destructive handlers without stopping authorized status commands", async () => {
@@ -1446,6 +1542,7 @@ test("/settings traverses categories and opens nonce-bound parameter modals", as
       "setup:identity",
     ],
     logs: ["setup:audit", "setup:discord"],
+    uniforms: ["setup:uniforms"],
     system: [
       "settings-action:status", "settings-action:maintenance-enable",
       "settings-action:maintenance-disable", "setup:bot-state", "setup:view",
@@ -1456,8 +1553,9 @@ test("/settings traverses categories and opens nonce-bound parameter modals", as
     "settings-category:moderation",
     "settings-category:integrations",
     "settings-category:security",
-    "settings-category:logs",
-    "settings-category:system",
+     "settings-category:logs",
+     "settings-category:uniforms",
+     "settings-category:system",
   ]);
   for (const [categoryName, expectedOptions] of Object.entries(expectedCategories)) {
     const { payload } = await chooseSettingsCategory("admin-a", rootResult.root, categoryName);

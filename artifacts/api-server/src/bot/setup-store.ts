@@ -14,6 +14,8 @@ export interface GuildSetup {
   security?: SecuritySettings;
   monitoring?: TrelloMonitoringSettings;
   identity?: IdentitySettings;
+  /** Optional uniform-log destinations and non-administrator submitter access. */
+  uniforms?: UniformSettings;
   updatedBy: string;
   updatedAt: string;
 }
@@ -71,6 +73,30 @@ export interface IdentitySettings {
   historicalAssociationWarnings: boolean;
   /** Deliberately fixed off: identity associations are warnings, never punishment. */
   autoPunishPossibleAlts: false;
+}
+
+export interface UniformSettings {
+  /** Channel used by /log. Undefined means that command is not configured. */
+  logChannelId?: string;
+  /** Channel used by /moderated. Undefined means that command is not configured. */
+  moderatedChannelId?: string;
+  /** Additional submitters allowed to use either uniform command. */
+  authorizedRoleIds: string[];
+  authorizedMemberIds: string[];
+}
+
+export const defaultUniformSettings = (): UniformSettings => ({
+  authorizedRoleIds: [],
+  authorizedMemberIds: [],
+});
+
+export function uniformSettingsFor(setup: GuildSetup): UniformSettings {
+  return {
+    ...defaultUniformSettings(),
+    ...setup.uniforms,
+    authorizedRoleIds: [...(setup.uniforms?.authorizedRoleIds ?? [])],
+    authorizedMemberIds: [...(setup.uniforms?.authorizedMemberIds ?? [])],
+  };
 }
 
 export const defaultSecuritySettings = (): SecuritySettings => ({
