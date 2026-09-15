@@ -54,7 +54,19 @@
         "autoPunishPossibleAlts": false
       },
       "updatedBy": "555727322695860234",
-      "updatedAt": "2026-09-15T00:52:27.711Z"
+      "updatedAt": "2026-09-15T02:02:26.380Z",
+      "uniforms": {
+        "authorizedRoleIds": [],
+        "authorizedMemberIds": [],
+        "logChannelId": "1549233954136006737",
+        "moderatedChannelId": "1549233954136006737",
+        "spreadsheet": {
+          "spreadsheetId": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98",
+          "logTab": "Uniform Logs",
+          "moderatedTab": "Moderated Logs",
+          "createMissingTabs": false
+        }
+      }
     }
   ]
 }
