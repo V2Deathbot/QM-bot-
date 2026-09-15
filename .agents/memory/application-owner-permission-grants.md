@@ -1,10 +1,10 @@
 ---
 name: Application-owner permission grants
-description: Authority boundary for configurable uploading and blacklist access.
+description: Authority boundary and defaults for configurable command access.
 ---
 
-Only the Discord application owner may add, replace, or remove configured uploading and blacklist role/member grants. Blacklist grants default to empty, so server-owner or current-Administrator access remains the default.
+Every registered command except `/blacklist_lookup` defaults to Discord Administrator/server-owner access. Only the Discord application owner may add, replace, or remove per-command role/member grants. `/blacklist_lookup` is always public and is not configurable.
 
-**Why:** Permission grants let non-Administrators use sensitive bot features. The user requires this delegation authority to remain exclusively with the Discord application owner, not each server's Administrators.
+**Why:** Permission grants let non-Administrators use bot features. The user requires each command to be delegated independently and requires delegation authority to remain exclusively with the Discord application owner.
 
-**How to apply:** Resolve ownership from Discord application metadata and fail closed when it is unavailable. Keep grants narrowly scoped: blacklist grants authorize blacklist actions only, and uploading grants authorize uniform uploads only. Recheck authorization at execution boundaries.
+**How to apply:** Resolve ownership from Discord application metadata and fail closed when unavailable. Do not use Discord's Administrator-only command registration flag because it blocks granted users before runtime checks. Recheck grants at execution boundaries.

@@ -20,15 +20,52 @@ export interface GuildSetup {
   security?: SecuritySettings;
   monitoring?: TrelloMonitoringSettings;
   identity?: IdentitySettings;
-  /** Optional uniform-log destinations and non-administrator submitter access. */
+  /** Optional uniform-log destinations. Legacy access fields are retained as inert data. */
   uniforms?: UniformSettings;
-  /** Optional, narrowly-scoped access to blacklist mutation commands. */
+  /** Legacy blacklist grants retained as inert data for storage compatibility. */
   blacklistAuthorizedRoleIds?: string[];
   blacklistAuthorizedMemberIds?: string[];
+  /** Per-command grants. An absent or empty entry means Administrator/server-owner only. */
+  commandPermissions?: Partial<Record<CommandPermissionName, CommandPermissionGrant>>;
   /** Explicit member allowed to run payouts and change security limits. */
   securityOwnerId?: string;
   updatedBy: string;
   updatedAt: string;
+}
+
+export const commandPermissionNames = [
+  "settings", "payout", "blacklist", "revoke_blacklist", "log", "moderated", "relog",
+] as const;
+export type CommandPermissionName = typeof commandPermissionNames[number];
+export interface CommandPermissionGrant {
+  roleIds: string[];
+  memberIds: string[];
+}
+
+export function commandPermissionName(command: string): CommandPermissionName | undefined {
+  if (command === "setup" || command === "settings") return "settings";
+  if ((commandPermissionNames as readonly string[]).includes(command)) {
+    return command as CommandPermissionName;
+  }
+  return undefined;
+}
+
+export function commandPermissionFor(
+  setup: GuildSetup,
+  command: string,
+): CommandPermissionGrant {
+  const key = commandPermissionName(command);
+  const grant = key ? setup.commandPermissions?.[key] : undefined;
+  return {
+    roleIds: [...new Set((grant?.roleIds ?? []).filter((id) => /^\d{5,25}$/.test(id)))],
+    memberIds: [...new Set((grant?.memberIds ?? []).filter((id) => /^\d{5,25}$/.test(id)))],
+  };
+}
+
+/** Whether a command has an explicit new-model entry (including an intentional empty grant). */
+export function hasCommandPermissionEntry(setup: GuildSetup, command: string): boolean {
+  const key = commandPermissionName(command);
+  return Boolean(key && setup.commandPermissions && Object.prototype.hasOwnProperty.call(setup.commandPermissions, key));
 }
 
 export interface SecuritySettings {
@@ -235,12 +272,23 @@ function isGuildSetup(value: unknown): value is GuildSetup {
   const validOptionalIds = (ids: unknown): boolean =>
     ids === undefined ||
     (Array.isArray(ids) && ids.every((id) => typeof id === "string" && /^\d{5,25}$/.test(id)));
+  const permissions = candidate["commandPermissions"];
+  const validCommandPermissions = permissions === undefined || Boolean(
+    permissions && typeof permissions === "object" &&
+    Object.entries(permissions).every(([name, value]) =>
+      (commandPermissionNames as readonly string[]).includes(name) &&
+      Boolean(value) && typeof value === "object" &&
+      validOptionalIds((value as Record<string, unknown>)["roleIds"]) &&
+      validOptionalIds((value as Record<string, unknown>)["memberIds"]),
+    )
+  );
   return (
     typeof candidate["guildId"] === "string" &&
     typeof candidate["moderatorRoleId"] === "string" &&
     typeof candidate["auditChannelId"] === "string" &&
     validOptionalIds(candidate["blacklistAuthorizedRoleIds"]) &&
     validOptionalIds(candidate["blacklistAuthorizedMemberIds"]) &&
+    validCommandPermissions &&
     typeof candidate["updatedBy"] === "string" &&
     typeof candidate["updatedAt"] === "string"
   );

@@ -34,7 +34,8 @@ import {
   getGuildSetup,
   saveGuildSetup,
   updateGuildSetup,
-  quartermasterUniformRoleIds,
+  commandPermissionFor,
+  hasCommandPermissionEntry,
   uniformSettingsFor,
   type GuildSetup,
   type UniformSettings,
@@ -558,14 +559,15 @@ function memberHasRole(member: GuildMember, roleIds: string[]): boolean {
  * work only.  They are combined at the point of authorization, never copied
  * into the editable generic role list.
  */
-function uniformAccessSettings(setup: GuildSetup): UniformSettings {
+function uniformAccessSettings(setup: GuildSetup, command?: UniformCommandName): UniformSettings {
   const settings = uniformSettingsFor(setup);
+  const grant = command && hasCommandPermissionEntry(setup, command)
+    ? commandPermissionFor(setup, command)
+    : undefined;
   return {
     ...settings,
-    authorizedRoleIds: [...new Set([
-      ...settings.authorizedRoleIds,
-      ...quartermasterUniformRoleIds(setup),
-    ])],
+    authorizedRoleIds: grant?.roleIds ?? [],
+    authorizedMemberIds: grant?.memberIds ?? [],
   };
 }
 
@@ -825,7 +827,7 @@ export async function handleUniformCommand(
   if (!uniformCommandNames.has(command)) {
     throw new Error("That is not a uniform logging command.");
   }
-  const settings = uniformAccessSettings(setup);
+  const settings = uniformAccessSettings(setup, command);
   await requireUniformSubmitter(interaction.guild!, interaction.user.id, settings);
   // Validate both the configured audit destination and the explicitly chosen
   // customer destination before opening the private confirmation.
@@ -879,13 +881,16 @@ async function relogAuthorized(
   guild: Guild,
   actorId: string,
   record: UniformDeliveryRecord,
+  setup?: GuildSetup,
 ): Promise<boolean> {
   const member = await currentMember(guild, actorId);
   if (guild.ownerId === member.id || member.permissions.has(PermissionFlagsBits.Administrator)) return true;
-  // A /log relog belongs to the SEQM originally selected for this specific
-  // delivery. /moderated has no SEQM or Sold column, so only its original
-  // actor (or an Administrator above) can replace its delivery.
-  return record.command === "log" ? record.seqmId === member.id : record.actorId === member.id;
+  if (setup && hasCommandPermissionEntry(setup, "relog")) {
+    const grant = commandPermissionFor(setup, "relog");
+    return grant.memberIds.includes(actorId) ||
+      memberHasRole(member, grant.roleIds);
+  }
+  return false;
 }
 
 function relogPending(nonce: string, interaction: { guildId: string | null; user: { id: string } }): PendingRelogConfirmation {
@@ -1158,9 +1163,10 @@ export async function handleUniformRelogCommand(
   await requireUniformChannel(interaction.guild!, selected.id, "log");
   const newAsset = parseUniformAssetInput(optionString(interaction, "newlink", true) ?? "");
   const records = await findUniformDeliveriesForChannel(interaction.guildId!, selected.id);
+  const setup = await getGuildSetup(interaction.guildId!);
   const authorized: UniformDeliveryRecord[] = [];
   for (const record of records) {
-    if (await relogAuthorized(interaction.guild!, interaction.user.id, record)) authorized.push(record);
+    if (await relogAuthorized(interaction.guild!, interaction.user.id, record, setup)) authorized.push(record);
   }
   const choices = authorized.flatMap((record) =>
     record.assets.map((_asset, rowIndex) => ({ submissionId: record.submissionId, rowIndex })),
@@ -1213,7 +1219,7 @@ export async function handleUniformRelogSelection(
   }
   const record = await getUniformDelivery(submissionId);
   if (!record || record.guildId !== pending.guildId || record.destinationChannelId !== pending.channelId ||
-      !await relogAuthorized(interaction.guild!, interaction.user.id, record)) {
+      !await relogAuthorized(interaction.guild!, interaction.user.id, record, await getGuildSetup(interaction.guildId!))) {
     throw new Error("This recorded delivery is no longer available for relog.");
   }
   pendingRelogConfirmations.delete(nonce);
@@ -1648,7 +1654,7 @@ export async function handleUniformSubmitButton(
   }
   const latest = await getGuildSetup(pending.guildId);
   if (!latest) throw new Error("This server no longer has a valid bot setup.");
-  const settings = uniformAccessSettings(latest);
+  const settings = uniformAccessSettings(latest, pending.command);
   await requireUniformSubmitter(interaction.guild!, pending.actorId, settings);
   if (settings.spreadsheet && pending.workbookGeneration !== undefined &&
       pending.workbookGeneration !== await payoutWorkbookGeneration(settings.spreadsheet.spreadsheetId)) {
@@ -1759,9 +1765,9 @@ export async function handleUniformRetryButton(
     }
     const latest = await getGuildSetup(record.guildId);
     if (!latest) throw new Error("This server no longer has a valid bot setup.");
-    const settings = uniformAccessSettings(latest);
+    const settings = uniformAccessSettings(latest, record.command);
     if (record.relog) {
-      if (!await relogAuthorized(interaction.guild!, interaction.user.id, record)) {
+      if (!await relogAuthorized(interaction.guild!, interaction.user.id, record, latest)) {
         throw new Error(record.command === "log"
           ? "Only the assigned Senior Quartermaster or a current Administrator can retry this relog."
           : "Only the original moderated actor or a current Administrator can retry this relog.");

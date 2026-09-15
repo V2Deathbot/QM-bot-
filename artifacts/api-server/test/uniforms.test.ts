@@ -136,6 +136,11 @@ const guild = {
 };
 const setup = {
   guildId: "guild", moderatorRoleId: "mod", auditChannelId: "audit", updatedBy: "owner", updatedAt: new Date().toISOString(),
+  commandPermissions: {
+    log: { roleIds: ["20000000000000001"], memberIds: [] },
+    moderated: { roleIds: ["20000000000000001"], memberIds: [] },
+    relog: { roleIds: ["20000000000000001"], memberIds: [] },
+  },
   uniforms: {
     logChannelId: "log", moderatedChannelId: "moderated",
     authorizedRoleIds: ["20000000000000001"], authorizedMemberIds: [],
