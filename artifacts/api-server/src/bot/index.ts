@@ -276,7 +276,7 @@ function persistRecoveryState(): void {
     logger.error({ err: error }, "Could not persist bot recovery state");
   });
 }
-type SettingsCategory = "moderation" | "integrations" | "security" | "logs" | "uniforms" | "system";
+type SettingsCategory = "uploading" | "blacklisting" | "global";
 
 type SettingsLocation =
   | { kind: "root" }
@@ -962,12 +962,9 @@ const settingsCategories: Array<{
   label: string;
   description: string;
 }> = [
-  { id: "moderation", label: "Moderation", description: "Blacklist rules, records, and identity lookup" },
-  { id: "integrations", label: "Integrations", description: "Trello configuration and monitoring" },
-  { id: "security", label: "Security", description: "Lockdown, access safeguards, and identity detection" },
-  { id: "logs", label: "Logs & Server", description: "Audit destinations and Discord policy" },
-  { id: "uniforms", label: "Uniforms", description: "Uniform upload destinations and submitter access" },
-  { id: "system", label: "System", description: "Status, maintenance, bot state, and configuration" },
+  { id: "uploading", label: "Uploading", description: "Uniform destinations, spreadsheets, and submitter access" },
+  { id: "blacklisting", label: "Blacklisting", description: "Blacklist rules, records, Trello, and identity lookup" },
+  { id: "global", label: "Global", description: "Payout owner, security, audit, and essential bot controls" },
 ];
 
 type SettingsOption = {
@@ -981,8 +978,7 @@ function settingsRootCategories(configured: boolean, maintenance: boolean): type
   // setup the same small emergency surface remains available so a broken or
   // partially configured guild can still recover.
   if (maintenance || !configured) {
-    return settingsCategories.filter((category) =>
-      category.id === "system" || category.id === "security");
+    return settingsCategories.filter((category) => category.id === "global");
   }
   return settingsCategories;
 }
@@ -993,70 +989,53 @@ function settingsCategoryOptions(
   maintenance: boolean,
 ): SettingsOption[] {
   if (maintenance) {
-    if (category === "system") {
+    if (category === "global") {
       return [
         { label: "System Status", value: "settings-action:status", description: "View current emergency and command status" },
-        { label: "Disable Maintenance", value: "settings-action:maintenance-disable", description: "Restore normal administration" },
-      ];
-    }
-    if (category === "security") {
-      return [
         { label: "Security Lockdown", value: "settings-action:lockdown", description: "Immediately stop destructive actions" },
         { label: "Security Unlock", value: "settings-action:unlock", description: "Unlock after confirmation" },
+        { label: "Disable Maintenance", value: "settings-action:maintenance-disable", description: "Restore normal administration" },
       ];
     }
     return [];
   }
 
   if (!configured) {
-    if (category === "system") {
+    if (category === "global") {
       return [
         { label: "Complete First-time Setup", value: "settings-action:initial-audit", description: "Select required audit and Quartermaster roles" },
         { label: "System Status", value: "settings-action:status", description: "View setup and command registration status" },
-        { label: "Enable Maintenance", value: "settings-action:maintenance-enable", description: "Temporarily lock normal administration" },
-        { label: "Disable Maintenance", value: "settings-action:maintenance-disable", description: "Restore normal administration" },
-      ];
-    }
-    if (category === "security") {
-      return [
         { label: "Security Lockdown", value: "settings-action:lockdown", description: "Immediately stop destructive actions" },
         { label: "Security Unlock", value: "settings-action:unlock", description: "Unlock after confirmation" },
+        { label: "Enable Maintenance", value: "settings-action:maintenance-enable", description: "Temporarily lock normal administration" },
+        { label: "Disable Maintenance", value: "settings-action:maintenance-disable", description: "Restore normal administration" },
       ];
     }
     return [];
   }
 
   switch (category) {
-    case "moderation":
+    case "uploading":
+      return [
+        { label: "Uniform Uploading", value: "setup:uniforms", description: "Channels, spreadsheet, recovery, and submitter access" },
+      ];
+    case "blacklisting":
       return [
         { label: "Blacklist Rules", value: "setup:blacklist", description: "Discord role and Trello list mappings" },
+        { label: "Trello Configuration", value: "setup:trello", description: "Blacklist monitoring and polling configuration" },
+        { label: "Sync Monitoring Report", value: "settings-action:sync", description: "Run a monitoring-only Trello report" },
         { label: "Blacklist a Group", value: "settings-action:group", description: "Create a group blacklist record" },
         { label: "Add Blacklist Note", value: "settings-action:note", description: "Record a durable moderation note" },
         { label: "Identity Lookup", value: "settings-action:identity-lookup", description: "Search recorded associations" },
       ];
-    case "integrations":
+    case "global":
       return [
-        { label: "Trello Configuration", value: "setup:trello", description: "Monitoring and polling configuration" },
-        { label: "Sync Monitoring Report", value: "settings-action:sync", description: "Run a monitoring-only Trello report" },
-      ];
-    case "security":
-      return [
+        { label: "Payout Owner & Discord Roles", value: "setup:discord", description: "Set the payout owner and named Quartermaster roles" },
         { label: "Security Configuration", value: "setup:security", description: "Limits, protections, and confirmations" },
         { label: "Security Lockdown", value: "settings-action:lockdown", description: "Immediately stop destructive actions" },
         { label: "Security Unlock", value: "settings-action:unlock", description: "Unlock after confirmation" },
         { label: "Identity Detection", value: "setup:identity", description: "Warning-only association controls" },
-      ];
-    case "logs":
-      return [
         { label: "Audit Configuration", value: "setup:audit", description: "Destinations and retained log categories" },
-        { label: "Discord Roles & Policy", value: "setup:discord", description: "Edit moderator, Senior QM, and QM roles" },
-      ];
-    case "uniforms":
-      return [
-        { label: "Uniform Uploading", value: "setup:uniforms", description: "Separate /log and /moderated channels and access" },
-      ];
-    case "system":
-      return [
         { label: "System Status", value: "settings-action:status", description: "View command, Trello, and security status" },
         { label: "Enable Maintenance", value: "settings-action:maintenance-enable", description: "Temporarily lock normal administration" },
         { label: "Disable Maintenance", value: "settings-action:maintenance-disable", description: "Restore normal administration" },
@@ -1082,10 +1061,10 @@ function settingsMenu(
       maintenance
         ? "Maintenance is active. Choose an emergency category. Normal configuration and moderation controls are hidden and remain unavailable."
         : configured
-          ? `**Core setup: ${setup?.auditChannelId && setup?.seniorQuartermasterRoleId && setup?.quartermasterRoleId ? "complete" : "legacy configuration—review Discord Identity & Uniform Roles"}**\n` +
+          ? `**Core setup: ${setup?.auditChannelId && setup?.seniorQuartermasterRoleId && setup?.quartermasterRoleId && setup?.securityOwnerId ? "complete" : "incomplete—review Payout Owner & Discord Roles"}**\n` +
             `**Optional locations: ${setup?.uniforms?.spreadsheet ? "spreadsheet configured" : "spreadsheet not configured"}; ${setup?.uniforms?.logChannelId || setup?.uniforms?.moderatedChannelId ? "uniform channel configured" : "uniform channels not configured"}**\n\n` +
-            "Choose a category to manage Quartermaster. Controls are private, expire after 10 minutes, and re-check your current Administrator permission. **Moderation** covers blacklist rules and records. **Integrations** covers Trello. **Security** covers safeguards and identity detection. **Logs & Server** covers audit and Discord policy. **Uniforms** covers upload logging destinations and access. **System** covers the full configuration overview and maintenance."
-          : "Initial setup is required. Open System to select the required audit channel, Senior Quartermaster, and Quartermaster roles. Emergency status and security controls remain available.",
+            "Choose a category to manage Quartermaster. Controls are private, expire after 10 minutes, and re-check your current Administrator permission. **Uploading** contains uniform channels, spreadsheet, recovery, and access settings. **Blacklisting** contains blacklist rules, Trello monitoring, records, and identity lookup. **Global** contains the payout owner, security, audit, maintenance, and essential bot controls."
+          : "Initial setup is required. Open Global to select the audit channel, Senior Quartermaster, Quartermaster, and Security / Payout Owner. Emergency status and security controls remain available.",
     )],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
       new StringSelectMenuBuilder()
@@ -1201,8 +1180,9 @@ function discordRolePanel(setup: GuildSetup, nonce: string): {
   const member = (id: string | undefined) => id ? `<@${id}>` : "Not configured";
   return {
     embeds: [outcomeEmbed(
-      "Discord Identity & Uniform Roles",
-      "These named roles are persistent, narrowly scoped uniform submitter access. " +
+      "Payout Owner & Discord Roles",
+      "The Security / Payout Owner is the only configured member allowed to run payouts or change destructive-action security limits, and only the Discord server owner can replace that member. " +
+      "The named Quartermaster roles are persistent, narrowly scoped uniform submitter access. " +
       "They do not grant Discord Administrator access, settings access, payout access, or blacklist privileges. " +
       "The moderator-role record remains separate and also does not replace current Discord Administrator checks. " +
       "Choose a replacement role to save it immediately.",
@@ -1268,7 +1248,7 @@ function settingsCategoryMenu(
       definition.label,
       maintenance
         ? "Only emergency controls are available while maintenance is active. Choose an action or return to categories."
-        : `Choose a ${definition.label.toLowerCase()} setting or action. Related controls are grouped here; use Back to return to categories.`,
+        : `Choose an option. Related ${definition.label.toLowerCase()} controls are grouped here; use Back to return to categories.`,
     )],
     // Discord select menus and buttons cannot share a row. Keep Back in its
     // own row so every category page has an obvious, safe parent.
@@ -1602,16 +1582,16 @@ function settingsCategoryForAction(id: string): SettingsCategory | undefined {
     id === "settings-action:group" ||
     id === "settings-action:note" ||
     id === "settings-action:identity-lookup"
-  ) return "moderation";
-  if (id === "setup:trello" || id === "settings-action:sync") return "integrations";
+  ) return "blacklisting";
+  if (id === "setup:trello" || id === "settings-action:sync") return "blacklisting";
   if (
     id === "setup:security" ||
     id === "setup:lockdown" ||
     id === "setup:identity" ||
     id === "settings-action:lockdown" ||
     id === "settings-action:unlock"
-  ) return "security";
-  if (id === "setup:audit" || id === "setup:discord") return "logs";
+  ) return "global";
+  if (id === "setup:audit" || id === "setup:discord") return "global";
   if (
     id === "setup:uniforms" ||
     id === "setup:uniforms-config" ||
@@ -1619,7 +1599,7 @@ function settingsCategoryForAction(id: string): SettingsCategory | undefined {
     id === "setup:uniforms-spreadsheet-config" ||
     id === "setup:uniforms-spreadsheet-reset" ||
     id === "setup:uniforms-recover"
-  ) return "uniforms";
+  ) return "uploading";
   if (
     id === "setup:bot-state" ||
     id === "setup:view" ||
@@ -1627,7 +1607,7 @@ function settingsCategoryForAction(id: string): SettingsCategory | undefined {
     id === "settings-action:initial-audit" ||
     id === "settings-action:maintenance-enable" ||
     id === "settings-action:maintenance-disable"
-  ) return "system";
+  ) return "global";
   return undefined;
 }
 
@@ -1691,7 +1671,7 @@ async function renderSettingsBack(
     if (!setup) throw new Error("Complete first-time setup before changing these settings.");
     const state = await getSecurityState(guild.id);
     if (state.maintenance.active) throw new Error(maintenanceMessage);
-    const categoryLocation = settingsCategoryLocation("security");
+    const categoryLocation = settingsCategoryLocation("global");
     session.navigation = [
       settingsRootLocation(),
       categoryLocation,
@@ -2033,7 +2013,7 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
       if (current?.kind === "page" && current.id === id) {
         // The category select has already established this page.
       } else if (current?.kind === "page" && id === "setup:security") {
-        const categoryLocation = settingsCategoryLocation("security");
+        const categoryLocation = settingsCategoryLocation("global");
         activeSession.navigation = [
           settingsRootLocation(),
           categoryLocation,

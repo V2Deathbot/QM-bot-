@@ -692,7 +692,7 @@ function assertDiscordComponentLimits(payload: ComponentPayload): void {
 
 async function setMaintenance(active: boolean, actor = "admin-a", reason = "maintenance test"): Promise<void> {
   const { root } = await openSettings(actor);
-  const system = await chooseSettingsCategory(actor, root, "system");
+  const system = await chooseSettingsCategory(actor, root, "global");
   const action = active ? "settings-action:maintenance-enable" : "settings-action:maintenance-disable";
   const menu = await chooseSettingsAction(actor, system, action);
   if (active) {
@@ -994,7 +994,7 @@ test("audits an Administrator security-setting change through the setup interact
   await setSecurity({ confirmationsRequired: true });
   const beforeAudits = auditEvents.length;
   const { root } = await openSettings("owner");
-  const security = await chooseSettingsCategory("owner", root, "security");
+  const security = await chooseSettingsCategory("owner", root, "global");
   const securityPage = await chooseSettingsAction("owner", security, "setup:security");
   const securityPayload = latestComponentPayload(securityPage);
   const confirmationButton = renderedButton(securityPayload, "Toggle Confirmation");
@@ -1004,7 +1004,7 @@ test("audits an Administrator security-setting change through the setup interact
   assert.ok(auditEvents.length > beforeAudits, "configuration change must emit an audit event");
 });
 
-test("navigates to Uniforms uploading configuration, seals modal fields, saves, resets, and rechecks admin permission", async () => {
+test("navigates to Uploading configuration, seals modal fields, saves, resets, and rechecks admin permission", async () => {
   await setSecurity({});
   const store = await import("../src/bot/setup-store.ts");
   const current = await store.getGuildSetup(guild.id);
@@ -1020,7 +1020,7 @@ test("navigates to Uniforms uploading configuration, seals modal fields, saves, 
   });
 
   const { root } = await openSettings("setup-owner");
-  const uniforms = await chooseSettingsCategory("setup-owner", root, "uniforms");
+  const uniforms = await chooseSettingsCategory("setup-owner", root, "uploading");
   const uniformPageInteraction = await chooseSettingsAction("setup-owner", uniforms, "setup:uniforms");
   const uniformPage = latestComponentPayload(uniformPageInteraction);
   const configure = renderedButton(uniformPage, "Uploading Configuration", "setup:");
@@ -1085,7 +1085,7 @@ test("navigates to Uniforms uploading configuration, seals modal fields, saves, 
   const backToCategory = renderedButton(resetPayload, "Back to Category", "settings:back:");
   const backInteraction = button("setup-owner", backToCategory);
   await dispatchRaw(backInteraction);
-  assert.match(presentationReplyText(backInteraction.localReplies.at(-1)), /Uniforms/);
+  assert.match(presentationReplyText(backInteraction.localReplies.at(-1)), /Uploading/);
 });
 
 test("limits legacy uniform delivery recovery to its scoped Administrator settings modal", async () => {
@@ -1107,7 +1107,7 @@ test("limits legacy uniform delivery recovery to its scoped Administrator settin
   });
   const rowCount = spreadsheetRows.get("Uniform Logs")?.length;
   const { root } = await openSettings("setup-owner");
-  const uniforms = await chooseSettingsCategory("setup-owner", root, "uniforms");
+  const uniforms = await chooseSettingsCategory("setup-owner", root, "uploading");
   const pageInteraction = await chooseSettingsAction("setup-owner", uniforms, "setup:uniforms");
   const page = latestComponentPayload(pageInteraction);
   assert.match(presentationReplyText(page), new RegExp(submissionId));
@@ -1155,7 +1155,7 @@ test("configures Spreadsheet Configuration with stable nonce-bound fields and pr
   });
 
   const { root } = await openSettings("setup-owner");
-  const uniforms = await chooseSettingsCategory("setup-owner", root, "uniforms");
+  const uniforms = await chooseSettingsCategory("setup-owner", root, "uploading");
   const uniformPageInteraction = await chooseSettingsAction("setup-owner", uniforms, "setup:uniforms");
   let uniformPage = latestComponentPayload(uniformPageInteraction);
   const configure = renderedButton(uniformPage, "Spreadsheet Configuration", "setup:");
@@ -1259,7 +1259,7 @@ test("setup unlock always presents and requires a confirmation, even if normal c
     };
   });
   const { root } = await openSettings("setup-owner");
-  const security = await chooseSettingsCategory("setup-owner", root, "security");
+  const security = await chooseSettingsCategory("setup-owner", root, "global");
   const securityPage = await chooseSettingsAction("setup-owner", security, "setup:security");
   const lockdown = button("setup-owner", renderedButton(latestComponentPayload(securityPage), "Lockdown Settings"));
   await dispatchRaw(lockdown);
@@ -1812,7 +1812,7 @@ test("rejects setup controls clicked by another administrator and expired setup 
   const { root } = await openSettings("setup-owner");
   const rootPayload = latestComponentPayload(root);
   const rootSelect = renderedSelect(rootPayload);
-  const securityCategory = renderedOption(rootPayload, "settings-category:security");
+  const securityCategory = renderedOption(rootPayload, "settings-category:global");
   const category = select("setup-owner", rootSelect.customId, [securityCategory]);
   await dispatchRaw(category);
   const categoryPayload = latestComponentPayload(category);
@@ -1837,31 +1837,27 @@ test("/settings traverses categories and opens nonce-bound parameter modals", as
   await setSecurity({ confirmationsRequired: true });
   shownModals.splice(0);
   const expectedCategories: Record<string, string[]> = {
-    moderation: [
-      "setup:blacklist", "settings-action:group", "settings-action:note",
-      "settings-action:identity-lookup",
+    uploading: ["setup:uniforms"],
+    blacklisting: [
+      "setup:blacklist", "setup:trello", "settings-action:sync",
+      "settings-action:group", "settings-action:note", "settings-action:identity-lookup",
     ],
-    integrations: ["setup:trello", "settings-action:sync"],
-    security: [
+    global: [
+      "setup:discord",
       "setup:security", "settings-action:lockdown", "settings-action:unlock",
-      "setup:identity",
-    ],
-    logs: ["setup:audit", "setup:discord"],
-    uniforms: ["setup:uniforms"],
-    system: [
+      "setup:identity", "setup:audit",
       "settings-action:status", "settings-action:maintenance-enable",
       "settings-action:maintenance-disable", "setup:bot-state", "setup:view",
     ],
   };
   const rootResult = await openSettings("admin-a");
   assert.deepEqual(renderedOptions(rootResult.payload), [
-    "settings-category:moderation",
-    "settings-category:integrations",
-    "settings-category:security",
-     "settings-category:logs",
-     "settings-category:uniforms",
-     "settings-category:system",
+    "settings-category:uploading",
+    "settings-category:blacklisting",
+    "settings-category:global",
   ]);
+  const globalCategory = await chooseSettingsCategory("admin-a", rootResult.root, "global");
+  assert.match(JSON.stringify(globalCategory.payload), /Payout Owner & Discord Roles/);
   for (const [categoryName, expectedOptions] of Object.entries(expectedCategories)) {
     const { payload } = await chooseSettingsCategory("admin-a", rootResult.root, categoryName);
     assert.deepEqual(
@@ -1872,12 +1868,12 @@ test("/settings traverses categories and opens nonce-bound parameter modals", as
   }
 
   for (const [categoryName, action, expectedModal] of [
-    ["moderation", "settings-action:group", "settings-modal:group:"],
-    ["moderation", "settings-action:note", "settings-modal:note:"],
-    ["moderation", "settings-action:identity-lookup", "settings-modal:identity-lookup:"],
-    ["system", "settings-action:maintenance-enable", "settings-modal:maintenance-enable:"],
-    ["security", "settings-action:lockdown", "settings-modal:lockdown:"],
-    ["security", "settings-action:unlock", "settings-modal:unlock:"],
+    ["blacklisting", "settings-action:group", "settings-modal:group:"],
+    ["blacklisting", "settings-action:note", "settings-modal:note:"],
+    ["blacklisting", "settings-action:identity-lookup", "settings-modal:identity-lookup:"],
+    ["global", "settings-action:maintenance-enable", "settings-modal:maintenance-enable:"],
+    ["global", "settings-action:lockdown", "settings-modal:lockdown:"],
+    ["global", "settings-action:unlock", "settings-modal:unlock:"],
   ] as const) {
     const { root } = await openSettings("admin-a");
     const category = await chooseSettingsCategory("admin-a", root, categoryName);
@@ -1897,7 +1893,7 @@ test("sealed settings modals keep field IDs stable while binding modal sessions"
   shownModals.splice(0);
 
   const ratesRoot = await openSettings("owner");
-  const ratesCategory = await chooseSettingsCategory("owner", ratesRoot.root, "security");
+  const ratesCategory = await chooseSettingsCategory("owner", ratesRoot.root, "global");
   const ratesPage = await chooseSettingsAction("owner", ratesCategory, "setup:security");
   await dispatchRaw(button(
     "owner",
@@ -1953,7 +1949,7 @@ test("sealed settings modals keep field IDs stable while binding modal sessions"
   // exercises the generic sealing path with a second parameter modal.
   shownModals.splice(0);
   const thresholdRoot = await openSettings("owner");
-  const thresholdCategory = await chooseSettingsCategory("owner", thresholdRoot.root, "security");
+  const thresholdCategory = await chooseSettingsCategory("owner", thresholdRoot.root, "global");
   const securityPage = await chooseSettingsAction("owner", thresholdCategory, "setup:security");
   const lockdown = button(
     "owner",
@@ -1979,7 +1975,7 @@ test("settings navigation returns through categories, nested pages, and saved re
 
   const first = await openSettings("admin-a");
   assertDiscordComponentLimits(first.payload);
-  const moderation = await chooseSettingsCategory("admin-a", first.root, "moderation");
+  const moderation = await chooseSettingsCategory("admin-a", first.root, "blacklisting");
   assert.equal(moderation.interaction.replied, true, "category selection must acknowledge with update");
   assertDiscordComponentLimits(moderation.payload);
   const categoryBack = renderedButton(moderation.payload, "Back to Categories", "settings:");
@@ -1987,7 +1983,7 @@ test("settings navigation returns through categories, nested pages, and saved re
   const rootAfterCategoryBack = latestComponentPayload(first.root);
   assert.ok(renderedSelect(rootAfterCategoryBack).customId.startsWith("settings:select:"));
 
-  const security = await chooseSettingsCategory("admin-a", first.root, "security");
+  const security = await chooseSettingsCategory("admin-a", first.root, "global");
   const securityPage = await chooseSettingsAction("admin-a", security, "setup:security");
   assert.equal(securityPage.replied, true, "deeper settings page must acknowledge with update");
   const securityPayload = latestComponentPayload(securityPage);
@@ -2007,19 +2003,19 @@ test("settings navigation returns through categories, nested pages, and saved re
   const securityBackInteraction = button("admin-a", securityBack);
   await dispatchRaw(securityBackInteraction);
   const securityCategoryAgain = latestComponentPayload(securityBackInteraction);
-  assert.ok(renderedSelect(securityCategoryAgain).customId.startsWith("settings:option:security:"));
+  assert.ok(renderedSelect(securityCategoryAgain).customId.startsWith("settings:option:global:"));
   const rootBack = renderedButton(securityCategoryAgain, "Back to Categories", "settings:");
   const rootBackInteraction = button("admin-a", rootBack);
   await dispatchRaw(rootBackInteraction);
   assert.ok(renderedSelect(latestComponentPayload(rootBackInteraction)).customId.startsWith("settings:select:"));
 
   const integrationRoot = await openSettings("admin-a");
-  const integrations = await chooseSettingsCategory("admin-a", integrationRoot.root, "integrations");
+  const integrations = await chooseSettingsCategory("admin-a", integrationRoot.root, "blacklisting");
   const sync = await chooseSettingsAction("admin-a", integrations, "settings-action:sync");
   assert.equal(sync.deferred, true, "report-only sync must acknowledge with deferUpdate");
 
   const saveRoot = await openSettings("admin-a");
-  const saveIntegrations = await chooseSettingsCategory("admin-a", saveRoot.root, "integrations");
+  const saveIntegrations = await chooseSettingsCategory("admin-a", saveRoot.root, "blacklisting");
   const trelloPage = await chooseSettingsAction("admin-a", saveIntegrations, "setup:trello");
   const trelloPayload = latestComponentPayload(trelloPage);
   const toggle = renderedButton(trelloPayload, "Toggle manual alerts");
@@ -2035,7 +2031,7 @@ test("a /settings group-blacklist modal preserves confirmation binding and execu
   await setSecurity({ confirmationsRequired: true, perAdminLimit: 20, globalLimit: 20 });
   const before = trelloCardCreations.length;
   const { root } = await openSettings("admin-a");
-  const category = await chooseSettingsCategory("admin-a", root, "moderation");
+  const category = await chooseSettingsCategory("admin-a", root, "blacklisting");
   await chooseSettingsAction("admin-a", category, "settings-action:group");
   const groupModal = shownModals.at(-1);
   assert.ok(groupModal?.customId.startsWith("settings-modal:group:"));
@@ -2051,7 +2047,7 @@ test("a /settings group-blacklist modal preserves confirmation binding and execu
 test("/settings restricts the maintenance menu while allowing emergency status", async () => {
   await setSecurity({});
   const preMaintenance = await openSettings("admin-a");
-  const moderation = await chooseSettingsCategory("admin-a", preMaintenance.root, "moderation");
+  const moderation = await chooseSettingsCategory("admin-a", preMaintenance.root, "blacklisting");
   const staleNormalControl = {
     customId: renderedSelect(moderation.payload).customId,
     value: renderedOption(moderation.payload, "settings-action:group"),
@@ -2059,12 +2055,11 @@ test("/settings restricts the maintenance menu while allowing emergency status",
   };
   await setMaintenance(true, "admin-a", "settings emergency restriction");
   const { root } = await openSettings("admin-a");
-  assert.deepEqual(renderedOptions(latestComponentPayload(root)).sort(), [
-    "settings-category:security", "settings-category:system",
-  ]);
-  const system = await chooseSettingsCategory("admin-a", root, "system");
+  assert.deepEqual(renderedOptions(latestComponentPayload(root)), ["settings-category:global"]);
+  const system = await chooseSettingsCategory("admin-a", root, "global");
   assert.deepEqual(renderedOptions(system.payload), [
-    "settings-action:status", "settings-action:maintenance-disable",
+    "settings-action:status", "settings-action:lockdown", "settings-action:unlock",
+    "settings-action:maintenance-disable",
   ]);
   const status = await chooseSettingsAction("admin-a", system, "settings-action:status");
   assert.ok(status.replied, "status selection must acknowledge with update");
@@ -2093,7 +2088,7 @@ test("/settings performs first-time setup with native audit and Quartermaster se
     };
   });
   const { root } = await openSettings("owner");
-  const system = await chooseSettingsCategory("owner", root, "system");
+  const system = await chooseSettingsCategory("owner", root, "global");
   const launch = await chooseSettingsAction("owner", system, "settings-action:initial-audit");
   const customId = (payload: ComponentPayload, prefix: string) => {
     const component = componentRows(payload).find((item) =>
@@ -2135,7 +2130,7 @@ test("Discord role policy edits remain administrator-only and preserve named rol
     };
   });
   const { root } = await openSettings("admin-a");
-  const logs = await chooseSettingsCategory("admin-a", root, "logs");
+  const logs = await chooseSettingsCategory("admin-a", root, "global");
   const policy = await chooseSettingsAction("admin-a", logs, "setup:discord");
   const policyPayload = latestComponentPayload(policy);
   const selectorId = (prefix: string) => {
@@ -2181,7 +2176,7 @@ test("Trello mapping edits and resets retain the independently selected board", 
     },
   });
   const { root } = await openSettings("admin-a");
-  const moderation = await chooseSettingsCategory("admin-a", root, "moderation");
+  const moderation = await chooseSettingsCategory("admin-a", root, "blacklisting");
   const blacklist = await chooseSettingsAction("admin-a", moderation, "setup:blacklist");
   await dispatchRaw(button("admin-a", renderedButton(
     latestComponentPayload(blacklist), "Trello Lists", "setup:",
@@ -2381,7 +2376,7 @@ test("maintenance blocks every normal command and old interactive work before pr
   const oldBlacklistConfirmation = lastConfirmationId(oldBlacklist);
 
   const setupRoot = await openSettings("admin-a");
-  const setupSystem = await chooseSettingsCategory("admin-a", setupRoot.root, "system");
+  const setupSystem = await chooseSettingsCategory("admin-a", setupRoot.root, "global");
   const setupState = await chooseSettingsAction("admin-a", setupSystem, "setup:bot-state");
   await dispatchRaw(button("admin-a", renderedButton(
     latestComponentPayload(setupState), "Enable Maintenance", "setup:",
@@ -2477,7 +2472,7 @@ test("security status reports setup-required before setup and persisted maintena
 test("setup BOT STATE opens a reason modal and background join/recovery work continues in maintenance", async () => {
   await setSecurity({});
   const setupRoot = await openSettings("admin-a");
-  const setupSystem = await chooseSettingsCategory("admin-a", setupRoot.root, "system");
+  const setupSystem = await chooseSettingsCategory("admin-a", setupRoot.root, "global");
   const setupState = await chooseSettingsAction("admin-a", setupSystem, "setup:bot-state");
   await dispatchRaw(button("admin-a", renderedButton(
     latestComponentPayload(setupState), "Enable Maintenance", "setup:",
