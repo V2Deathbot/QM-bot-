@@ -6,6 +6,13 @@ export interface BotRuntimeLease {
   release(): Promise<void>;
 }
 
+export class BotRuntimeLeaseUnavailableError extends Error {
+  constructor() {
+    super("Another bot runtime already holds the PostgreSQL leadership lock.");
+    this.name = "BotRuntimeLeaseUnavailableError";
+  }
+}
+
 /**
  * Keep this exact PostgreSQL session open while Discord is connected. Advisory
  * locks are released automatically if its database connection dies, at which
@@ -28,7 +35,7 @@ export async function acquireBotRuntimeLease(
       [runtimeLockName],
     );
     if (result.rows[0]?.acquired !== true) {
-      throw new Error("Another bot runtime already holds the PostgreSQL leadership lock.");
+      throw new BotRuntimeLeaseUnavailableError();
     }
     backendPid = result.rows[0].backend_pid;
   } catch (error) {

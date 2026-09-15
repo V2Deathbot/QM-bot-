@@ -34,7 +34,11 @@ import {
   mapDiscordPresenceToPublicStatus,
   type PublicBotStatus,
 } from "./public-status";
-import { acquireBotRuntimeLease, type BotRuntimeLease } from "./runtime-lease";
+import {
+  acquireBotRuntimeLease,
+  BotRuntimeLeaseUnavailableError,
+  type BotRuntimeLease,
+} from "./runtime-lease";
 import { isFileBotStorage } from "./persistent-store";
 import {
   readPersistedRecoveryState,
@@ -252,6 +256,7 @@ let runtimeLease: BotRuntimeLease | null = null;
 let recoveryPersistence: Promise<void> = Promise.resolve();
 let leadershipLost = false;
 let leadershipGeneration = 0;
+let botShutdownRequested = false;
 type BotExitHandler = (code: number) => never | void;
 let botExit: BotExitHandler = (code) => process.exit(code);
 
@@ -5520,6 +5525,7 @@ export async function startBot(): Promise<void> {
   if (!shutdownHooksInstalled) {
     shutdownHooksInstalled = true;
     const shutdown = () => {
+      botShutdownRequested = true;
       clearTrelloRetry();
       clearBlacklistSyncTimer();
       discordClient?.destroy();
@@ -5536,22 +5542,43 @@ export async function startBot(): Promise<void> {
   if (!runtimeLease) {
     leadershipLost = false;
     leadershipGeneration += 1;
-    runtimeLease = await acquireBotRuntimeLease((error) => {
-      leadershipLost = true;
-      leadershipGeneration += 1;
-      runtimeLease = null;
-      clearTrelloRetry();
-      clearBlacklistSyncTimer();
-      commandsRegistered = false;
-      setupCommandRegistered = false;
-      guildSetupComplete = false;
-      discordClient?.destroy();
-      discordClient = null;
-      logger.error({ err: error }, "Lost PostgreSQL bot leadership lock; Discord client stopped fail-closed");
-      // Do not await cleanup or persistence: a process that lost its DB
-      // session must not reconnect while a replacement leader may be active.
-      botExit(1);
-    });
+    let attempts = 0;
+    while (!runtimeLease && !botShutdownRequested) {
+      try {
+        runtimeLease = await acquireBotRuntimeLease((error) => {
+          leadershipLost = true;
+          leadershipGeneration += 1;
+          runtimeLease = null;
+          clearTrelloRetry();
+          clearBlacklistSyncTimer();
+          commandsRegistered = false;
+          setupCommandRegistered = false;
+          guildSetupComplete = false;
+          discordClient?.destroy();
+          discordClient = null;
+          logger.error({ err: error }, "Lost PostgreSQL bot leadership lock; Discord client stopped fail-closed");
+          // Do not reconnect after losing an established lease: another
+          // process may already be the active leader.
+          botExit(1);
+        });
+      } catch (error) {
+        if (!(error instanceof BotRuntimeLeaseUnavailableError)) throw error;
+        attempts += 1;
+        if (attempts === 1 || attempts % 15 === 0) {
+          logger.warn(
+            { attempts },
+            "Waiting for the previous bot runtime to release the PostgreSQL leadership lock",
+          );
+        }
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 2_000);
+          timer.unref?.();
+        });
+      }
+    }
+    if (!runtimeLease) {
+      throw new Error("Bot startup was cancelled while waiting for PostgreSQL leadership.");
+    }
   }
   let result: BotRefreshResult;
   try {
