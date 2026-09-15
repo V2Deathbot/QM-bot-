@@ -35,7 +35,7 @@ const {
   setGoogleSheetsProxyForTests,
   UNIFORM_SHEET_HEADERS,
 } = await import("../src/bot/google-sheets.ts");
-const { getSecurityState, mutateSecurityState } =
+const { administratorInEscalationWindow, getSecurityState, mutateSecurityState } =
   await import("../src/bot/security-store.ts");
 const { findActiveSnapshot, findRoleSnapshot, saveRoleSnapshot } = await import("../src/bot/role-store.ts");
 const { getRegisteredCommandDefinitions, refreshBot } = await import("../src/bot/index.ts");
@@ -385,7 +385,7 @@ function select(userId: string, customId: string, values: string[], messageId = 
 }
 
 function nativeSelect(
-  kind: "role" | "channel",
+  kind: "role" | "channel" | "user",
   userId: string,
   customId: string,
   values: string[],
@@ -398,6 +398,7 @@ function nativeSelect(
     isStringSelectMenu: () => false,
     isRoleSelectMenu: () => kind === "role",
     isChannelSelectMenu: () => kind === "channel",
+    isUserSelectMenu: () => kind === "user",
     isModalSubmit: () => false,
     customId,
     message: { id: messageId },
@@ -565,7 +566,7 @@ function latestComponentPayload(interaction: { localReplies: unknown[] }): Compo
       "components" in reply &&
       Array.isArray((reply as { components?: unknown }).components),
   );
-  assert.ok(payload, "interaction should render Discord components");
+  assert.ok(payload, `interaction should render Discord components: ${JSON.stringify(interaction.localReplies)}`);
   return payload;
 }
 
@@ -877,6 +878,77 @@ test("enforces the per-Administrator destructive-action limit", async () => {
   assert.match(replies.at(-1) ?? "", /Blacklist rate limit reached/i);
 });
 
+test("unobserved administrators cannot race destructive commands or payout ahead of gateway events", async () => {
+  await setSecurity({ recentPermissionEscalationProtection: true });
+  const writes = trelloWrites.length;
+  const roleCalls = roleMutationCalls;
+  const first = command("admin-a", "group_blacklist", { id: "123", reason: "race" });
+  const second = command("admin-a", "group_blacklist", { id: "124", reason: "race" });
+  client!.emit(Events.InteractionCreate, first);
+  client!.emit(Events.InteractionCreate, second);
+  await settle();
+  await settle();
+  assert.match(JSON.stringify(first.localReplies), /delayed for 10 minutes/);
+  assert.match(JSON.stringify(second.localReplies), /delayed for 10 minutes/);
+  const observed = (await getSecurityState(guild.id)).observedAdministrators["admin-a"];
+  assert.ok(Number.isFinite(Date.parse(observed!)));
+  await dispatch(command("admin-a", "payout"));
+  assert.match(replies.at(-1) ?? "", /Select a Security \/ Payout Owner in setup/);
+  await dispatch(command("owner", "payout"));
+  assert.match(replies.at(-1) ?? "", /Select a Security \/ Payout Owner in setup/);
+  assert.equal((await getSecurityState(guild.id)).observedAdministrators["admin-a"], observed);
+  assert.equal((await getSecurityState(guild.id)).destructiveActions.length, 0);
+  assert.equal(trelloWrites.length, writes);
+  assert.equal(roleMutationCalls, roleCalls);
+
+  await dispatch(command("admin-b", "payout"));
+  assert.match(replies.at(-1) ?? "", /Select a Security \/ Payout Owner in setup/);
+  await dispatch(command("owner", "payout"));
+  assert.match(replies.at(-1) ?? "", /Select a Security \/ Payout Owner in setup/);
+  const restarted = await import(`../src/bot/security-store.ts?escalation=${Date.now()}`);
+  assert.equal((await restarted.getSecurityState(guild.id)).observedAdministrators["admin-a"], observed);
+});
+
+test("an administrator grant queued behind persistence cannot race command admission", async () => {
+  await setSecurity({ recentPermissionEscalationProtection: true });
+  await mutateSecurityState(guild.id, (state) => {
+    state.observedAdministrators["admin-a"] = "1970-01-01T00:00:00.000Z";
+  });
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const blocked = mutateSecurityState(guild.id, async () => { await barrier; });
+  const before = memberFor("admin-a");
+  before.permissions = { has: () => false };
+  client!.emit(Events.GuildMemberUpdate, before, memberFor("admin-a"));
+  const interaction = command("admin-a", "group_blacklist", { id: "125", reason: "queued grant" });
+  client!.emit(Events.InteractionCreate, interaction);
+  release();
+  await blocked;
+  await settle();
+  assert.match(JSON.stringify(interaction.localReplies), /delayed for 10 minutes/);
+  assert.equal((await getSecurityState(guild.id)).destructiveActions.length, 0);
+});
+
+test("escalation observations fail closed on malformed time and expire only after ten minutes", async () => {
+  await setSecurity({ recentPermissionEscalationProtection: true });
+  const now = Date.now();
+  for (const timestamp of [undefined, "invalid", new Date(now + 60_000).toISOString()]) {
+    await mutateSecurityState(guild.id, (state) => {
+      if (timestamp === undefined) delete state.observedAdministrators["admin-a"];
+      else state.observedAdministrators["admin-a"] = timestamp;
+      assert.equal(administratorInEscalationWindow(state, "admin-a", now), true);
+      assert.equal(administratorInEscalationWindow(state, "admin-a", now + 599_999), true);
+      assert.equal(administratorInEscalationWindow(state, "admin-a", now + 600_000), false);
+    });
+  }
+  await mutateSecurityState(guild.id, (state) => {
+    state.observedAdministrators["admin-a"] = new Date(now - 600_001).toISOString();
+  });
+  const before = trelloCardCreations.length;
+  await dispatch(command("admin-a", "group_blacklist", { id: "126", reason: "established" }));
+  assert.equal(trelloCardCreations.length, before + 1);
+});
+
 test("counts multiple administrators globally, activates lockdown, and blocks later destructive commands", async () => {
   await setSecurity({
     perAdminLimit: 5, globalLimit: 2, automaticLockdownThreshold: 2,
@@ -921,12 +993,12 @@ test("server owner is authorized but remains subject to the same limit", async (
 test("audits an Administrator security-setting change through the setup interaction handler", async () => {
   await setSecurity({ confirmationsRequired: true });
   const beforeAudits = auditEvents.length;
-  const { root } = await openSettings("setup-owner");
-  const security = await chooseSettingsCategory("setup-owner", root, "security");
-  const securityPage = await chooseSettingsAction("setup-owner", security, "setup:security");
+  const { root } = await openSettings("owner");
+  const security = await chooseSettingsCategory("owner", root, "security");
+  const securityPage = await chooseSettingsAction("owner", security, "setup:security");
   const securityPayload = latestComponentPayload(securityPage);
   const confirmationButton = renderedButton(securityPayload, "Toggle Confirmation");
-  await dispatchRaw(button("setup-owner", confirmationButton));
+  await dispatchRaw(button("owner", confirmationButton));
   const saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
   assert.equal(saved?.security?.confirmationsRequired, false);
   assert.ok(auditEvents.length > beforeAudits, "configuration change must emit an audit event");
@@ -1824,16 +1896,16 @@ test("sealed settings modals keep field IDs stable while binding modal sessions"
   });
   shownModals.splice(0);
 
-  const ratesRoot = await openSettings("admin-a");
-  const ratesCategory = await chooseSettingsCategory("admin-a", ratesRoot.root, "security");
-  const ratesPage = await chooseSettingsAction("admin-a", ratesCategory, "setup:security");
+  const ratesRoot = await openSettings("owner");
+  const ratesCategory = await chooseSettingsCategory("owner", ratesRoot.root, "security");
+  const ratesPage = await chooseSettingsAction("owner", ratesCategory, "setup:security");
   await dispatchRaw(button(
-    "admin-a",
+    "owner",
     renderedButton(latestComponentPayload(ratesPage), "Edit Rate Limits"),
   ));
   const ratesModal = shownModals.at(-1);
   assert.ok(ratesModal);
-  assert.equal(ratesModal.userId, "admin-a");
+  assert.equal(ratesModal.userId, "owner");
   assert.match(ratesModal.customId, /^setup-modal:rates:[a-f0-9]{32}$/);
   const rateInputIds = modalTextInputIds(ratesModal);
   assert.deepEqual(rateInputIds, ["per_admin", "global", "window"]);
@@ -1846,7 +1918,7 @@ test("sealed settings modals keep field IDs stable while binding modal sessions"
     id,
     ({ per_admin: "7", global: "19", window: "23" } as Record<string, string>)[id]!,
   ]));
-  await dispatchRaw(modal("admin-a", ratesModal.customId, rateValues));
+  await dispatchRaw(modal("owner", ratesModal.customId, rateValues));
   const savedRates = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
   assert.deepEqual(
     {
@@ -1869,7 +1941,7 @@ test("sealed settings modals keep field IDs stable while binding modal sessions"
   const realNow = Date.now;
   Date.now = () => realNow() + 11 * 60_000;
   try {
-    await dispatchRaw(modal("admin-a", ratesModal.customId, rateValues));
+    await dispatchRaw(modal("owner", ratesModal.customId, rateValues));
     assert.match(replies.at(-1) ?? "", /settings session has expired/i);
   } finally {
     Date.now = realNow;
@@ -1880,22 +1952,22 @@ test("sealed settings modals keep field IDs stable while binding modal sessions"
   // Threshold uses the same legacy setup-component renderer and therefore
   // exercises the generic sealing path with a second parameter modal.
   shownModals.splice(0);
-  const thresholdRoot = await openSettings("admin-a");
-  const thresholdCategory = await chooseSettingsCategory("admin-a", thresholdRoot.root, "security");
-  const securityPage = await chooseSettingsAction("admin-a", thresholdCategory, "setup:security");
+  const thresholdRoot = await openSettings("owner");
+  const thresholdCategory = await chooseSettingsCategory("owner", thresholdRoot.root, "security");
+  const securityPage = await chooseSettingsAction("owner", thresholdCategory, "setup:security");
   const lockdown = button(
-    "admin-a",
+    "owner",
     renderedButton(latestComponentPayload(securityPage), "Lockdown Settings"),
   );
   await dispatchRaw(lockdown);
   const thresholdButton = renderedButton(latestComponentPayload(lockdown), "Change Threshold");
-  await dispatchRaw(button("admin-a", thresholdButton));
+  await dispatchRaw(button("owner", thresholdButton));
   const thresholdModal = shownModals.at(-1);
   assert.ok(thresholdModal);
   assert.match(thresholdModal.customId, /^setup-modal:threshold:[a-f0-9]{32}$/);
   const thresholdInputIds = modalTextInputIds(thresholdModal);
   assert.deepEqual(thresholdInputIds, ["threshold"]);
-  await dispatchRaw(modal("admin-a", thresholdModal.customId, {
+  await dispatchRaw(modal("owner", thresholdModal.customId, {
     [thresholdInputIds[0]!]: "37",
   }));
   const savedThreshold = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
@@ -2020,9 +2092,9 @@ test("/settings performs first-time setup with native audit and Quartermaster se
       revision: state.maintenance.revision + 1,
     };
   });
-  const { root } = await openSettings("admin-a");
-  const system = await chooseSettingsCategory("admin-a", root, "system");
-  const launch = await chooseSettingsAction("admin-a", system, "settings-action:initial-audit");
+  const { root } = await openSettings("owner");
+  const system = await chooseSettingsCategory("owner", root, "system");
+  const launch = await chooseSettingsAction("owner", system, "settings-action:initial-audit");
   const customId = (payload: ComponentPayload, prefix: string) => {
     const component = componentRows(payload).find((item) =>
       (item.data?.custom_id ?? item.custom_id)?.startsWith(prefix),
@@ -2033,18 +2105,24 @@ test("/settings performs first-time setup with native audit and Quartermaster se
   };
   const initial = latestComponentPayload(launch);
   assertDiscordComponentLimits(initial);
-  const audit = nativeSelect("channel", "admin-a", customId(initial, "settings:initial-audit:"), ["12345678901234567"]);
+  const audit = nativeSelect("channel", "owner", customId(initial, "settings:initial-audit:"), ["12345678901234567"]);
   await dispatchRaw(audit);
-  const senior = nativeSelect("role", "admin-a", customId(latestComponentPayload(audit), "settings:initial-senior-quartermaster:"), ["senior-quartermaster-role"]);
+  const senior = nativeSelect("role", "owner", customId(latestComponentPayload(audit), "settings:initial-senior-quartermaster:"), ["senior-quartermaster-role"]);
   await dispatchRaw(senior);
-  const quartermaster = nativeSelect("role", "admin-a", customId(latestComponentPayload(senior), "settings:initial-quartermaster:"), ["quartermaster-role"]);
+  const quartermaster = nativeSelect("role", "owner", customId(latestComponentPayload(senior), "settings:initial-quartermaster:"), ["quartermaster-role"]);
   await dispatchRaw(quartermaster);
-  const save = button("admin-a", renderedButton(latestComponentPayload(quartermaster), "Save Core Setup"));
+  const securityOwner = nativeSelect("user", "owner", customId(latestComponentPayload(quartermaster), "settings:initial-security-owner:"), ["admin-a"]);
+  await dispatchRaw(securityOwner);
+  const save = button("owner", renderedButton(
+    latestComponentPayload(securityOwner),
+    "Save Core Setup",
+  ));
   await dispatchRaw(save);
   const persisted = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
   assert.equal(persisted?.auditChannelId, "12345678901234567");
   assert.equal(persisted?.seniorQuartermasterRoleId, "senior-quartermaster-role");
   assert.equal(persisted?.quartermasterRoleId, "quartermaster-role");
+  assert.equal(persisted?.securityOwnerId, "admin-a");
   assert.equal("presence" in (persisted ?? {}), false);
 });
 

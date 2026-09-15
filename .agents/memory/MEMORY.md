@@ -7,3 +7,4 @@
 - [Uniform spreadsheet delivery](uniform-sheet-delivery.md) — Saved rows and Discord delivery are separate outcomes; formula-empty cells are not blank data.
 - [Payout reset safety](payout-reset-safety.md) — Calculated totals change after reset; verify recovery against target cells and require every report page before clearing.
 - [Bot persistence constraints](bot-persistence.md) — Legacy composite keys contain NUL; preserve JSON escapes in TEXT and keep only one environment connected to Discord.
+- [Configured payout authority](owner-only-security-authority.md) — The actual server owner selects the member who may run payouts and change security limits.

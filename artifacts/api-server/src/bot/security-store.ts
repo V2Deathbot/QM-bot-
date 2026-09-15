@@ -36,7 +36,7 @@ export interface SecurityState {
   /** Durable audit trail used even before an audit channel has been configured. */
   maintenanceAudit: MaintenanceAuditAction[];
   destructiveActions: RateLimitAction[];
-  /** Existing administrators observed at boot are trusted; only later grants are escalations. */
+  /** First confirmed observation; missing or invalid observations must never imply trust. */
   observedAdministrators: Record<string, string>;
   identityLedger: Array<{
     discordUserId: string;
@@ -73,6 +73,25 @@ const blank = (guildId: string): SecurityState => ({
 });
 let queue: Promise<void> = Promise.resolve();
 
+export const permissionEscalationWindowMs = 10 * 60_000;
+
+/**
+ * Call inside a committed security mutation after checking current permissions.
+ * Return a denial rather than throwing: the first observation must survive it.
+ */
+export function administratorInEscalationWindow(
+  state: SecurityState,
+  actorId: string,
+  now = Date.now(),
+): boolean {
+  const observedAt = Date.parse(state.observedAdministrators[actorId] ?? "");
+  if (!Number.isFinite(observedAt) || observedAt > now) {
+    state.observedAdministrators[actorId] = new Date(now).toISOString();
+    return true;
+  }
+  return now - observedAt < permissionEscalationWindowMs;
+}
+
 function valid(value: unknown): value is SecurityState {
   if (!value || typeof value !== "object") return false;
   const item = value as Record<string, unknown>;
@@ -100,6 +119,7 @@ function normalized(state: SecurityState): SecurityState {
     : 0;
   return {
     ...state,
+    observedAdministrators: state.observedAdministrators ?? {},
     maintenance: {
       active: maintenance?.active === true,
       reason: typeof maintenance?.reason === "string" ? maintenance.reason : "",

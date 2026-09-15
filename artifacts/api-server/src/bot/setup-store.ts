@@ -22,6 +22,8 @@ export interface GuildSetup {
   identity?: IdentitySettings;
   /** Optional uniform-log destinations and non-administrator submitter access. */
   uniforms?: UniformSettings;
+  /** Explicit member allowed to run payouts and change security limits. */
+  securityOwnerId?: string;
   updatedBy: string;
   updatedAt: string;
 }

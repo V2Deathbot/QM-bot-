@@ -17,6 +17,7 @@ import {
   StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
+  UserSelectMenuBuilder,
   type ButtonInteraction,
   type ChannelSelectMenuInteraction,
   type ChatInputCommandInteraction,
@@ -85,6 +86,7 @@ import {
   type GuildSetup,
 } from "./setup-store";
 import {
+  administratorInEscalationWindow,
   getSecurityState,
   mutateSecurityState,
   recordIdentityAssociation,
@@ -293,6 +295,7 @@ interface SetupSession {
     auditChannelId?: string;
     seniorQuartermasterRoleId?: string;
     quartermasterRoleId?: string;
+    securityOwnerId?: string;
   };
 }
 const setupSessions = new Map<string, SetupSession>();
@@ -351,8 +354,18 @@ interface PayoutConfirmation {
 const payoutConfirmations = new Map<string, PayoutConfirmation>();
 
 const destructiveCommands = new Set(["blacklist", "group_blacklist", "revoke_blacklist"]);
+const ownerOnlySecurityControls = new Set([
+  "setup:confirmation",
+  "setup:escalation-protection",
+  "setup:security-reset",
+  "setup:toggle-auto-lockdown",
+  "setup-modal:rates",
+  "setup-modal:threshold",
+  "setup-modal:protected-users",
+  "setup-modal:protected-roles",
+  "setup:security-owner",
+]);
 const setupSessionLifetimeMs = 10 * 60_000;
-const permissionEscalationWindowMs = 10 * 60_000;
 
 const maintenanceMessage =
   "Bot under maintenance. Normal commands are temporarily unavailable; background blacklist protection continues.";
@@ -508,6 +521,47 @@ async function currentAdministrator(guild: Guild, userId: string): Promise<boole
     member.permissions.has(PermissionFlagsBits.Administrator);
 }
 
+async function requireServerOwner(
+  guild: Guild,
+  userId: string,
+  setup?: GuildSetup,
+  command?: string,
+): Promise<void> {
+  if (guild.ownerId === userId) return;
+  if (setup) {
+    await auditBestEffort(guild, setup, {
+      action: "Server-owner-only command denied",
+      status: "failed",
+      actorId: userId,
+      fields: command ? [{ name: "Command", value: command }] : [],
+    });
+  }
+  throw new Error("Only the Discord server owner may use this command.");
+}
+
+async function requireConfiguredSecurityOwner(
+  guild: Guild,
+  userId: string,
+  setup: GuildSetup,
+  command?: string,
+): Promise<void> {
+  if (
+    (setup.securityOwnerId && setup.securityOwnerId === userId) ||
+    (!setup.securityOwnerId && guild.ownerId === userId)
+  ) return;
+  await auditBestEffort(guild, setup, {
+    action: "Configured security owner authorization denied",
+    status: "failed",
+    actorId: userId,
+    fields: command ? [{ name: "Command", value: command }] : [],
+  });
+  throw new Error(
+    setup.securityOwnerId
+      ? "Only the configured Security / Payout Owner may use this command."
+      : "Select a Security / Payout Owner in setup before using this command.",
+  );
+}
+
 async function requireCurrentAdministrator(
   guild: Guild,
   userId: string,
@@ -577,13 +631,14 @@ async function reserveDestructiveAction(
     if (state.lockdown.active) {
       throw new Error(`Security lockdown is active: ${state.lockdown.reason || "no reason provided"}.`);
     }
-    const escalationAt = state.observedAdministrators[actorId];
     if (
       settings.recentPermissionEscalationProtection &&
-      escalationAt &&
-      now - Date.parse(escalationAt) < permissionEscalationWindowMs
+      administratorInEscalationWindow(state, actorId, now)
     ) {
-      throw new Error("This administrator permission was granted recently. Destructive commands are delayed for 10 minutes.");
+      return {
+        lockdownActivated: false,
+        denial: "This administrator permission was granted recently or has not previously been observed. Destructive commands are delayed for 10 minutes.",
+      };
     }
     const own = state.destructiveActions.filter((entry) => entry.actorId === actorId).length;
     if (own >= settings.perAdminLimit) {
@@ -614,7 +669,7 @@ async function reserveDestructiveAction(
   });
   if (result.denial) {
     await auditBestEffort(guild, setup, {
-      action: "Global blacklist rate limit denied",
+      action: "Destructive action denied by security policy",
       status: "failed",
       actorId,
       fields: [{ name: "Result", value: result.denial }],
@@ -1044,7 +1099,8 @@ function settingsMenu(
 type SettingsSelectInteraction =
   | StringSelectMenuInteraction
   | RoleSelectMenuInteraction
-  | ChannelSelectMenuInteraction;
+  | ChannelSelectMenuInteraction
+  | UserSelectMenuInteraction;
 type SettingsComponentInteraction = ButtonInteraction | SettingsSelectInteraction;
 
 function selectedSettingsValue(interaction: SettingsSelectInteraction): string {
@@ -1058,6 +1114,7 @@ function initialSetupPanel(session: SetupSession): {
   components: Array<
     | ActionRowBuilder<ChannelSelectMenuBuilder>
     | ActionRowBuilder<RoleSelectMenuBuilder>
+    | ActionRowBuilder<UserSelectMenuBuilder>
     | ActionRowBuilder<ButtonBuilder>
   >;
 } {
@@ -1065,9 +1122,10 @@ function initialSetupPanel(session: SetupSession): {
   const ready = Boolean(
     selected.auditChannelId &&
     selected.seniorQuartermasterRoleId &&
-    selected.quartermasterRoleId,
+    selected.quartermasterRoleId &&
+    selected.securityOwnerId,
   );
-  const status = (value: string | undefined, prefix: "#" | "@&") =>
+  const status = (value: string | undefined, prefix: "#" | "@&" | "@") =>
     value ? `<${prefix}${value}> — selected` : "Required — not selected";
   return {
     embeds: [brandedEmbed(
@@ -1079,7 +1137,8 @@ function initialSetupPanel(session: SetupSession): {
       { name: "Audit Channel", value: status(selected.auditChannelId, "#"), inline: true },
       { name: "Senior Quartermaster", value: status(selected.seniorQuartermasterRoleId, "@&"), inline: true },
       { name: "Quartermaster", value: status(selected.quartermasterRoleId, "@&"), inline: true },
-      { name: "Next step", value: ready ? "All required selections are ready. Choose **Save Core Setup**." : "Choose all three required selections before saving." },
+      { name: "Security / Payout Owner", value: status(selected.securityOwnerId, "@"), inline: true },
+      { name: "Next step", value: ready ? "All required selections are ready. Choose **Save Core Setup**." : "Choose all four required selections before saving." },
     )],
     components: [
       new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(
@@ -1104,6 +1163,13 @@ function initialSetupPanel(session: SetupSession): {
           .setMinValues(1)
           .setMaxValues(1),
       ),
+      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+        new UserSelectMenuBuilder()
+          .setCustomId(`settings:initial-security-owner:${session.nonce}`)
+          .setPlaceholder("Select the security and payout owner")
+          .setMinValues(1)
+          .setMaxValues(1),
+      ),
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId(`settings:initial-save:${session.nonce}`)
@@ -1121,9 +1187,14 @@ function initialSetupPanel(session: SetupSession): {
 
 function discordRolePanel(setup: GuildSetup, nonce: string): {
   embeds: EmbedBuilder[];
-  components: Array<ActionRowBuilder<RoleSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>>;
+  components: Array<
+    | ActionRowBuilder<RoleSelectMenuBuilder>
+    | ActionRowBuilder<UserSelectMenuBuilder>
+    | ActionRowBuilder<ButtonBuilder>
+  >;
 } {
   const role = (id: string | undefined) => id ? `<@&${id}>` : "Not configured";
+  const member = (id: string | undefined) => id ? `<@${id}>` : "Not configured";
   return {
     embeds: [outcomeEmbed(
       "Discord Identity & Uniform Roles",
@@ -1136,6 +1207,7 @@ function discordRolePanel(setup: GuildSetup, nonce: string): {
         { name: "Moderation role record", value: role(setup.moderatorRoleId === setup.guildId ? undefined : setup.moderatorRoleId), inline: true },
         { name: "Senior Quartermaster", value: role(setup.seniorQuartermasterRoleId), inline: true },
         { name: "Quartermaster", value: role(setup.quartermasterRoleId), inline: true },
+        { name: "Security / Payout Owner", value: member(setup.securityOwnerId), inline: true },
         { name: "Administrative authorization", value: "Current Discord Administrator or server owner only" },
       ],
     )],
@@ -1158,6 +1230,13 @@ function discordRolePanel(setup: GuildSetup, nonce: string): {
         new RoleSelectMenuBuilder()
           .setCustomId(`setup:discord-quartermaster:${nonce}`)
           .setPlaceholder("Select Quartermaster role")
+          .setMinValues(1)
+          .setMaxValues(1),
+      ),
+      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+        new UserSelectMenuBuilder()
+          .setCustomId(`setup:security-owner:${nonce}`)
+          .setPlaceholder("Select Security / Payout Owner")
           .setMinValues(1)
           .setMaxValues(1),
       ),
@@ -1713,10 +1792,29 @@ async function handleSettingsComponent(
       await interaction.update(initialSetupPanel(session));
       return;
     }
+    if (id === "settings:initial-security-owner") {
+      await requireServerOwner(interaction.guild!, interaction.user.id, undefined, id);
+      const ownerId = selectedSettingsValue(interaction as SettingsSelectInteraction);
+      const owner = await interaction.guild!.members.fetch({ user: ownerId, force: true });
+      if (
+        owner.id !== interaction.guild!.ownerId &&
+        !owner.permissions.has(PermissionFlagsBits.Administrator)
+      ) {
+        throw new Error("The selected Security / Payout Owner must be the server owner or a current Administrator.");
+      }
+      session.initialSetup.securityOwnerId = ownerId;
+      await interaction.update(initialSetupPanel(session));
+      return;
+    }
     if (id === "settings:initial-save") {
       const selected = session.initialSetup;
-      if (!selected.auditChannelId || !selected.seniorQuartermasterRoleId || !selected.quartermasterRoleId) {
-        throw new Error("Select an audit channel, Senior Quartermaster role, and Quartermaster role before saving.");
+      if (
+        !selected.auditChannelId ||
+        !selected.seniorQuartermasterRoleId ||
+        !selected.quartermasterRoleId ||
+        !selected.securityOwnerId
+      ) {
+        throw new Error("Select an audit channel, Senior Quartermaster role, Quartermaster role, and Security / Payout Owner before saving.");
       }
       const initial: GuildSetup = {
         guildId: interaction.guild!.id,
@@ -1725,6 +1823,7 @@ async function handleSettingsComponent(
         auditChannelId: selected.auditChannelId,
         seniorQuartermasterRoleId: selected.seniorQuartermasterRoleId,
         quartermasterRoleId: selected.quartermasterRoleId,
+        securityOwnerId: selected.securityOwnerId,
         security: defaultSecuritySettings(),
         monitoring: defaultMonitoringSettings(),
         trello: defaultTrelloMappings(),
@@ -1909,6 +2008,13 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
   const componentId = interaction.customId.replace(/:([a-f0-9]{32})$/, "");
   const rawId = interaction.isStringSelectMenu() ? interaction.values[0]! : interaction.customId;
   const id = rawId.replace(/:([a-f0-9]{32})$/, "");
+  if (ownerOnlySecurityControls.has(id)) {
+    if (id === "setup:security-owner") {
+      await requireServerOwner(guild, interaction.user.id, setup, id);
+    } else {
+      await requireConfiguredSecurityOwner(guild, interaction.user.id, setup, id);
+    }
+  }
   const nonce = rawId.match(/:([a-f0-9]{32})$/)?.[1];
   if (nonce && activeSession?.nonce !== nonce) {
     throw new Error("This settings control belongs to an expired settings session. Run /settings again.");
@@ -2019,6 +2125,29 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
           : "Quartermaster uniform role",
       setup[key] ?? "Not configured",
       roleId,
+    );
+    await interaction.update(discordRolePanel(updated, activeSession?.nonce ?? nonce ?? ""));
+    return;
+  }
+  if (id === "setup:security-owner") {
+    if (!interaction.isUserSelectMenu()) {
+      throw new Error("Choose the Security / Payout Owner with the server member selector.");
+    }
+    const ownerId = selectedSettingsValue(interaction);
+    const owner = await guild.members.fetch({ user: ownerId, force: true });
+    if (
+      owner.id !== guild.ownerId &&
+      !owner.permissions.has(PermissionFlagsBits.Administrator)
+    ) {
+      throw new Error("The selected Security / Payout Owner must be the server owner or a current Administrator.");
+    }
+    const updated = await saveSetupChange(
+      guild,
+      { ...setup, securityOwnerId: ownerId },
+      interaction.user.id,
+      "Security / Payout Owner",
+      setup.securityOwnerId ?? "Not configured",
+      ownerId,
     );
     await interaction.update(discordRolePanel(updated, activeSession?.nonce ?? nonce ?? ""));
     return;
@@ -2451,6 +2580,9 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
   const guild = interaction.guild!;
   const rawId = interaction.customId;
   const id = rawId.replace(/:([a-f0-9]{32})$/, "");
+  if (ownerOnlySecurityControls.has(id)) {
+    await requireConfiguredSecurityOwner(guild, interaction.user.id, setup, id);
+  }
   const nonce = rawId.match(/:([a-f0-9]{32})$/)?.[1];
   const session = setupSessions.get(setupSessionId(guild.id, interaction.user.id));
   if (!nonce || session?.nonce !== nonce) {
@@ -3849,22 +3981,27 @@ async function requirePayoutSafety(
   setup: GuildSetup,
   command: string,
 ): Promise<void> {
+  if (!setup.securityOwnerId) {
+    throw new Error("Select a Security / Payout Owner in setup before using this command.");
+  }
+  await requireConfiguredSecurityOwner(guild, actorId, setup, command);
   await requireCurrentAdministrator(guild, actorId, setup, command);
-  const state = await getSecurityState(guild.id);
-  if (state.lockdown.active) {
-    throw new Error(`Security lockdown is active: ${state.lockdown.reason || "no reason provided"}.`);
-  }
-  const grantedAt = state.observedAdministrators[actorId];
-  if (
-    securitySettingsFor(setup).recentPermissionEscalationProtection &&
-    grantedAt &&
-    Date.now() - Date.parse(grantedAt) < permissionEscalationWindowMs
-  ) {
-    throw new Error("This administrator permission was granted recently. Payout is delayed for 10 minutes.");
-  }
-  if (await maintenanceActive(guild.id)) {
-    throw new Error("Bot maintenance mode is active. Payout is temporarily unavailable.");
-  }
+  const denial = await mutateSecurityState(guild.id, (state) => {
+    if (state.lockdown.active) {
+      return `Security lockdown is active: ${state.lockdown.reason || "no reason provided"}.`;
+    }
+    if (
+      securitySettingsFor(setup).recentPermissionEscalationProtection &&
+      administratorInEscalationWindow(state, actorId)
+    ) {
+      return "This administrator permission was granted recently or has not previously been observed. Payout is delayed for 10 minutes.";
+    }
+    if (state.maintenance.active) {
+      return "Bot maintenance mode is active. Payout is temporarily unavailable.";
+    }
+    return undefined;
+  });
+  if (denial) throw new Error(denial);
 }
 
 function payoutRecoveryDetails(run: PayoutRun): {
@@ -4521,17 +4658,15 @@ async function registerCommands(readyClient: Client<true>): Promise<boolean> {
 }
 
 async function observeExistingAdministrators(guild: Guild): Promise<void> {
-  // GuildManager fixtures and very early partial guilds may not expose a
-  // member fetcher yet. Live configured guilds do; defer observation rather
-  // than treating every established administrator as newly escalated.
+  // If enumeration is unavailable, interaction-time checks still fail closed.
   if (typeof guild.members.list !== "function") return;
   const members = await fetchGuildMembers(guild);
   await mutateSecurityState(guild.id, (state) => {
     for (const member of members.values()) {
       if (member.id === guild.ownerId || member.permissions.has(PermissionFlagsBits.Administrator)) {
-        // Do not timestamp established administrators as a fresh escalation
-        // after a process restart.
-        state.observedAdministrators[member.id] ??= "1970-01-01T00:00:00.000Z";
+        administratorInEscalationWindow(state, member.id);
+      } else {
+        delete state.observedAdministrators[member.id];
       }
     }
   });
@@ -4717,6 +4852,18 @@ async function connectDiscord(): Promise<void> {
       })().catch((error) => replyInteractionError(interaction, error));
     } else if (typeof interaction.isUserSelectMenu === "function" && interaction.isUserSelectMenu()) {
       void (async () => {
+        if (interaction.customId.startsWith("settings:")) {
+          await handleSettingsComponent(interaction);
+          return;
+        }
+        if (interaction.customId.startsWith("setup:")) {
+          if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
+            await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
+            return;
+          }
+          await handleSetupComponent(interaction);
+          return;
+        }
         if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
           await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
           return;
@@ -4786,11 +4933,11 @@ async function connectDiscord(): Promise<void> {
     if (!hadAdministrator && hasAdministrator) {
       void mutateSecurityState(after.guild.id, (state) => {
         state.observedAdministrators[after.id] = new Date().toISOString();
-      });
+      }).catch((error) => logger.error({ error }, "Failed to record administrator grant"));
     } else if (hadAdministrator && !hasAdministrator) {
       void mutateSecurityState(after.guild.id, (state) => {
         delete state.observedAdministrators[after.id];
-      });
+      }).catch((error) => logger.error({ error }, "Failed to record administrator removal"));
     }
   });
 
