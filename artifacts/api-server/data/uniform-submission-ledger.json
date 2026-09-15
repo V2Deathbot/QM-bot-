@@ -17,6 +17,23 @@
       "state": "written",
       "notified": true,
       "createdAt": "2026-09-15T02:57:09.110Z"
+    },
+    {
+      "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Moderated Uniforms\u0000A2:D\u00001549270688257282118",
+      "destination": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Moderated Uniforms\u0000A2:D",
+      "submissionId": "1549270688257282118",
+      "targetRange": "A2:D2",
+      "values": [
+        [
+          "lumiivqs",
+          "lumiivqs",
+          "egg_8771",
+          "https://www.roblox.com/catalog/123456789"
+        ]
+      ],
+      "state": "written",
+      "notified": true,
+      "createdAt": "2026-09-15T04:08:37.433Z"
     }
   ]
 }
