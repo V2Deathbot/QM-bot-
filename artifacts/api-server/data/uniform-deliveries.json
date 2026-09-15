@@ -191,21 +191,174 @@
           "26138z",
           "26138z",
           "V2Deathbot",
-          "https://www.roblox.com/catalog/696969"
+          "https://www.roblox.com/catalog/546787654"
         ]
       ],
       "sheetState": "saved",
       "assets": [
         {
-          "id": 696969,
-          "url": "https://www.roblox.com/catalog/696969"
+          "id": 546787654,
+          "url": "https://www.roblox.com/catalog/546787654"
         }
       ],
       "customerName": "V2Deathbot",
       "logNoticeState": "sent",
       "customerDeliveryState": "sent",
       "createdAt": "2026-09-15T05:05:11.897Z",
-      "customerMessageId": "1549284941466963988"
+      "relog": {
+        "state": "sent",
+        "rowIndex": 0,
+        "newAsset": {
+          "id": 546787654,
+          "url": "https://www.roblox.com/catalog/546787654"
+        },
+        "oldCustomerMessageId": "1549284941466963988",
+        "nonce": "u-relog-313d33989b3bd32f",
+        "startedAt": "2026-09-15T05:44:00.688Z"
+      },
+      "customerMessageRevision": 1,
+      "customerMessageId": "1549294702254104617",
+      "action": {
+        "kind": "purchased",
+        "state": "sent",
+        "nonce": "u-purchased-6db1b1075f577"
+      },
+      "terminal": "purchased"
+    },
+    {
+      "submissionId": "1549294433856655400",
+      "guildId": "1114860005334716422",
+      "command": "log",
+      "actorId": "555727322695860234",
+      "customerId": "555727322695860234",
+      "seqmId": "1170780243754242199",
+      "destinationChannelId": "1549284789473906860",
+      "uploadLogChannelId": "1549233954136006737",
+      "spreadsheet": {
+        "spreadsheetId": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98",
+        "logTab": "Uniform Logging",
+        "moderatedTab": "Moderated Uniforms",
+        "logRange": "A2:E",
+        "moderatedRange": "A2:D",
+        "createMissingTabs": false
+      },
+      "rows": [
+        [
+          "lumiivqs",
+          "lumiivqs",
+          "lumiivqs",
+          "V2Deathbot",
+          "https://www.roblox.com/catalog/34564324"
+        ],
+        [
+          "lumiivqs",
+          "lumiivqs",
+          "lumiivqs",
+          "V2Deathbot",
+          "https://www.roblox.com/catalog/4567654"
+        ],
+        [
+          "lumiivqs",
+          "lumiivqs",
+          "lumiivqs",
+          "V2Deathbot",
+          "https://www.roblox.com/catalog/56765456"
+        ]
+      ],
+      "sheetState": "saved",
+      "assets": [
+        {
+          "id": 34564324,
+          "url": "https://www.roblox.com/catalog/34564324"
+        },
+        {
+          "id": 4567654,
+          "url": "https://www.roblox.com/catalog/4567654"
+        },
+        {
+          "id": 56765456,
+          "url": "https://www.roblox.com/catalog/56765456"
+        }
+      ],
+      "customerName": "V2Deathbot",
+      "logNoticeState": "sent",
+      "customerDeliveryState": "sent",
+      "createdAt": "2026-09-15T05:43:04.703Z",
+      "customerMessageId": "1549294472876130335",
+      "action": {
+        "kind": "purchased",
+        "state": "sent",
+        "nonce": "u-purchased-1001c51830f97"
+      },
+      "terminal": "purchased"
+    },
+    {
+      "submissionId": "1549294552727289876",
+      "guildId": "1114860005334716422",
+      "command": "log",
+      "actorId": "555727322695860234",
+      "customerId": "555727322695860234",
+      "seqmId": "1170780243754242199",
+      "destinationChannelId": "1549284789473906860",
+      "uploadLogChannelId": "1549233954136006737",
+      "spreadsheet": {
+        "spreadsheetId": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98",
+        "logTab": "Uniform Logging",
+        "moderatedTab": "Moderated Uniforms",
+        "logRange": "A2:E",
+        "moderatedRange": "A2:D",
+        "createMissingTabs": false
+      },
+      "rows": [
+        [
+          "lumiivqs",
+          "lumiivqs",
+          "lumiivqs",
+          "V2Deathbot",
+          "https://www.roblox.com/catalog/34564324"
+        ],
+        [
+          "lumiivqs",
+          "lumiivqs",
+          "lumiivqs",
+          "V2Deathbot",
+          "https://www.roblox.com/catalog/4567654"
+        ],
+        [
+          "lumiivqs",
+          "lumiivqs",
+          "lumiivqs",
+          "V2Deathbot",
+          "https://www.roblox.com/catalog/56765456"
+        ]
+      ],
+      "sheetState": "saved",
+      "assets": [
+        {
+          "id": 34564324,
+          "url": "https://www.roblox.com/catalog/34564324"
+        },
+        {
+          "id": 4567654,
+          "url": "https://www.roblox.com/catalog/4567654"
+        },
+        {
+          "id": 56765456,
+          "url": "https://www.roblox.com/catalog/56765456"
+        }
+      ],
+      "customerName": "V2Deathbot",
+      "logNoticeState": "sent",
+      "customerDeliveryState": "sent",
+      "createdAt": "2026-09-15T05:43:33.540Z",
+      "customerMessageId": "1549294591591710741",
+      "action": {
+        "kind": "assistance",
+        "reason": "ee",
+        "state": "sent",
+        "nonce": "u-assistance-73b69ea273fb"
+      },
+      "terminal": "assistance"
     }
   ]
 }

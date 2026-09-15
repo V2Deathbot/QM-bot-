@@ -29,20 +29,17 @@
       "robloxUserId": 663770855,
       "robloxUsername": "26138z",
       "roleIds": [
-        "1548958021160411216"
+        "1548958021160411216",
+        "1549235595744911380"
       ],
-      "cardId": "6aa87e37fb1df5e020ccf077",
-      "cardUrl": "https://trello.com/c/Z6oEKEYm/6-26138z-663770855",
+      "cardId": "6aa8db9ffd42ae5bf660fe1c",
+      "cardUrl": "https://trello.com/c/xAJIr3BZ/11-26138z-663770855",
       "blacklistType": "conditional",
-      "blacklistReason": "hzhz",
+      "blacklistReason": "fff",
       "source": "command",
-      "blacklistNotificationAttemptedAt": "2026-09-14T23:58:23.202Z",
-      "status": "revoked",
-      "createdAt": "2026-09-14T23:58:23.202Z",
-      "cardUpdatedAt": "2026-09-14T23:58:22.300Z",
-      "revocationCardMovedAt": "2026-09-15T00:00:15.529Z",
-      "revokedAt": "2026-09-15T00:00:15.704Z",
-      "revocationNotificationAttemptedAt": "2026-09-15T00:00:15.704Z"
+      "blacklistNotificationAttemptedAt": "2026-09-15T05:46:08.862Z",
+      "status": "active",
+      "createdAt": "2026-09-15T05:46:06.910Z"
     },
     {
       "key": "1114860005334716422:1370330049",
