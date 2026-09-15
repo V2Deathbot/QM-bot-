@@ -20,6 +20,7 @@ import {
   type GuildMember,
   type ModalSubmitInteraction,
   type StringSelectMenuInteraction,
+  type UserSelectMenuInteraction,
 } from "discord.js";
 import { logger } from "../lib/logger";
 import { config, getMissingConfiguration, type BlacklistType } from "./config";
@@ -97,9 +98,15 @@ import {
 } from "./presentation";
 import {
   handleUniformCommand,
+  handleUniformAssistanceModal,
+  handleUniformCancelButton,
+  handleUniformCustomerButton,
   handleUniformSettingsComponent,
   handleUniformSettingsModal,
   handleUniformSpreadsheetSettingsModal,
+  handleUniformSubmitButton,
+  handleUniformRetryButton,
+  handleUniformUserSelection,
   UniformNotificationError,
   renderUniformSettings,
   uniformCommandNames,
@@ -3844,7 +3851,7 @@ async function observeExistingAdministrators(guild: Guild): Promise<void> {
 }
 
 async function replyInteractionError(
-  interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
+  interaction: ButtonInteraction | StringSelectMenuInteraction | UserSelectMenuInteraction | ModalSubmitInteraction,
   error: unknown,
 ): Promise<void> {
   const message = error instanceof Error ? error.message : "The interaction failed unexpectedly.";
@@ -3916,6 +3923,29 @@ async function connectDiscord(): Promise<void> {
           await handleIdentityPromptButton(interaction);
           return;
         }
+        if (interaction.customId.startsWith("uniform:") && interaction.guildId && await maintenanceActive(interaction.guildId)) {
+          await interaction.reply({
+            ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"),
+            ephemeral: true,
+          });
+          return;
+        }
+        if (interaction.customId.startsWith("uniform:submit:")) {
+          await handleUniformSubmitButton(interaction, maintenanceActive);
+          return;
+        }
+        if (interaction.customId.startsWith("uniform:retry:")) {
+          await handleUniformRetryButton(interaction, maintenanceActive);
+          return;
+        }
+        if (interaction.customId.startsWith("uniform:cancel:")) {
+          await handleUniformCancelButton(interaction);
+          return;
+        }
+        if (interaction.customId.startsWith("uniform:purchase:") || interaction.customId.startsWith("uniform:assist:")) {
+          await handleUniformCustomerButton(interaction);
+          return;
+        }
         const [, confirmationId] = interaction.customId.split(/:(.+)/);
         const existingConfirmation = confirmationId ? confirmations.get(confirmationId) : undefined;
         // The command form of emergency unlock remains usable in maintenance;
@@ -3944,6 +3974,14 @@ async function connectDiscord(): Promise<void> {
           await handleSetupComponent(interaction);
         }
       })().catch((error) => replyInteractionError(interaction, error));
+    } else if (typeof interaction.isUserSelectMenu === "function" && interaction.isUserSelectMenu()) {
+      void (async () => {
+        if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
+          await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
+          return;
+        }
+        await handleUniformUserSelection(interaction);
+      })().catch((error) => replyInteractionError(interaction, error));
     } else if (interaction.isStringSelectMenu()) {
       void (async () => {
         if (interaction.customId.startsWith("settings:")) {
@@ -3967,6 +4005,14 @@ async function connectDiscord(): Promise<void> {
         }
         if (interaction.customId.startsWith("settings-modal:")) {
           await handleSettingsModal(interaction);
+          return;
+        }
+        if (interaction.customId.startsWith("uniform:assist-modal:")) {
+          if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
+            await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
+            return;
+          }
+          await handleUniformAssistanceModal(interaction);
           return;
         }
         if (interaction.guildId && await maintenanceActive(interaction.guildId)) {

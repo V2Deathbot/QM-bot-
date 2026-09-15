@@ -38,6 +38,8 @@ export const config = {
     process.env["BOT_SECURITY_FILE"] ?? "data/guild-security.json",
   uniformSubmissionLedgerFile:
     process.env["UNIFORM_SUBMISSION_LEDGER_FILE"] ?? "data/uniform-submission-ledger.json",
+  uniformDeliveryFile:
+    process.env["UNIFORM_DELIVERY_FILE"] ?? "data/uniform-deliveries.json",
 } as const;
 
 function parseDelay(value: string | undefined, fallback: number): number {

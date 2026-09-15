@@ -9,6 +9,7 @@ import {
   SlashCommandBuilder,
   TextInputBuilder,
   TextInputStyle,
+  UserSelectMenuBuilder,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Guild,
@@ -16,16 +17,26 @@ import {
   type ModalSubmitInteraction,
   type PermissionResolvable,
   type StringSelectMenuInteraction,
+  type UserSelectMenuInteraction,
 } from "discord.js";
+import { randomBytes } from "node:crypto";
 import { findRobloxUser, type RobloxUser } from "./roblox";
 import {
   defaultUniformSettings,
+  getGuildSetup,
   saveGuildSetup,
   updateGuildSetup,
   uniformSettingsFor,
   type GuildSetup,
   type UniformSettings,
 } from "./setup-store";
+import {
+  getUniformDelivery,
+  claimUniformDeliveryAction,
+  saveUniformDelivery,
+  updateUniformDelivery,
+  type UniformDeliveryRecord,
+} from "./uniform-delivery-store";
 import {
   displayId,
   noMentions,
@@ -87,6 +98,12 @@ export const uniformCommands = [
         .setDescription("Roblox uniform asset ID or allowlisted Roblox URL.")
         .setRequired(true),
     )
+    // Discord requires every required option to precede the optional asset
+    // inputs. Keep this customer destination with the required command data.
+    .addChannelOption((option) =>
+      option.setName("channel").setDescription("Customer delivery channel.").setRequired(true)
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
+    )
     .addStringOption((option) =>
       option.setName("shirtid2").setDescription("Uniform asset ID or Roblox URL.").setRequired(false),
     )
@@ -140,6 +157,10 @@ export const uniformCommands = [
         .setName("shirtid")
         .setDescription("Roblox uniform asset ID or allowlisted Roblox URL.")
         .setRequired(true),
+    )
+    .addChannelOption((option) =>
+      option.setName("channel").setDescription("Customer delivery channel.").setRequired(true)
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
     ),
 ] as const;
 
@@ -176,9 +197,24 @@ export class UniformNotificationError extends Error {
 }
 
 const activeUniformSubmissions = new Set<string>();
+const uniformConfirmationLifetimeMs = 10 * 60_000;
+interface PendingUniformConfirmation {
+  nonce: string;
+  submissionId: string;
+  guildId: string;
+  actorId: string;
+  command: UniformCommandName;
+  submission: UniformSubmission;
+  destinationChannelId: string;
+  customerId?: string;
+  seqmId?: string;
+  expiresAt: number;
+}
+const pendingUniformConfirmations = new Map<string, PendingUniformConfirmation>();
 
 export function resetUniformSubmissionStateForTests(): void {
   activeUniformSubmissions.clear();
+  pendingUniformConfirmations.clear();
 }
 
 export interface UniformAsset {
@@ -638,101 +674,457 @@ export async function handleUniformCommand(
   }
   const settings = uniformSettingsFor(setup);
   await requireUniformSubmitter(interaction.guild!, interaction.user.id, settings);
-  const channel = await requireUniformChannel(
-    interaction.guild!,
-    command === "log" ? settings.logChannelId : settings.moderatedChannelId,
-    command,
+  // Validate both the configured audit destination and the explicitly chosen
+  // customer destination before opening the private confirmation.
+  await requireUniformChannel(
+    interaction.guild!, command === "log" ? settings.logChannelId : settings.moderatedChannelId, command,
   );
-
-  // All account and asset validation occurs before the public send. A failed
-  // lookup can therefore never leave a partial uniform log in the channel.
+  const selectedChannel = interaction.options.getChannel("channel", true);
+  await requireUniformChannel(interaction.guild!, selectedChannel.id, command);
   const submission = await resolveSubmission(interaction, command);
-  const spreadsheet = configuredSpreadsheet(settings);
-  if (!spreadsheet) {
-    throw new Error(
-      "Google Sheets is not configured. Ask an Administrator to open /settings → Uniforms → Spreadsheet Configuration and save a spreadsheet URL or ID before submitting.",
-    );
-  }
   const submissionId = interaction.id;
   if (!submissionId) throw new Error("The Discord interaction has no submission ID.");
-  const duplicateKey = `${interaction.guildId}:${submissionId}`;
-  if (activeUniformSubmissions.has(duplicateKey)) {
-    throw new Error(
-      "This Discord interaction has already been processed or is still in progress. Do not resubmit it.",
-    );
-  }
-  activeUniformSubmissions.add(duplicateKey);
-
-  const rows = uniformSheetRows(submission, interaction, new Date());
-  let appendResult;
-  try {
-    appendResult = await appendUniformRows({
-      config: spreadsheet,
-      logKind: command,
-      rows,
-      submissionId,
-    });
-  } catch (error) {
-    // No successful append means a transient Sheets failure can be retried.
-    // If the provider actually committed before timing out, the append helper's
-    // submission-ID check makes the next delivery idempotent.
-    activeUniformSubmissions.delete(duplicateKey);
-    throw error;
-  }
-  if (appendResult.alreadyWritten && appendResult.alreadyNotified) {
-    await interaction.editReply({
-      content: "",
-      embeds: [presentationEmbed(
-        "Uniform Already Submitted",
-        `This /${command} submission is already saved and its Discord notice is already recorded. No duplicate message was sent.`,
-        "info",
-        avatarUrl,
-      )],
-      allowedMentions: noMentions,
-    });
-    return;
-  }
-
-  let sentMessage: unknown;
-  try {
-    sentMessage = await channel.send({
-      content: `Uniform logged: /${command} (${rows.length} asset${rows.length === 1 ? "" : "s"}).`,
-      allowedMentions: noMentions,
-      nonce: submissionId,
-      enforceNonce: true,
-    });
-  } catch (error) {
-    // The durable local ledger records the sheet write but not a sent notice.
-    // Permit a later delivery to resume notification; Discord's nonce keeps a
-    // supported retry from producing a second public message.
-    activeUniformSubmissions.delete(duplicateKey);
-    throw new UniformNotificationError(command, error);
-  }
-  try {
-    await markUniformRowsNotified(
-      spreadsheet,
-      command,
-      submissionId,
-      sentDiscordMessageId(sentMessage),
-    );
-  } catch (error) {
-    // The Discord notice is durable, but its bookkeeping write is not. Allow
-    // a later delivery to retry the keyed notice/status operation; Discord's
-    // nonce+enforceNonce pair prevents a second public message when supported.
-    activeUniformSubmissions.delete(duplicateKey);
-    throw new UniformNotificationError(command, error, true);
-  }
+  const nonce = randomBytes(16).toString("hex");
+  const pending: PendingUniformConfirmation = {
+    nonce, submissionId, guildId: interaction.guildId!, actorId: interaction.user.id,
+    command, submission, destinationChannelId: selectedChannel.id,
+    expiresAt: Date.now() + uniformConfirmationLifetimeMs,
+  };
+  pendingUniformConfirmations.set(nonce, pending);
   await interaction.editReply({
     content: "",
     embeds: [presentationEmbed(
-      "Uniform Log Submitted",
-      `Your /${command} submission was saved to Google Sheets and posted as one short notice to the configured uniform channel.`,
-      "success",
+      "Confirm Uniform Delivery",
+      command === "log"
+        ? "Review the /log submission. Select the customer and Senior Quartermaster Discord accounts, then submit. No Google Sheets rows or Discord messages have been sent yet."
+        : "Review the /moderated submission. Select the customer Discord account, then submit. No Google Sheets rows or Discord messages have been sent yet.",
+      "info",
       avatarUrl,
-      [{ name: "Destination", value: `<#${command === "log" ? settings.logChannelId : settings.moderatedChannelId}>` }],
+      [
+        { name: "Customer", value: "Not selected", inline: true },
+        ...(command === "log" ? [{ name: "Senior Quartermaster", value: "Not selected", inline: true }] : []),
+        { name: "Delivery channel", value: `<#${selectedChannel.id}>`, inline: true },
+        { name: "Assets", value: `${submission.assets.length} uniform asset${submission.assets.length === 1 ? "" : "s"}` },
+      ],
     )],
+    components: uniformConfirmationComponents(nonce, command, false),
     allowedMentions: noMentions,
   });
+}
+
+function uniformConfirmationComponents(nonce: string, command: UniformCommandName, ready: boolean) {
+  const rows: Array<ActionRowBuilder<UserSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>> = [
+    new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+      new UserSelectMenuBuilder().setCustomId(`uniform:customer:${nonce}`).setPlaceholder("Select customer").setMinValues(1).setMaxValues(1),
+    ),
+  ];
+  if (command === "log") {
+    rows.push(new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+      new UserSelectMenuBuilder().setCustomId(`uniform:seqm:${nonce}`).setPlaceholder("Select Senior Quartermaster").setMinValues(1).setMaxValues(1),
+    ));
+  }
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`uniform:submit:${nonce}`).setLabel("Submit").setStyle(ButtonStyle.Success).setDisabled(!ready),
+      new ButtonBuilder().setCustomId(`uniform:cancel:${nonce}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
+    ),
+  );
+  return rows;
+}
+
+function pendingUniform(nonce: string, interaction: { user: { id: string }; guildId: string | null }): PendingUniformConfirmation {
+  const pending = pendingUniformConfirmations.get(nonce);
+  if (!pending || pending.expiresAt < Date.now()) {
+    pendingUniformConfirmations.delete(nonce);
+    throw new Error("This private uniform confirmation has expired. Run the command again.");
+  }
+  if (pending.actorId !== interaction.user.id || pending.guildId !== interaction.guildId) {
+    throw new Error("Only the person who started this uniform submission can use its confirmation controls.");
+  }
+  return pending;
+}
+
+function confirmationEmbed(pending: PendingUniformConfirmation): EmbedBuilder {
+  return presentationEmbed(
+    "Confirm Uniform Delivery",
+    pending.command === "log"
+      ? "Review the /log submission. Select the customer and Senior Quartermaster Discord accounts, then submit. No Google Sheets rows or Discord messages have been sent yet."
+      : "Review the /moderated submission. Select the customer Discord account, then submit. No Google Sheets rows or Discord messages have been sent yet.",
+    "info",
+    undefined,
+    [
+      { name: "Customer", value: pending.customerId ? `<@${pending.customerId}>` : "Not selected", inline: true },
+      ...(pending.command === "log"
+        ? [{ name: "Senior Quartermaster", value: pending.seqmId ? `<@${pending.seqmId}>` : "Not selected", inline: true }]
+        : []),
+      { name: "Delivery channel", value: `<#${pending.destinationChannelId}>`, inline: true },
+      { name: "Assets", value: pending.submission.assets.map((asset) => `[${asset.id}](${asset.url})`).join(", ") },
+    ],
+  );
+}
+
+export async function handleUniformUserSelection(interaction: UserSelectMenuInteraction): Promise<void> {
+  const [, field, nonce] = interaction.customId.split(":");
+  if ((field !== "customer" && field !== "seqm") || !nonce) throw new Error("That uniform selection is unavailable.");
+  const pending = pendingUniform(nonce, interaction);
+  const selected = interaction.values[0];
+  if (!selected) throw new Error("Select exactly one Discord user.");
+  if (field === "customer") pending.customerId = selected;
+  else pending.seqmId = selected;
+  await interaction.update({
+    embeds: [confirmationEmbed(pending)],
+    components: uniformConfirmationComponents(
+      nonce, pending.command, Boolean(pending.customerId && (pending.command === "moderated" || pending.seqmId)),
+    ),
+    allowedMentions: noMentions,
+  });
+}
+
+function customerDeliveryEmbed(record: UniformDeliveryRecord): EmbedBuilder {
+  return presentationEmbed(
+    "Your Uniform Is Ready",
+    "Your uniform has been completed and is ready for collection.",
+    "success",
+    undefined,
+    [
+      { name: "Customer", value: safePresentationText(record.customerName), inline: true },
+      { name: "Uniform links", value: record.assets.map((asset, index) => `[Uniform ${index + 1}](${asset.url})`).join("\n") },
+    ],
+  );
+}
+
+function customerDeliveryButtons(record: UniformDeliveryRecord, disabled = false) {
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`uniform:purchase:${record.submissionId}`).setLabel("Purchased").setStyle(ButtonStyle.Success).setDisabled(disabled),
+    new ButtonBuilder().setCustomId(`uniform:assist:${record.submissionId}`).setLabel("Request Assistance").setStyle(ButtonStyle.Danger).setDisabled(disabled),
+  )];
+}
+function deliveryRetryComponents(record: UniformDeliveryRecord) {
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`uniform:retry:${record.submissionId}`).setLabel("Retry Delivery").setStyle(ButtonStyle.Primary),
+  )];
+}
+
+function sentMessageId(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  return typeof (value as { id?: unknown }).id === "string" ? (value as { id: string }).id : "";
+}
+
+async function sendPendingDelivery(
+  record: UniformDeliveryRecord,
+  guild: Guild,
+): Promise<UniformDeliveryRecord> {
+  const logChannel = await requireUniformChannel(
+    guild, record.uploadLogChannelId, record.command,
+  );
+  const destination = await requireUniformChannel(guild, record.destinationChannelId, record.command);
+  let current = await getUniformDelivery(record.submissionId) ?? record;
+  if (current.logNoticeState === "unresolved" || current.customerDeliveryState === "unresolved") {
+    throw new Error("A prior Discord delivery outcome is unresolved. No duplicate message will be sent; an administrator must verify the recorded channel.");
+  }
+  if (current.logNoticeState === "claimed" || current.customerDeliveryState === "claimed") {
+    // A process can stop after persisting the outbox claim and before (or just
+    // after) Discord accepts it. Never replay that ambiguous request.
+    current = await updateUniformDelivery(record.submissionId, (item) => {
+      if (item.logNoticeState === "claimed") item.logNoticeState = "unresolved";
+      if (item.customerDeliveryState === "claimed") item.customerDeliveryState = "unresolved";
+    });
+    throw new Error("A prior Discord delivery attempt is unresolved. No duplicate message will be sent; an administrator must verify the recorded channel.");
+  }
+  if (current.logNoticeState !== "sent") {
+    current = await updateUniformDelivery(record.submissionId, (item) => { item.logNoticeState = "claimed"; });
+    try {
+      const notice = await logChannel.send({
+        content: `Uniform logged: /${record.command} (${record.assets.length} asset${record.assets.length === 1 ? "" : "s"}).`,
+        allowedMentions: noMentions, nonce: `${record.submissionId}-notice`, enforceNonce: true,
+      });
+      await markUniformRowsNotified(record.spreadsheet, record.command, record.submissionId, sentMessageId(notice));
+      current = await updateUniformDelivery(record.submissionId, (item) => { item.logNoticeState = "sent"; });
+    } catch (error) {
+      await updateUniformDelivery(record.submissionId, (item) => { item.logNoticeState = "unresolved"; });
+      throw error;
+    }
+  }
+  if (current.customerDeliveryState !== "sent") {
+    current = await updateUniformDelivery(record.submissionId, (item) => { item.customerDeliveryState = "claimed"; });
+    try {
+      const message = await destination.send({
+        content: `<@${record.customerId}>`, embeds: [customerDeliveryEmbed(current)],
+        components: customerDeliveryButtons(current), allowedMentions: { parse: [], users: [record.customerId] },
+        nonce: `${record.submissionId}-customer`, enforceNonce: true,
+      });
+      const messageId = sentMessageId(message);
+      if (!messageId) throw new Error("Discord did not return a message ID for the customer delivery.");
+      current = await updateUniformDelivery(record.submissionId, (item) => {
+        item.customerMessageId = messageId;
+        item.customerDeliveryState = "sent";
+      });
+    } catch (error) {
+      await updateUniformDelivery(record.submissionId, (item) => { item.customerDeliveryState = "unresolved"; });
+      throw error;
+    }
+  }
+  return current;
+}
+
+export async function handleUniformSubmitButton(
+  interaction: ButtonInteraction,
+  maintenanceIsActive: (guildId: string) => Promise<boolean>,
+): Promise<void> {
+  const [, , nonce] = interaction.customId.split(":");
+  if (!nonce) throw new Error("That uniform submission is unavailable.");
+  const pending = pendingUniform(nonce, interaction);
+  if (!pending.customerId || (pending.command === "log" && !pending.seqmId)) {
+    throw new Error("Select the required Discord user(s) before submitting.");
+  }
+  await interaction.deferUpdate();
+  if (await maintenanceIsActive(pending.guildId)) {
+    throw new Error("Bot maintenance mode is active. Commands are temporarily unavailable.");
+  }
+  const latest = await getGuildSetup(pending.guildId);
+  if (!latest) throw new Error("This server no longer has a valid bot setup.");
+  const settings = uniformSettingsFor(latest);
+  await requireUniformSubmitter(interaction.guild!, pending.actorId, settings);
+  let record = await getUniformDelivery(pending.submissionId);
+  if (record && (record.guildId !== pending.guildId || record.actorId !== pending.actorId)) {
+    throw new Error("The durable uniform submission record does not match this confirmation.");
+  }
+  if (!record) {
+    await fetchedMember(interaction.guild!, pending.customerId);
+    if (pending.command === "log") await fetchedMember(interaction.guild!, pending.seqmId!);
+    const uploadLogChannelId = pending.command === "log" ? settings.logChannelId : settings.moderatedChannelId;
+    await requireUniformChannel(interaction.guild!, uploadLogChannelId, pending.command);
+    await requireUniformChannel(interaction.guild!, pending.destinationChannelId, pending.command);
+    const spreadsheet = configuredSpreadsheet(settings);
+    if (!spreadsheet) throw new Error("Google Sheets is not configured. The submission was not saved.");
+    const rows = uniformSheetRows(pending.submission, {
+      id: pending.submissionId, user: { id: pending.actorId }, guildId: pending.guildId,
+    } as Pick<ChatInputCommandInteraction, "id" | "user" | "guildId">, new Date());
+    record = await saveUniformDelivery({
+      submissionId: pending.submissionId, guildId: pending.guildId, command: pending.command,
+      actorId: pending.actorId, customerId: pending.customerId, seqmId: pending.seqmId ?? "",
+      destinationChannelId: pending.destinationChannelId, uploadLogChannelId: uploadLogChannelId!,
+      spreadsheet, rows, sheetState: "prepared", assets: pending.submission.assets,
+      customerName: pending.submission.users.customer.name, logNoticeState: "pending",
+      customerDeliveryState: "pending", createdAt: new Date().toISOString(),
+    });
+  }
+  // The durable record is now authoritative. It outlives the private review
+  // and prevents changed settings/selections from changing a retry.
+  pendingUniformConfirmations.delete(nonce);
+  const key = `${pending.guildId}:${pending.submissionId}`;
+  if (activeUniformSubmissions.has(key)) throw new Error("This uniform submission is already being processed.");
+  activeUniformSubmissions.add(key);
+  try {
+    if (record.sheetState !== "saved") {
+      try {
+        await appendUniformRows({ config: record.spreadsheet, logKind: record.command, rows: record.rows, submissionId: record.submissionId });
+        record = await updateUniformDelivery(record.submissionId, (item) => { item.sheetState = "saved"; });
+      } catch {
+        await interaction.editReply({
+          embeds: [presentationEmbed(
+            "Submission Pending",
+            "The original Sheets target and rows are durably preserved, but the write outcome was not confirmed. Do not run the slash command again; Retry Delivery uses only that original target.",
+            "warning",
+          )],
+          components: deliveryRetryComponents(record),
+          allowedMentions: noMentions,
+        });
+        return;
+      }
+    }
+    let delivered: UniformDeliveryRecord;
+    try {
+      delivered = await sendPendingDelivery(record, interaction.guild!);
+    } catch (error) {
+      const current = await getUniformDelivery(record.submissionId);
+      await interaction.editReply({
+        embeds: [presentationEmbed(
+          current?.sheetState === "saved" ? "Saved, Delivery Unresolved" : "Submission Outcome Unresolved",
+          current?.sheetState === "saved"
+            ? "The uniform rows are saved, but a Discord delivery outcome could not be confirmed. No duplicate message will be sent automatically; an administrator must verify the recorded channel."
+            : "The original Sheets target is durably reserved, but its write outcome could not be confirmed. Do not run the slash command again; an administrator must verify the original sheet target.",
+          "warning",
+        )],
+        components: current?.sheetState === "saved" && current.logNoticeState !== "unresolved" && current.customerDeliveryState !== "unresolved"
+          ? deliveryRetryComponents(current) : [],
+        allowedMentions: noMentions,
+      });
+      return;
+    }
+    await interaction.editReply({
+      embeds: [presentationEmbed(
+        "Uniform Submitted",
+        `The /${pending.command} rows were saved, one short upload-log notice was sent, and the customer delivery was posted to <#${delivered.destinationChannelId}>.`,
+        "success",
+      )],
+      components: [],
+      allowedMentions: noMentions,
+    });
+  } finally {
+    activeUniformSubmissions.delete(key);
+  }
+}
+
+export async function handleUniformRetryButton(
+  interaction: ButtonInteraction,
+  maintenanceIsActive: (guildId: string) => Promise<boolean>,
+): Promise<void> {
+  const [, , submissionId] = interaction.customId.split(":");
+  if (!submissionId) throw new Error("That delivery retry is unavailable.");
+  const record = await getUniformDelivery(submissionId);
+  if (!record || record.guildId !== interaction.guildId || record.actorId !== interaction.user.id) {
+    throw new Error("Only the original authorized submitter can retry this recorded delivery.");
+  }
+  await interaction.deferUpdate();
+  if (await maintenanceIsActive(record.guildId)) throw new Error("Bot maintenance mode is active. Commands are temporarily unavailable.");
+  const latest = await getGuildSetup(record.guildId);
+  if (!latest) throw new Error("This server no longer has a valid bot setup.");
+  await requireUniformSubmitter(interaction.guild!, record.actorId, uniformSettingsFor(latest));
+  await fetchedMember(interaction.guild!, record.customerId);
+  if (record.command === "log") await fetchedMember(interaction.guild!, record.seqmId);
+  await requireUniformChannel(interaction.guild!, record.uploadLogChannelId, record.command);
+  await requireUniformChannel(interaction.guild!, record.destinationChannelId, record.command);
+  if (record.sheetState !== "saved") {
+    await appendUniformRows({ config: record.spreadsheet, logKind: record.command, rows: record.rows, submissionId: record.submissionId });
+    await updateUniformDelivery(record.submissionId, (item) => { item.sheetState = "saved"; });
+  }
+  const current = await getUniformDelivery(submissionId);
+  if (!current || current.logNoticeState === "unresolved" || current.customerDeliveryState === "unresolved") {
+    throw new Error("This delivery outcome is unresolved and will not be replayed automatically.");
+  }
+  const delivered = await sendPendingDelivery(current, interaction.guild!);
+  await interaction.editReply({
+    embeds: [presentationEmbed("Uniform Delivery Completed", `The existing saved submission was delivered to <#${delivered.destinationChannelId}> without writing Sheets rows again.`, "success")],
+    components: [],
+    allowedMentions: noMentions,
+  });
+}
+
+export async function handleUniformCancelButton(interaction: ButtonInteraction): Promise<void> {
+  const [, , nonce] = interaction.customId.split(":");
+  if (!nonce) throw new Error("That uniform submission is unavailable.");
+  pendingUniform(nonce, interaction);
+  pendingUniformConfirmations.delete(nonce);
+  await interaction.update({
+    embeds: [presentationEmbed("Uniform Submission Cancelled", "No Google Sheets rows or Discord messages were sent.", "info")],
+    components: [],
+    allowedMentions: noMentions,
+  });
+}
+
+function escapedAssistanceReason(value: string): string {
+  // The reason is displayed as literal text, never as customer-controlled
+  // markdown, links, or a mention. presentation text also removes controls.
+  return safePresentationText(value, 1000).replace(/[\\`*_~|[\]()]/g, "\\$&");
+}
+async function boundDelivery(interaction: ButtonInteraction | ModalSubmitInteraction, submissionId: string): Promise<UniformDeliveryRecord> {
+  const record = await getUniformDelivery(submissionId);
+  if (!record || record.guildId !== interaction.guildId || record.destinationChannelId !== interaction.channelId) {
+    throw new Error("This uniform delivery control is no longer valid.");
+  }
+  if (interaction.user.id !== record.customerId) throw new Error("Only the selected customer can use this uniform delivery control.");
+  if ("message" in interaction && (!interaction.message || record.customerMessageId !== interaction.message.id)) {
+    throw new Error("This uniform delivery control is not attached to its recorded customer message.");
+  }
+  await fetchedMember(interaction.guild!, record.customerId);
+  return record;
+}
+
+export async function handleUniformCustomerButton(interaction: ButtonInteraction): Promise<void> {
+  const [, action, submissionId] = interaction.customId.split(":");
+  if ((action !== "purchase" && action !== "assist") || !submissionId) throw new Error("That uniform delivery control is unavailable.");
+  const record = await boundDelivery(interaction, submissionId);
+  if (record.terminal) {
+    // A prior terminal outbox send succeeded but the message edit may have
+    // failed. Repair the visible controls without sending another outcome.
+    await interaction.update({ components: customerDeliveryButtons(record, true) });
+    return;
+  }
+  if (record.action) {
+    throw new Error("This customer outcome is already claimed or unresolved. It will not be sent again automatically.");
+  }
+  if (action === "assist") {
+    await interaction.showModal(
+      new ModalBuilder().setCustomId(`uniform:assist-modal:${submissionId}`).setTitle("Request Senior Quartermaster Assistance")
+        .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId("reason").setLabel("How can we help?").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1000),
+        )),
+    );
+    return;
+  }
+  const claimed = await claimUniformDeliveryAction(submissionId, "purchased");
+  if (claimed.action?.kind !== "purchased" || claimed.action.state !== "claimed") {
+    throw new Error("This customer outcome is already claimed or unresolved. It will not be sent again automatically.");
+  }
+  await interaction.deferUpdate();
+  try {
+    const channel = await requireUniformChannel(interaction.guild!, record.destinationChannelId, record.command);
+    await channel.send({
+      content: record.command === "log" ? `<@${record.seqmId}>` : "A customer has confirmed their purchase.",
+      embeds: [presentationEmbed("Purchase Confirmed", "Thank you for your purchase. Your ticket will be closed shortly.", "success")],
+      allowedMentions: record.command === "log" ? { parse: [], users: [record.seqmId] } : noMentions,
+      nonce: claimed.action.nonce,
+      enforceNonce: true,
+    });
+    await updateUniformDelivery(submissionId, (item) => {
+      item.terminal = "purchased";
+      if (item.action) item.action.state = "sent";
+    });
+  } catch (error) {
+    await updateUniformDelivery(submissionId, (item) => {
+      if (item.action?.state === "claimed") item.action.state = "unresolved";
+    }).catch(() => undefined);
+    throw error;
+  }
+  await interaction.editReply({ components: customerDeliveryButtons(claimed, true) });
+}
+
+export async function handleUniformAssistanceModal(interaction: ModalSubmitInteraction): Promise<void> {
+  const [, , submissionId] = interaction.customId.split(":");
+  if (!submissionId) throw new Error("That assistance request is unavailable.");
+  const record = await boundDelivery(interaction, submissionId);
+  if (record.terminal) throw new Error("This uniform delivery has already been completed.");
+  if (record.action) throw new Error("This customer outcome is already claimed or unresolved. It will not be sent again automatically.");
+  let reason = "";
+  try { reason = interaction.fields.getTextInputValue("reason").trim(); } catch { /* reply below */ }
+  if (!reason || reason.length > 1000) throw new Error("An assistance reason of up to 1000 characters is required.");
+  const claimed = await claimUniformDeliveryAction(submissionId, "assistance", reason);
+  if (claimed.action?.kind !== "assistance" || claimed.action.state !== "claimed") {
+    throw new Error("This customer outcome is already claimed or unresolved. It will not be sent again automatically.");
+  }
+  try {
+    await interaction.deferReply({ ephemeral: true });
+    const channel = await requireUniformChannel(interaction.guild!, record.destinationChannelId, record.command);
+    await channel.send({
+      content: record.command === "log" ? `<@${record.seqmId}>` : "A customer assistance request was posted.",
+      embeds: [presentationEmbed(
+        "Customer Assistance Requested",
+        "The customer needs Senior Quartermaster assistance and will be in touch shortly.",
+        "warning",
+        undefined,
+        [{ name: "Reason", value: escapedAssistanceReason(reason) }],
+      )],
+      allowedMentions: record.command === "log" ? { parse: [], users: [record.seqmId] } : noMentions,
+      nonce: claimed.action.nonce,
+      enforceNonce: true,
+    });
+    await updateUniformDelivery(submissionId, (item) => {
+      item.terminal = "assistance";
+      if (item.action) item.action.state = "sent";
+    });
+    const original = await interaction.channel?.messages.fetch(record.customerMessageId!);
+    await original?.edit({ components: customerDeliveryButtons(claimed, true) });
+    await interaction.editReply({
+      embeds: [presentationEmbed("Assistance Requested", "Your request was sent. A Senior Quartermaster will be in touch shortly.", "success")],
+      allowedMentions: noMentions,
+    });
+  } catch (error) {
+    await updateUniformDelivery(submissionId, (item) => {
+      if (item.action?.state === "claimed") item.action.state = "unresolved";
+    }).catch(() => undefined);
+    throw error;
+  }
 }
 
 function discordIds(value: string, label: string): string[] {

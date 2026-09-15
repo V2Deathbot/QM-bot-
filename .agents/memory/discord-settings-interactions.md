@@ -14,3 +14,9 @@ Test modal submissions using the actual serialized field IDs, with missing-field
 **Why:** Tests that invented submission keys concealed a form-builder mismatch: completed forms failed because session scoping had renamed their input fields.
 
 **How to apply:** Capture the emitted modal JSON, construct submissions from its fields, and verify persisted values rather than only checking the modal opened.
+
+Validate Discord command registration constraints in serialization tests, not just builder construction.
+
+**Why:** The builder accepted a required channel after optional asset fields, but Discord rejected the entire guild command registration, blocking bot startup.
+
+**How to apply:** Assert required options precede optional ones for every command whenever adding options.

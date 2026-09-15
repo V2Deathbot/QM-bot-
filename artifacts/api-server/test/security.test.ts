@@ -785,11 +785,11 @@ test("registers exactly six commands with the requested moderation and uniform o
   assert.deepEqual(revoke?.options?.map((option) => option.name), ["username"]);
   assert.deepEqual(log?.options?.map((option) => option.name), [
     "qm", "seqm", "publisher", "customer",
-    "shirtid1", "shirtid2", "shirtid3", "shirtid4", "shirtid5",
-    "shirtid6", "shirtid7", "shirtid8", "shirtid9", "shirtid10",
+    "shirtid1", "channel", "shirtid2", "shirtid3", "shirtid4", "shirtid5",
+    "shirtid6", "shirtid7", "shirtid8", "shirtid9", "shirtid10", "channel",
   ]);
   assert.deepEqual(moderated?.options?.map((option) => option.name), [
-    "uploader", "publisher", "customer", "shirtid",
+    "uploader", "publisher", "customer", "shirtid", "channel",
   ]);
 });
 
@@ -1433,7 +1433,9 @@ test("confirmation tokens are atomically claimed before duplicate continuations 
     client!.emit("interactionCreate", first);
     client!.emit("interactionCreate", duplicate);
     await settle();
-    for (let attempt = 0; attempt < 40 && !first.deferred; attempt += 1) {
+    // File-backed security state can be briefly contended by other serial
+    // suite workers while their cleanup completes.
+    for (let attempt = 0; attempt < 100 && !first.deferred; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     assert.equal(first.deferred, true);
