@@ -1,0 +1,32 @@
+{
+  "guilds": [
+    {
+      "guildId": "retry-revoked-command",
+      "lockdown": {
+        "active": false,
+        "automatic": false,
+        "reason": "",
+        "startedAt": null,
+        "startedBy": null
+      },
+      "maintenance": {
+        "active": false,
+        "reason": "",
+        "startedAt": null,
+        "startedBy": null,
+        "revision": 0
+      },
+      "maintenanceAudit": [],
+      "destructiveActions": [],
+      "observedAdministrators": {},
+      "identityLedger": [
+        {
+          "discordUserId": "retry-discord-member",
+          "robloxUserId": 78,
+          "observedAt": "2026-09-15T22:00:54.075Z",
+          "source": "command"
+        }
+      ]
+    }
+  ]
+}

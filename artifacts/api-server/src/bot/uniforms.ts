@@ -2079,14 +2079,6 @@ export async function handleUniformAssistanceModal(interaction: ModalSubmitInter
   }
 }
 
-function discordIds(value: string, label: string): string[] {
-  const entries = value.split(",").map((entry) => entry.trim()).filter(Boolean);
-  if (entries.some((entry) => !/^\d{5,25}$/.test(entry))) {
-    throw new Error(`${label} must contain only comma-separated Discord IDs, or be left blank to revoke access.`);
-  }
-  return [...new Set(entries)];
-}
-
 function optionalChannelId(value: string, label: string): string | undefined {
   const trimmed = value.trim();
   if (!trimmed) return undefined;
@@ -2176,7 +2168,11 @@ export async function resetUniformSettings(
 ): Promise<GuildSetup> {
   return updateGuildSetup(setup.guildId, (latest) => {
     const updated = { ...(latest ?? setup) } as GuildSetup & { uniforms?: UniformSettings };
-    delete updated.uniforms;
+    const existing = uniformSettingsFor(updated);
+    updated.uniforms = {
+      authorizedRoleIds: existing.authorizedRoleIds,
+      authorizedMemberIds: existing.authorizedMemberIds,
+    };
     updated.updatedBy = actorId;
     updated.updatedAt = new Date().toISOString();
     return updated;
@@ -2193,7 +2189,7 @@ export function uniformSettingsEmbed(
     ids.length ? ids.map((id) => `${prefix}${id}>`).join(", ") : "None — Administrators only";
   return presentationEmbed(
     "Uniforms",
-    "Separate uniform logging destinations and submitter access. Administrators and the server owner can always submit.",
+    "Separate uniform logging destinations and submitter access. Administrators and the server owner can always submit. Access grants are read-only here and can only be changed by the Discord application owner under Global → Permissions.",
     "info",
     avatarUrl,
     [
@@ -2382,24 +2378,6 @@ export async function handleUniformSettingsComponent(
             .setRequired(false)
             .setMaxLength(25),
         ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("authorized_role_ids")
-            .setLabel("Authorized role IDs (comma-separated)")
-            .setStyle(TextInputStyle.Paragraph)
-            .setValue(settings.authorizedRoleIds.join(", "))
-            .setRequired(false)
-            .setMaxLength(500),
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("authorized_member_ids")
-            .setLabel("Authorized member IDs (comma-separated)")
-            .setStyle(TextInputStyle.Paragraph)
-            .setValue(settings.authorizedMemberIds.join(", "))
-            .setRequired(false)
-            .setMaxLength(500),
-        ),
       ),
   );
 }
@@ -2419,7 +2397,9 @@ export async function handleUniformSettingsModal(
   interaction: ModalSubmitInteraction,
   setup: GuildSetup,
 ): Promise<GuildSetup> {
+  const existing = uniformSettingsFor(setup);
   const settings: UniformSettings = {
+    ...existing,
     logChannelId: optionalChannelId(
       uniformModalValue(interaction, "log_channel_id"),
       "/log channel ID",
@@ -2427,14 +2407,6 @@ export async function handleUniformSettingsModal(
     moderatedChannelId: optionalChannelId(
       uniformModalValue(interaction, "moderated_channel_id"),
       "/moderated channel ID",
-    ),
-    authorizedRoleIds: discordIds(
-      uniformModalValue(interaction, "authorized_role_ids"),
-      "Authorized role IDs",
-    ),
-    authorizedMemberIds: discordIds(
-      uniformModalValue(interaction, "authorized_member_ids"),
-      "Authorized member IDs",
     ),
   };
   const updated = await saveUniformSettings(
@@ -2447,7 +2419,7 @@ export async function handleUniformSettingsModal(
     content: "",
     embeds: [presentationEmbed(
       "Uniforms Saved",
-      "Uniform destinations and submitter access were validated and saved. Blank destinations disable that command; blank access lists restore Administrator-only access.",
+      "Uniform destinations were validated and saved. Blank destinations disable that command. Access grants were preserved and remain editable only under Global → Permissions.",
       "success",
       undefined,
       [

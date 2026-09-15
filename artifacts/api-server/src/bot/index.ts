@@ -83,6 +83,8 @@ import {
   defaultSecuritySettings,
   defaultTrelloMappings,
   saveGuildSetup,
+  updateGuildSetup,
+  blacklistAccessFor,
   securitySettingsFor,
   auditSettingsFor,
   trelloMappingsFor,
@@ -358,6 +360,7 @@ interface PayoutConfirmation {
 const payoutConfirmations = new Map<string, PayoutConfirmation>();
 
 const destructiveCommands = new Set(["blacklist", "group_blacklist", "revoke_blacklist"]);
+const blacklistAccessCommands = new Set([...destructiveCommands, "blacklist_lookup"]);
 const ownerOnlySecurityControls = new Set([
   "setup:confirmation",
   "setup:escalation-protection",
@@ -511,12 +514,67 @@ async function interactionMember(
 
 export async function canUseModerationCommands(
   interaction: ChatInputCommandInteraction,
-  _setup: GuildSetup,
+  setup: GuildSetup,
+  command?: string,
 ): Promise<boolean> {
   const guild = interaction.guild!;
   const member = await interactionMember(interaction);
   if (guild.ownerId === member.id) return true;
-  return member.permissions.has(PermissionFlagsBits.Administrator);
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  if (!blacklistAccessCommands.has(command ?? "")) return false;
+  const access = blacklistAccessFor(setup);
+  return access.authorizedMemberIds.includes(member.id) ||
+    Boolean(member.roles.cache.some((role) => access.authorizedRoleIds.includes(role.id)));
+}
+
+async function requireModerationAuthorization(
+  interaction: ChatInputCommandInteraction,
+  setup: GuildSetup,
+  command: string,
+): Promise<void> {
+  if (await canUseModerationCommands(interaction, setup, command)) return;
+  await auditBestEffort(interaction.guild!, setup, {
+    action: "Unauthorized moderation command denied",
+    status: "failed",
+    actorId: interaction.user.id,
+    fields: [{ name: "Command", value: `/${command}` }],
+  });
+  throw new Error(
+    blacklistAccessCommands.has(command)
+      ? "Only a current Discord Administrator, the server owner, or a configured blacklist access grant may use this command."
+      : "Only a current Discord Administrator or the server owner may use this command.",
+  );
+}
+
+/**
+ * Resolve ownership from Discord's application metadata on every sensitive
+ * interaction. Missing or stale metadata is intentionally a denial rather
+ * than an invitation to guess an owner.
+ */
+async function requireDiscordApplicationOwner(
+  guild: Guild,
+  userId: string,
+): Promise<void> {
+  const application = guild.client.application;
+  if (!application || typeof application.fetch !== "function") {
+    throw new Error("Discord application ownership could not be resolved.");
+  }
+  let resolved: typeof application;
+  try {
+    resolved = await application.fetch();
+  } catch {
+    throw new Error("Discord application ownership could not be resolved.");
+  }
+  if (!resolved) throw new Error("Discord application ownership could not be resolved.");
+  const owner = resolved.owner;
+  const ownerId = owner && "ownerId" in owner && typeof owner.ownerId === "string"
+    ? owner.ownerId
+    : owner && "id" in owner && typeof owner.id === "string"
+      ? owner.id
+      : undefined;
+  if (!ownerId || ownerId !== userId) {
+    throw new Error("Only the Discord application owner may manage Permissions.");
+  }
 }
 
 async function currentAdministrator(guild: Guild, userId: string): Promise<boolean> {
@@ -1031,6 +1089,7 @@ function settingsCategoryOptions(
     case "global":
       return [
         { label: "Payout Owner & Discord Roles", value: "setup:discord", description: "Set the payout owner and named Quartermaster roles" },
+        { label: "Permissions", value: "setup:permissions", description: "Configure narrowly-scoped uploading and blacklist access grants" },
         { label: "Security Configuration", value: "setup:security", description: "Limits, protections, and confirmations" },
         { label: "Security Lockdown", value: "settings-action:lockdown", description: "Immediately stop destructive actions" },
         { label: "Security Unlock", value: "settings-action:unlock", description: "Unlock after confirmation" },
@@ -1226,6 +1285,122 @@ function discordRolePanel(setup: GuildSetup, nonce: string): {
       ),
     ],
   };
+}
+
+function permissionIds(value: string, label: string): string[] {
+  const ids = value.split(",").map((entry) => entry.trim()).filter(Boolean);
+  if (ids.some((id) => !/^\d{5,25}$/.test(id))) {
+    throw new Error(`${label} must contain only comma-separated Discord IDs, or be left blank.`);
+  }
+  return [...new Set(ids)];
+}
+
+function permissionsPanel(setup: GuildSetup, nonce: string): {
+  embeds: EmbedBuilder[];
+  components: Array<ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<RoleSelectMenuBuilder>>;
+} {
+  const access = blacklistAccessFor(setup);
+  const uniforms = uniformSettingsFor(setup);
+  const mentions = (ids: string[], prefix: string) =>
+    ids.length ? ids.map((id) => `${prefix}${id}>`).join(", ") : "None — Administrator/server owner only";
+  return {
+    embeds: [outcomeEmbed(
+      "Permissions",
+      "Only the Discord application owner can edit these grants. They never grant access to /settings or any other administrative action.",
+      "info",
+      [
+        { name: "Uploading roles", value: mentions(uniforms.authorizedRoleIds, "<@&") },
+        { name: "Uploading members", value: mentions(uniforms.authorizedMemberIds, "<@") },
+        { name: "Senior Quartermaster upload role", value: setup.seniorQuartermasterRoleId ? `<@&${setup.seniorQuartermasterRoleId}>` : "Not configured" },
+        { name: "Quartermaster upload role", value: setup.quartermasterRoleId ? `<@&${setup.quartermasterRoleId}>` : "Not configured" },
+        { name: "Blacklist roles", value: mentions(access.authorizedRoleIds, "<@&") },
+        { name: "Blacklist members", value: mentions(access.authorizedMemberIds, "<@") },
+      ],
+    )],
+    components: [
+      new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
+        new RoleSelectMenuBuilder()
+          .setCustomId(`setup:permissions-senior-quartermaster:${nonce}`)
+          .setPlaceholder("Select Senior Quartermaster upload role")
+          .setMinValues(1)
+          .setMaxValues(1),
+      ),
+      new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
+        new RoleSelectMenuBuilder()
+          .setCustomId(`setup:permissions-quartermaster:${nonce}`)
+          .setPlaceholder("Select Quartermaster upload role")
+          .setMinValues(1)
+          .setMaxValues(1),
+      ),
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`setup:permissions-config:${nonce}`)
+          .setLabel("Edit Permissions")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`settings:back:category:global:${nonce}`)
+          .setLabel("Back to Global")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  };
+}
+
+async function savePermissions(
+  guild: Guild,
+  setup: GuildSetup,
+  actorId: string,
+  uniformRoleIds: string[],
+  uniformMemberIds: string[],
+  blacklistRoleIds: string[],
+  blacklistMemberIds: string[],
+): Promise<GuildSetup> {
+  const roleIds = [...new Set([...uniformRoleIds, ...blacklistRoleIds])];
+  for (const roleId of roleIds) {
+    let role: unknown;
+    try {
+      role = await guild.roles.fetch(roleId);
+    } catch {
+      role = null;
+    }
+    const roleGuildId = (role as { guild?: { id?: string } } | null)?.guild?.id;
+    if (!role || roleGuildId !== guild.id) {
+      throw new Error(`Role ${roleId} does not belong to this server.`);
+    }
+  }
+  for (const memberId of [...new Set([...uniformMemberIds, ...blacklistMemberIds])]) {
+    try {
+      const member = await guild.members.fetch(memberId);
+      if (!member || member.id !== memberId) throw new Error();
+    } catch {
+      throw new Error(`Member ${memberId} does not belong to this server or could not be fetched.`);
+    }
+  }
+  const updated = await updateGuildSetup(guild.id, async (latest) => {
+    const base = latest ?? setup;
+    return {
+      ...base,
+      uniforms: {
+        ...uniformSettingsFor(base),
+        authorizedRoleIds: uniformRoleIds,
+        authorizedMemberIds: uniformMemberIds,
+      },
+      blacklistAuthorizedRoleIds: blacklistRoleIds,
+      blacklistAuthorizedMemberIds: blacklistMemberIds,
+      updatedBy: actorId,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+  await auditBestEffort(guild, updated, {
+    action: "Bot permissions changed",
+    status: "success",
+    actorId,
+    fields: [
+      { name: "Uploading grants", value: `${uniformRoleIds.length} roles; ${uniformMemberIds.length} members` },
+      { name: "Blacklist grants", value: `${blacklistRoleIds.length} roles; ${blacklistMemberIds.length} members` },
+    ],
+  });
+  return updated;
 }
 
 function settingsCategoryMenu(
@@ -1592,6 +1767,7 @@ function settingsCategoryForAction(id: string): SettingsCategory | undefined {
     id === "settings-action:unlock"
   ) return "global";
   if (id === "setup:audit" || id === "setup:discord") return "global";
+  if (id === "setup:permissions") return "global";
   if (
     id === "setup:uniforms" ||
     id === "setup:uniforms-config" ||
@@ -1764,6 +1940,7 @@ async function handleSettingsComponent(
       return;
     }
     if (id === "settings:initial-senior-quartermaster" || id === "settings:initial-quartermaster") {
+      await requireDiscordApplicationOwner(interaction.guild!, interaction.user.id);
       const roleId = selectedSettingsValue(interaction as SettingsSelectInteraction);
       const role = await interaction.guild!.roles.fetch(roleId);
       if (!role) throw new Error("The selected role does not exist in this server.");
@@ -1992,6 +2169,16 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
   const componentId = interaction.customId.replace(/:([a-f0-9]{32})$/, "");
   const rawId = interaction.isStringSelectMenu() ? interaction.values[0]! : interaction.customId;
   const id = rawId.replace(/:([a-f0-9]{32})$/, "");
+  if (
+    id === "setup:permissions" ||
+    id === "setup:permissions-config" ||
+    id === "setup:permissions-senior-quartermaster" ||
+    id === "setup:permissions-quartermaster" ||
+    id === "setup:discord-senior-quartermaster" ||
+    id === "setup:discord-quartermaster"
+  ) {
+    await requireDiscordApplicationOwner(guild, interaction.user.id);
+  }
   if (ownerOnlySecurityControls.has(id)) {
     if (id === "setup:security-owner") {
       await requireServerOwner(guild, interaction.user.id, setup, id);
@@ -2006,7 +2193,7 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
   if (activeSession?.nonceRequired && id.startsWith("setup:")) {
     const pageIds = new Set([
       "setup:blacklist", "setup:trello", "setup:security", "setup:lockdown",
-      "setup:audit", "setup:discord", "setup:identity", "setup:uniforms", "setup:bot-state", "setup:view",
+      "setup:audit", "setup:discord", "setup:permissions", "setup:identity", "setup:uniforms", "setup:bot-state", "setup:view",
     ]);
     if (pageIds.has(id)) {
       const current = settingsNavigation(activeSession).at(-1);
@@ -2075,6 +2262,60 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
   }
   if (id === "setup:uniforms") {
     await renderUniformSettings(interaction as ButtonInteraction, setup, botAvatarUrl());
+    return;
+  }
+  if (id === "setup:permissions") {
+    await interaction.update(permissionsPanel(setup, activeSession?.nonce ?? nonce ?? ""));
+    return;
+  }
+  if (id === "setup:permissions-config") {
+    const uniforms = uniformSettingsFor(setup);
+    const access = blacklistAccessFor(setup);
+    await interaction.showModal(new ModalBuilder()
+      .setCustomId(scopedSetupModalId(guild.id, interaction.user.id, "setup-modal:permissions"))
+      .setTitle("Edit Quartermaster permissions")
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId("uniform_role_ids").setLabel("Uploading role IDs (comma-separated)")
+            .setStyle(TextInputStyle.Paragraph).setRequired(false).setValue(uniforms.authorizedRoleIds.join(", ")).setMaxLength(500),
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId("uniform_member_ids").setLabel("Uploading member IDs (comma-separated)")
+            .setStyle(TextInputStyle.Paragraph).setRequired(false).setValue(uniforms.authorizedMemberIds.join(", ")).setMaxLength(500),
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId("blacklist_role_ids").setLabel("Blacklist role IDs (comma-separated)")
+            .setStyle(TextInputStyle.Paragraph).setRequired(false).setValue(access.authorizedRoleIds.join(", ")).setMaxLength(500),
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId("blacklist_member_ids").setLabel("Blacklist member IDs (comma-separated)")
+            .setStyle(TextInputStyle.Paragraph).setRequired(false).setValue(access.authorizedMemberIds.join(", ")).setMaxLength(500),
+        ),
+      ));
+    return;
+  }
+  if (id === "setup:permissions-senior-quartermaster" || id === "setup:permissions-quartermaster") {
+    if (!interaction.isRoleSelectMenu()) {
+      throw new Error("Choose the uploading role with the server role selector.");
+    }
+    const roleId = selectedSettingsValue(interaction);
+    const role = await guild.roles.fetch(roleId);
+    if (!role) throw new Error("The selected role does not exist in this server.");
+    validateModeratorRole(guild, role);
+    const key = id === "setup:permissions-senior-quartermaster"
+      ? "seniorQuartermasterRoleId"
+      : "quartermasterRoleId";
+    const updated = await saveSetupChange(
+      guild,
+      { ...setup, [key]: roleId },
+      interaction.user.id,
+      key === "seniorQuartermasterRoleId"
+        ? "Senior Quartermaster uniform role"
+        : "Quartermaster uniform role",
+      setup[key] ?? "Not configured",
+      roleId,
+    );
+    await interaction.update(permissionsPanel(updated, activeSession?.nonce ?? nonce ?? ""));
     return;
   }
   if (id === "setup:discord") {
@@ -2564,6 +2805,9 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
   const guild = interaction.guild!;
   const rawId = interaction.customId;
   const id = rawId.replace(/:([a-f0-9]{32})$/, "");
+  if (id === "setup-modal:permissions") {
+    await requireDiscordApplicationOwner(guild, interaction.user.id);
+  }
   if (ownerOnlySecurityControls.has(id)) {
     await requireConfiguredSecurityOwner(guild, interaction.user.id, setup, id);
   }
@@ -2579,6 +2823,34 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
   }
   if (id === "setup-modal:uniforms") {
     await handleUniformSettingsModal(interaction, setup);
+    return;
+  }
+  if (id === "setup-modal:permissions") {
+    const value = (field: string): string => {
+      try {
+        return interaction.fields.getTextInputValue(field);
+      } catch {
+        throw new Error(`Missing Permissions configuration field "${field}". Reopen the settings modal and try again.`);
+      }
+    };
+    const updated = await savePermissions(
+      guild,
+      setup,
+      interaction.user.id,
+      permissionIds(value("uniform_role_ids"), "Uploading role IDs"),
+      permissionIds(value("uniform_member_ids"), "Uploading member IDs"),
+      permissionIds(value("blacklist_role_ids"), "Blacklist role IDs"),
+      permissionIds(value("blacklist_member_ids"), "Blacklist member IDs"),
+    );
+    await interaction.reply({
+      content: "",
+      embeds: [outcomeEmbed(
+        "Permissions Saved",
+        "Uploading and blacklist grants were validated and saved. Blank lists restore Administrator/server-owner-only behavior.",
+        "success",
+      )],
+      ephemeral: true,
+    });
     return;
   }
   if (id === "setup-modal:uniforms-recover") {
@@ -3295,7 +3567,12 @@ async function handleConfirmation(interaction: ButtonInteraction): Promise<void>
   let setup: GuildSetup | undefined;
   try {
     setup = await getGuildSetup(pending.guildId);
-    await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, `/${pending.command} confirmation`);
+    if (pending.command === "blacklist" || pending.command === "group_blacklist" || pending.command === "revoke_blacklist") {
+      if (!setup) throw new Error("Complete first-time setup before confirming this moderation action.");
+      await requireModerationAuthorization(pending.original, setup, pending.command);
+    } else {
+      await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, `/${pending.command} confirmation`);
+    }
     if (pending.command !== "security_unlock" && await maintenanceActive(pending.guildId)) {
       throw new Error("Bot maintenance mode is active. Commands are temporarily unavailable.");
     }
@@ -4399,7 +4676,11 @@ async function handleInteraction(
   }
 
   try {
-    await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, `/${interaction.commandName}`);
+    if (blacklistAccessCommands.has(interaction.commandName)) {
+      await requireModerationAuthorization(interaction, setup, interaction.commandName);
+    } else {
+      await requireCurrentAdministrator(interaction.guild, interaction.user.id, setup, `/${interaction.commandName}`);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Administrative access denied.";
     await interaction.editReply(errorResponse(message, "Administrative Access Denied"));

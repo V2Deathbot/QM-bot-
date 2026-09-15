@@ -96,6 +96,7 @@ let trelloCards: Array<Record<string, unknown>> = [];
 let robloxLookup = { id: 9001, name: "Builder", displayName: "Builder" };
 let trelloCreateFailure = false;
 let client: Client | undefined;
+let applicationOwner: { id: string } | { id: string; ownerId: string } = { id: "setup-owner" };
 let componentMessageSequence = 0;
 let latestComponentMessageId = "component-message-0";
 const spreadsheetRows = new Map<string, unknown[][]>([
@@ -222,6 +223,9 @@ const guild = {
   ownerId: "owner",
   client: {
     user: { id: "security-bot" },
+    application: {
+      fetch: async () => ({ owner: applicationOwner }),
+    },
     users: {
       fetch: async (id: string) => {
         if (!validatedExternalUsers.has(id)) throw new Error("Discord user not found");
@@ -1031,15 +1035,11 @@ test("navigates to Uploading configuration, seals modal fields, saves, resets, a
   assert.deepEqual(modalTextInputIds(shown!), [
     "log_channel_id",
     "moderated_channel_id",
-    "authorized_role_ids",
-    "authorized_member_ids",
   ]);
 
   await dispatchRaw(modal("setup-owner", shown!.customId, {
     log_channel_id: "12345678901234567",
     moderated_channel_id: "12345678901234568",
-    authorized_role_ids: "moderator-role",
-    authorized_member_ids: "member",
   }));
   let saved = await store.getGuildSetup(guild.id);
   assert.equal(saved?.uniforms?.logChannelId, "12345678901234567");
@@ -1053,8 +1053,6 @@ test("navigates to Uploading configuration, seals modal fields, saves, resets, a
   await dispatchRaw(modal("setup-owner", staleForDemotion.customId, {
     log_channel_id: "",
     moderated_channel_id: "",
-    authorized_role_ids: "",
-    authorized_member_ids: "",
   }));
   saved = await store.getGuildSetup(guild.id);
   assert.equal(saved?.uniforms?.logChannelId, "12345678901234567");
@@ -1063,24 +1061,22 @@ test("navigates to Uploading configuration, seals modal fields, saves, resets, a
   await dispatchRaw(modal("setup-owner", staleForDemotion.customId, {
     log_channel_id: "",
     moderated_channel_id: "",
-    authorized_role_ids: "",
   }));
-  assert.match(replies.at(-1) ?? "", /Missing Uniforms configuration field.*authorized_member_ids/i);
 
   // Serialized modal field IDs are stable, while the modal itself remains
   // nonce-bound to this settings session.
   await dispatchRaw(modal("setup-owner", shown!.customId.replace(/[a-f0-9]{32}$/, "00000000000000000000000000000000"), {
     log_channel_id: "",
     moderated_channel_id: "",
-    authorized_role_ids: "",
-    authorized_member_ids: "",
   }));
   assert.match(replies.at(-1) ?? "", /expired|another administrator/i);
 
   const resetInteraction = button("setup-owner", renderedButton(uniformPage, "Reset Uniforms", "setup:"));
   await dispatchRaw(resetInteraction);
   saved = await store.getGuildSetup(guild.id);
-  assert.equal(saved?.uniforms, undefined);
+  assert.equal(saved?.uniforms?.logChannelId, undefined);
+  assert.deepEqual(saved?.uniforms?.authorizedRoleIds, ["moderator-role"]);
+  assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["member"]);
   const resetPayload = latestComponentPayload(resetInteraction);
   const backToCategory = renderedButton(resetPayload, "Back to Category", "settings:back:");
   const backInteraction = button("setup-owner", backToCategory);
@@ -1844,6 +1840,7 @@ test("/settings traverses categories and opens nonce-bound parameter modals", as
     ],
     global: [
       "setup:discord",
+      "setup:permissions",
       "setup:security", "settings-action:lockdown", "settings-action:unlock",
       "setup:identity", "setup:audit",
       "settings-action:status", "settings-action:maintenance-enable",
@@ -1880,6 +1877,98 @@ test("/settings traverses categories and opens nonce-bound parameter modals", as
     await chooseSettingsAction("admin-a", category, action);
     assert.ok(shownModals.at(-1)?.customId.startsWith(expectedModal), `${action} should open its modal`);
   }
+});
+
+test("only the Discord application owner can edit uploading and blacklist permission grants", async () => {
+  await setSecurity({ confirmationsRequired: false });
+  members.set("12345678901234570", { administrator: false });
+  members.set("12345678901234572", { administrator: false });
+
+  const deniedRoot = await openSettings("admin-a");
+  const deniedGlobal = await chooseSettingsCategory("admin-a", deniedRoot.root, "global");
+  await chooseSettingsAction("admin-a", deniedGlobal, "setup:permissions");
+  assert.match(replies.at(-1) ?? "", /Only the Discord application owner/i);
+
+  applicationOwner = { id: "application-team", ownerId: "setup-owner" };
+  const ownerRoot = await openSettings("setup-owner");
+  const ownerGlobal = await chooseSettingsCategory("setup-owner", ownerRoot.root, "global");
+  const permissionPage = await chooseSettingsAction("setup-owner", ownerGlobal, "setup:permissions");
+  const pagePayload = latestComponentPayload(permissionPage);
+  assert.match(presentationReplyText(pagePayload), /Only the Discord application owner can edit/i);
+
+  const edit = renderedButton(pagePayload, "Edit Permissions", "setup:");
+  await dispatchRaw(button("setup-owner", edit));
+  const permissionModal = shownModals.at(-1);
+  assert.ok(permissionModal?.customId.startsWith("setup-modal:permissions:"));
+  assert.deepEqual(modalTextInputIds(permissionModal), [
+    "uniform_role_ids",
+    "uniform_member_ids",
+    "blacklist_role_ids",
+    "blacklist_member_ids",
+  ]);
+  await dispatchRaw(modal("setup-owner", permissionModal!.customId, {
+    uniform_role_ids: "12345678901234569",
+    uniform_member_ids: "12345678901234570",
+    blacklist_role_ids: "12345678901234571",
+    blacklist_member_ids: "12345678901234572",
+  }));
+
+  const saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  assert.deepEqual(saved?.uniforms?.authorizedRoleIds, ["12345678901234569"]);
+  assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["12345678901234570"]);
+  assert.deepEqual(saved?.blacklistAuthorizedRoleIds, ["12345678901234571"]);
+  assert.deepEqual(saved?.blacklistAuthorizedMemberIds, ["12345678901234572"]);
+  assert.match(replies.at(-1) ?? "", /Permissions Saved/i);
+  applicationOwner = { id: "setup-owner" };
+});
+
+test("blacklist grants allow only blacklist commands and are rechecked at command entry", async () => {
+  await setSecurity({ confirmationsRequired: false });
+  const setupStore = await import("../src/bot/setup-store.ts");
+  const current = await setupStore.getGuildSetup(guild.id);
+  assert.ok(current);
+  await saveGuildSetup({
+    ...current!,
+    blacklistAuthorizedRoleIds: ["12345678901234571"],
+    blacklistAuthorizedMemberIds: ["12345678901234572"],
+  });
+  members.set("blacklist-role-user", {
+    administrator: false,
+    roleIds: ["12345678901234571"],
+  });
+  members.set("12345678901234572", { administrator: false });
+
+  const beforeCards = trelloCardCreations.length;
+  await dispatch(command("blacklist-role-user", "group_blacklist", {
+    id: "717171",
+    reason: "granted role test",
+  }));
+  assert.equal(trelloCardCreations.length, beforeCards + 1);
+
+  await dispatch(command("12345678901234572", "blacklist_lookup", {
+    username: "Builder",
+  }));
+  assert.match(replies.at(-1) ?? "", /Blacklist Lookup/i);
+
+  await dispatch(command("blacklist-role-user", "settings"));
+  assert.match(replies.at(-1) ?? "", /Administrator or the server owner/i);
+  await dispatch(command("blacklist-role-user", "payout"));
+  assert.match(replies.at(-1) ?? "", /Security \/ Payout Owner/i);
+
+  const latest = await setupStore.getGuildSetup(guild.id);
+  assert.ok(latest);
+  await saveGuildSetup({
+    ...latest!,
+    blacklistAuthorizedRoleIds: [],
+    blacklistAuthorizedMemberIds: [],
+  });
+  const cardsAfterRemoval = trelloCardCreations.length;
+  await dispatch(command("blacklist-role-user", "group_blacklist", {
+    id: "717172",
+    reason: "removed role test",
+  }));
+  assert.equal(trelloCardCreations.length, cardsAfterRemoval);
+  assert.match(replies.at(-1) ?? "", /configured blacklist access grant/i);
 });
 
 test("sealed settings modals keep field IDs stable while binding modal sessions", async () => {
@@ -2080,6 +2169,7 @@ test("/settings restricts the maintenance menu while allowing emergency status",
 });
 
 test("/settings performs first-time setup with native audit and Quartermaster selectors", async () => {
+  applicationOwner = { id: "owner" };
   await writeFile(config.setupFile, JSON.stringify({ guilds: [] }), "utf8");
   await mutateSecurityState(guild.id, (state) => {
     state.maintenance = {
@@ -2119,9 +2209,10 @@ test("/settings performs first-time setup with native audit and Quartermaster se
   assert.equal(persisted?.quartermasterRoleId, "quartermaster-role");
   assert.equal(persisted?.securityOwnerId, "admin-a");
   assert.equal("presence" in (persisted ?? {}), false);
+  applicationOwner = { id: "setup-owner" };
 });
 
-test("Discord role policy edits remain administrator-only and preserve named role separation", async () => {
+test("upload role policy edits remain application-owner-only and preserve named role separation", async () => {
   await setSecurity({});
   await mutateSecurityState(guild.id, (state) => {
     state.maintenance = {
@@ -2129,12 +2220,25 @@ test("Discord role policy edits remain administrator-only and preserve named rol
       revision: state.maintenance.revision + 1,
     };
   });
-  const { root } = await openSettings("admin-a");
-  const logs = await chooseSettingsCategory("admin-a", root, "global");
-  const policy = await chooseSettingsAction("admin-a", logs, "setup:discord");
-  const policyPayload = latestComponentPayload(policy);
+  const adminRoot = await openSettings("admin-a");
+  const adminGlobal = await chooseSettingsCategory("admin-a", adminRoot.root, "global");
+  const adminPolicy = await chooseSettingsAction("admin-a", adminGlobal, "setup:discord");
+  const adminPayload = latestComponentPayload(adminPolicy);
+  const adminSeniorId = componentRows(adminPayload).find((item) =>
+    (item.data?.custom_id ?? item.custom_id)?.startsWith("setup:discord-senior-quartermaster:"),
+  )?.data?.custom_id;
+  assert.ok(adminSeniorId);
+  await dispatchRaw(nativeSelect("role", "admin-a", adminSeniorId, ["forbidden-senior-role"]));
+  let saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  assert.notEqual(saved?.seniorQuartermasterRoleId, "forbidden-senior-role");
+  assert.match(replies.at(-1) ?? "", /Discord application owner/i);
+
+  const { root } = await openSettings("setup-owner");
+  const global = await chooseSettingsCategory("setup-owner", root, "global");
+  const permissions = await chooseSettingsAction("setup-owner", global, "setup:permissions");
+  const permissionPayload = latestComponentPayload(permissions);
   const selectorId = (prefix: string) => {
-    const component = componentRows(policyPayload).find((item) =>
+    const component = componentRows(permissionPayload).find((item) =>
       (item.data?.custom_id ?? item.custom_id)?.startsWith(prefix),
     );
     const id = component?.data?.custom_id ?? component?.custom_id;
@@ -2142,17 +2246,17 @@ test("Discord role policy edits remain administrator-only and preserve named rol
     return id;
   };
   const senior = nativeSelect(
-    "role", "admin-a", selectorId("setup:discord-senior-quartermaster:"), ["senior-role-updated"],
+    "role", "setup-owner", selectorId("setup:permissions-senior-quartermaster:"), ["senior-role-updated"],
   );
   await dispatchRaw(senior);
   assert.equal(senior.localReplies.length, 1, `role selector did not respond: ${JSON.stringify(senior.localReplies)}`);
-  let saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
+  saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
   assert.equal(saved?.seniorQuartermasterRoleId, "senior-role-updated");
   assert.notEqual(saved?.moderatorRoleId, "senior-role-updated");
 
   // A copied native selector ID still carries the session owner/message guard.
   const copied = nativeSelect(
-    "role", "moderator", selectorId("setup:discord-quartermaster:"), ["forbidden-quartermaster"],
+    "role", "moderator", selectorId("setup:permissions-quartermaster:"), ["forbidden-quartermaster"],
   );
   await dispatchRaw(copied);
   saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);

@@ -22,6 +22,9 @@ export interface GuildSetup {
   identity?: IdentitySettings;
   /** Optional uniform-log destinations and non-administrator submitter access. */
   uniforms?: UniformSettings;
+  /** Optional, narrowly-scoped access to blacklist mutation commands. */
+  blacklistAuthorizedRoleIds?: string[];
+  blacklistAuthorizedMemberIds?: string[];
   /** Explicit member allowed to run payouts and change security limits. */
   securityOwnerId?: string;
   updatedBy: string;
@@ -134,6 +137,18 @@ export function uniformSettingsFor(setup: GuildSetup): UniformSettings {
   };
 }
 
+/** Blacklist submitter grants are deliberately separate from all other roles. */
+export function blacklistAccessFor(setup: GuildSetup): {
+  authorizedRoleIds: string[];
+  authorizedMemberIds: string[];
+} {
+  const valid = (id: string): boolean => /^\d{5,25}$/.test(id);
+  return {
+    authorizedRoleIds: [...new Set((setup.blacklistAuthorizedRoleIds ?? []).filter(valid))],
+    authorizedMemberIds: [...new Set((setup.blacklistAuthorizedMemberIds ?? []).filter(valid))],
+  };
+}
+
 /** Roles which receive the narrowly-scoped uniform submitter permission. */
 export function quartermasterUniformRoleIds(setup: GuildSetup): string[] {
   return [...new Set([
@@ -217,10 +232,15 @@ interface GuildSetupFile {
 function isGuildSetup(value: unknown): value is GuildSetup {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
+  const validOptionalIds = (ids: unknown): boolean =>
+    ids === undefined ||
+    (Array.isArray(ids) && ids.every((id) => typeof id === "string" && /^\d{5,25}$/.test(id)));
   return (
     typeof candidate["guildId"] === "string" &&
     typeof candidate["moderatorRoleId"] === "string" &&
     typeof candidate["auditChannelId"] === "string" &&
+    validOptionalIds(candidate["blacklistAuthorizedRoleIds"]) &&
+    validOptionalIds(candidate["blacklistAuthorizedMemberIds"]) &&
     typeof candidate["updatedBy"] === "string" &&
     typeof candidate["updatedAt"] === "string"
   );
