@@ -44,6 +44,8 @@ export interface UniformDeliveryRecord {
   sheetState: "prepared" | "saved";
   assets: Array<{ id: number; url: string }>;
   customerName: string;
+  /** Immutable Roblox user ID used for ownership verification. Missing on legacy records. */
+  customerRobloxId?: number;
   /** Real ticket channel name frozen at submission time; never infer it from a Discord user. */
   ticketChannelName?: string;
   /** The original upload audit message, when it was durably recorded. */

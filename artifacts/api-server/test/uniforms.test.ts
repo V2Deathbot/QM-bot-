@@ -35,7 +35,22 @@ const users = new Map([
   ["Customer", { id: 4, name: "Customer", displayName: "Customer" }],
   ["Uploader", { id: 5, name: "Uploader", displayName: "Uploader" }],
 ]);
-globalThis.fetch = async (_input, init) => {
+let unownedAssetIds = new Set<number>();
+let inventoryResponseStatus = 200;
+let inventoryRequestCount = 0;
+globalThis.fetch = async (input, init) => {
+  const url = String(input);
+  const ownership = /inventory\.roblox\.com\/v1\/users\/(\d+)\/items\/Asset\/(\d+)\/is-owned/.exec(url);
+  if (ownership) {
+    inventoryRequestCount += 1;
+    if (inventoryResponseStatus !== 200) {
+      return new Response("", { status: inventoryResponseStatus });
+    }
+    return new Response(
+      JSON.stringify(!unownedAssetIds.has(Number(ownership[2]))),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }
   const username = JSON.parse(String(init?.body)).usernames[0] as string;
   return new Response(JSON.stringify({ data: users.has(username) ? [users.get(username)] : [] }), {
     status: 200, headers: { "content-type": "application/json" },
@@ -174,6 +189,7 @@ async function prepareAndSubmit(command: "log" | "moderated", values: Record<str
 beforeEach(() => {
   rows.clear(); sends = []; auditMessageEdits = []; sentMessages.clear(); auditEditFailure = undefined; sendFailure = undefined; sheetFailure = undefined;
   rejectLongDiscordNonces = false; sheetValidationGate = undefined;
+  unownedAssetIds = new Set(); inventoryResponseStatus = 200; inventoryRequestCount = 0;
   resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
 });
 after(() => { globalThis.fetch = originalFetch; resetGoogleSheetsProxyForTests(); });
@@ -371,6 +387,59 @@ test("confirms purchase once, credits frozen names, and upgrades its original au
   assert.equal((await getUniformDelivery("purchase-audit"))?.action?.auditState, "sent");
 });
 
+test("keeps a purchase pending until Roblox confirms every shirt is owned", async () => {
+  await prepareAndSubmit("log", {
+    qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer",
+    shirtid1: "42", shirtid2: "43",
+  }, "ownership-required");
+  unownedAssetIds.add(43);
+  const edits: unknown[] = [];
+  await handleUniformCustomerButton({
+    customId: "uniform:purchase:ownership-required", guild, guildId: guild.id,
+    channelId: "customer-channel", message: { id: "notice-2" },
+    user: { id: "customer-discord" }, deferUpdate: async () => undefined,
+    editReply: async (payload: unknown) => { edits.push(payload); }, update: async () => undefined,
+  } as never);
+  const record = await getUniformDelivery("ownership-required");
+  assert.equal(record?.terminal, undefined);
+  assert.equal(record?.action, undefined);
+  assert.ok((rows.get("Uniform Logs") ?? []).every((row) => !row.includes("Sold")));
+  assert.match(JSON.stringify(edits[0]), /Purchase Not Verified/);
+  assert.match(JSON.stringify(edits[0]), /Retry Ownership Check/);
+  assert.match(JSON.stringify(edits[0]), /catalog\\?\/43|catalog\/43/);
+});
+
+test("shows private inventory status and retries transient Roblox failures three times", async () => {
+  await prepareAndSubmit("log", {
+    qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer",
+    shirtid1: "42",
+  }, "ownership-retry-status");
+  const click = {
+    customId: "uniform:purchase:ownership-retry-status", guild, guildId: guild.id,
+    channelId: "customer-channel", message: { id: "notice-2" },
+    user: { id: "customer-discord" }, deferUpdate: async () => undefined,
+  };
+
+  inventoryResponseStatus = 403;
+  const privateEdits: unknown[] = [];
+  await handleUniformCustomerButton({
+    ...click, editReply: async (payload: unknown) => { privateEdits.push(payload); },
+  } as never);
+  assert.equal(inventoryRequestCount, 1);
+  assert.match(JSON.stringify(privateEdits[0]), /Inventory Is Private/);
+  assert.match(JSON.stringify(privateEdits[0]), /Retry Ownership Check/);
+
+  inventoryRequestCount = 0;
+  inventoryResponseStatus = 503;
+  const unavailableEdits: unknown[] = [];
+  await handleUniformCustomerButton({
+    ...click, editReply: async (payload: unknown) => { unavailableEdits.push(payload); },
+  } as never);
+  assert.equal(inventoryRequestCount, 3);
+  assert.match(JSON.stringify(unavailableEdits[0]), /Roblox Check Unavailable/);
+  assert.match(JSON.stringify(unavailableEdits[0]), /three automatic attempts/);
+});
+
 test("uses only moderated uploader and publisher credits in a quiet purchase confirmation", async () => {
   await prepareAndSubmit("moderated", {
     uploader: "Uploader", publisher: "Publisher", customer: "Customer", shirtid: "42",
@@ -472,7 +541,8 @@ test("uses deterministic Discord-safe nonces for 19- and 20-digit delivery IDs",
     submissionId: twentyDigits, guildId: guild.id, command: "moderated", actorId: "submitter",
     customerId: "customer-discord", seqmId: "", destinationChannelId: "customer-channel",
     uploadLogChannelId: "log", spreadsheet: setup.uniforms!.spreadsheet!, rows: [],
-    sheetState: "saved", customerName: "Customer", assets: [{ id: 98, url: "https://www.roblox.com/catalog/98" }],
+    sheetState: "saved", customerName: "Customer", customerRobloxId: 4,
+    assets: [{ id: 98, url: "https://www.roblox.com/catalog/98" }],
     logNoticeState: "sent", customerDeliveryState: "sent", customerMessageId: "twenty-digit-message", createdAt: new Date().toISOString(),
   });
   await handleUniformCustomerButton({
@@ -644,7 +714,8 @@ test("legacy /log controls without original ledger rows fail before a purchase p
     submissionId: "customer-purchase", guildId: guild.id, command: "log", actorId: "submitter",
     customerId: "customer-discord", seqmId: "seqm-discord", destinationChannelId: "customer-channel",
     uploadLogChannelId: "log", spreadsheet: setup.uniforms!.spreadsheet!, rows: [],
-    sheetState: "saved", customerName: "Customer", assets: [{ id: 99, url: "https://www.roblox.com/catalog/99" }],
+    sheetState: "saved", customerName: "Customer", customerRobloxId: 4,
+    assets: [{ id: 99, url: "https://www.roblox.com/catalog/99" }],
     logNoticeState: "sent", customerDeliveryState: "sent", customerMessageId: "customer-message", createdAt: new Date().toISOString(),
   });
   resetUniformDeliveryStoreForTests();

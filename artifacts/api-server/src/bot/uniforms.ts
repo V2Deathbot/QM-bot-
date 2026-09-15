@@ -22,7 +22,13 @@ import {
 } from "discord.js";
 import { randomBytes } from "node:crypto";
 import { purchaseFooter } from "./purchase-footers";
-import { findRobloxUser, type RobloxUser } from "./roblox";
+import {
+  findRobloxUser,
+  ownsRobloxAsset,
+  RobloxInventoryPrivateError,
+  RobloxOwnershipUnavailableError,
+  type RobloxUser,
+} from "./roblox";
 import {
   defaultUniformSettings,
   getGuildSetup,
@@ -1404,6 +1410,64 @@ function customerDeliveryButtons(record: UniformDeliveryRecord, disabled = false
     new ButtonBuilder().setCustomId(`uniform:assist:${record.submissionId}`).setLabel("Request Assistance").setStyle(ButtonStyle.Danger).setDisabled(disabled),
   )];
 }
+
+function ownershipRetryComponents(record: UniformDeliveryRecord) {
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`uniform:purchase:${record.submissionId}`)
+      .setLabel("Retry Ownership Check")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`uniform:assist:${record.submissionId}`)
+      .setLabel("Request Assistance")
+      .setStyle(ButtonStyle.Secondary),
+  )];
+}
+
+function ownershipFailureResponse(
+  record: UniformDeliveryRecord,
+  error: unknown,
+  missingAssets: Array<{ id: number; url: string }> = [],
+) {
+  if (error instanceof RobloxInventoryPrivateError) {
+    return {
+      embeds: [presentationEmbed(
+        "Inventory Is Private",
+        "Roblox cannot verify this purchase while the customer's inventory is private. Make the inventory visible, then retry the ownership check.",
+        "warning",
+      )],
+      components: ownershipRetryComponents(record),
+      allowedMentions: noMentions,
+    };
+  }
+  if (missingAssets.length > 0) {
+    return {
+      embeds: [presentationEmbed(
+        "Purchase Not Verified",
+        `Roblox reports that the customer does not own ${missingAssets.length === 1 ? "this uniform" : "these uniforms"}. The purchase remains pending.`,
+        "warning",
+        undefined,
+        missingAssets.map((asset, index) => ({
+          name: `Uniform ${index + 1}`,
+          value: asset.url,
+        })),
+      )],
+      components: ownershipRetryComponents(record),
+      allowedMentions: noMentions,
+    };
+  }
+  return {
+    embeds: [presentationEmbed(
+      "Roblox Check Unavailable",
+      error instanceof RobloxOwnershipUnavailableError
+        ? "Roblox did not respond after three automatic attempts. Wait a moment, then retry the ownership check."
+        : "The ownership check could not be completed. Wait a moment, then retry.",
+      "warning",
+    )],
+    components: ownershipRetryComponents(record),
+    allowedMentions: noMentions,
+  };
+}
 function deliveryRetryComponents(record: Pick<UniformDeliveryRecord, "submissionId"> | string, disabled = false) {
   const submissionId = typeof record === "string" ? record : record.submissionId;
   return [new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -1611,7 +1675,9 @@ export async function handleUniformSubmitButton(
       actorId: pending.actorId, customerId: pending.customerId, seqmId: pending.seqmId ?? "",
       destinationChannelId: pending.destinationChannelId, uploadLogChannelId: uploadLogChannelId!,
       spreadsheet, rows, sheetState: "prepared", assets: pending.submission.assets,
-      customerName: pending.submission.users.customer.name, logNoticeState: "pending",
+      customerName: pending.submission.users.customer.name,
+      customerRobloxId: pending.submission.users.customer.id,
+      logNoticeState: "pending",
       customerDeliveryState: "pending", ticketChannelName: pending.ticketChannelName,
       createdAt: new Date().toISOString(),
     });
@@ -1880,6 +1946,42 @@ export async function handleUniformCustomerButton(interaction: ButtonInteraction
     );
     return;
   }
+  await interaction.deferUpdate();
+  if (!record.customerRobloxId) {
+    await interaction.editReply({
+      embeds: [presentationEmbed(
+        "Ownership Check Unavailable",
+        "This older delivery does not contain the Roblox user ID required for automatic verification. Request Senior Quartermaster assistance.",
+        "warning",
+      )],
+      components: ownershipRetryComponents(record),
+      allowedMentions: noMentions,
+    });
+    return;
+  }
+  let ownership: Array<{ asset: { id: number; url: string }; owned: boolean }>;
+  try {
+    ownership = await Promise.all(
+      record.assets.map(async (asset) => ({
+        asset,
+        owned: await ownsRobloxAsset(record.customerRobloxId!, asset.id),
+      })),
+    );
+  } catch (error) {
+    await interaction.editReply(ownershipFailureResponse(record, error));
+    return;
+  }
+  const missing = ownership.filter((result) => !result.owned);
+  if (missing.length > 0) {
+    await interaction.editReply(
+      ownershipFailureResponse(
+        record,
+        undefined,
+        missing.map(({ asset }) => asset),
+      ),
+    );
+    return;
+  }
   const claimed = await claimUniformDeliveryAction(submissionId, "purchased", undefined, {
     customerMessageId: interaction.message.id,
     customerMessageRevision: record.customerMessageRevision ?? 0,
@@ -1887,7 +1989,6 @@ export async function handleUniformCustomerButton(interaction: ButtonInteraction
   if (claimed.action?.kind !== "purchased" || claimed.action.state !== "claimed") {
     throw new Error("This customer outcome is already claimed or unresolved. It will not be sent again automatically.");
   }
-  await interaction.deferUpdate();
   try {
     // A /log acknowledgement is not successful unless its immutable original
     // ledger rows were marked in the fixed Sold column first.
@@ -1916,7 +2017,15 @@ export async function handleUniformCustomerButton(interaction: ButtonInteraction
     }).catch(() => undefined);
     throw error;
   }
-  await interaction.editReply({ components: customerDeliveryButtons(claimed, true) });
+  await interaction.editReply({
+    embeds: [presentationEmbed(
+      "Ownership Verified",
+      "Roblox confirmed ownership of every submitted uniform. The purchase has been recorded.",
+      "success",
+    )],
+    components: customerDeliveryButtons(claimed, true),
+    allowedMentions: noMentions,
+  });
 }
 
 export async function handleUniformAssistanceModal(interaction: ModalSubmitInteraction): Promise<void> {

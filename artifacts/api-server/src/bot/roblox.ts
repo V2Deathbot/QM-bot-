@@ -11,6 +11,20 @@ export class RobloxUserNotFoundError extends Error {
   }
 }
 
+export class RobloxInventoryPrivateError extends Error {
+  constructor() {
+    super("The customer's Roblox inventory is private, so ownership cannot be verified automatically.");
+    this.name = "RobloxInventoryPrivateError";
+  }
+}
+
+export class RobloxOwnershipUnavailableError extends Error {
+  constructor() {
+    super("Roblox ownership verification is temporarily unavailable.");
+    this.name = "RobloxOwnershipUnavailableError";
+  }
+}
+
 interface RobloxUserLookupResponse {
   data?: Array<RobloxUser>;
 }
@@ -93,6 +107,53 @@ export async function findRobloxUserById(id: number): Promise<RobloxUser> {
         ? candidate.displayName
         : candidate.name!,
   };
+}
+
+export async function ownsRobloxAsset(
+  userId: number,
+  assetId: number,
+): Promise<boolean> {
+  if (!isPositiveSafeInteger(userId) || !isPositiveSafeInteger(assetId)) {
+    throw new Error("Roblox ownership checks require valid user and asset IDs.");
+  }
+
+  const url =
+    `https://inventory.roblox.com/v1/users/${userId}/items/Asset/${assetId}/is-owned`;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+      if (response.status === 403) throw new RobloxInventoryPrivateError();
+      if (response.status === 429 || response.status >= 500) {
+        if (attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, attempt * 300));
+          continue;
+        }
+        throw new RobloxOwnershipUnavailableError();
+      }
+      if (!response.ok) {
+        throw new Error(`Roblox ownership verification failed (${response.status}).`);
+      }
+      const owned = (await response.json()) as unknown;
+      if (typeof owned !== "boolean") {
+        throw new RobloxOwnershipUnavailableError();
+      }
+      return owned;
+    } catch (error) {
+      if (error instanceof RobloxInventoryPrivateError) throw error;
+      if (
+        error instanceof Error &&
+        /^Roblox ownership verification failed \(\d+\)\.$/.test(error.message)
+      ) {
+        throw error;
+      }
+      if (attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 300));
+        continue;
+      }
+      throw new RobloxOwnershipUnavailableError();
+    }
+  }
+  throw new RobloxOwnershipUnavailableError();
 }
 
 export function getRobloxGroupUrl(groupId: string): string {
