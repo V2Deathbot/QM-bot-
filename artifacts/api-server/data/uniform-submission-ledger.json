@@ -1,3 +1,22 @@
 {
-  "entries": []
+  "entries": [
+    {
+      "key": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E\u00001549252701580300298",
+      "destination": "1UYmdCrOA9VkIZfmllBfUbzIfCi-nqnstUcTYLxt9h98\u0000Uniform Logging\u0000A2:E",
+      "submissionId": "1549252701580300298",
+      "targetRange": "A2:E2",
+      "values": [
+        [
+          "26138z",
+          "26138z",
+          "26138z",
+          "26138z",
+          "https://www.roblox.com/catalog/696969"
+        ]
+      ],
+      "state": "written",
+      "notified": true,
+      "createdAt": "2026-09-15T02:57:09.110Z"
+    }
+  ]
 }
