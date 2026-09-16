@@ -9,6 +9,11 @@ export interface FaqMatch {
   answer: string;
 }
 
+const questionOpeners = new Set([
+  "are", "can", "could", "do", "does", "how", "is", "may", "should",
+  "what", "when", "where", "which", "who", "why", "will", "would",
+]);
+
 export function normalizeFaqText(value: string): string {
   return value
     .normalize("NFKC")
@@ -18,6 +23,13 @@ export function normalizeFaqText(value: string): string {
     .replace(/[^\p{Letter}\p{Number}]+/gu, " ")
     .trim()
     .replace(/\s+/g, " ");
+}
+
+function looksLikeQuestion(input: string, normalized: string): boolean {
+  const tokens = normalized.split(" ");
+  if (tokens.length > 32) return false;
+  if (/\b(?:not asking|dont ask|do not ask|stop asking)\b/.test(normalized)) return false;
+  return input.includes("?") || questionOpeners.has(tokens[0] ?? "");
 }
 
 interface FaqEntry {
@@ -152,6 +164,7 @@ export function matchFaqQuestion(input: string): FaqMatch | undefined {
   if (typeof input !== "string") return undefined;
   const normalized = normalizeFaqText(input);
   if (!normalized) return undefined;
+  if (!looksLikeQuestion(input, normalized)) return undefined;
   const tokens = new Set(normalized.split(" "));
   const matches = faqEntries.flatMap((entry) => {
     const phrase = entry.phrases.some((candidate) => phraseMatches(normalized, candidate));
@@ -167,6 +180,37 @@ export function matchFaqQuestion(input: string): FaqMatch | undefined {
 
 export function answerFaq(input: string): string | undefined {
   return matchFaqQuestion(input)?.answer;
+}
+
+export interface FaqReplyAttempt {
+  guildId: string;
+  channelId: string;
+  userId: string;
+  faqId: string;
+}
+
+/** In-memory spam guard. Restarts safely clear cooldowns but never stored settings. */
+export class FaqReplyLimiter {
+  private readonly lastByChannel = new Map<string, number>();
+  private readonly lastByUser = new Map<string, number>();
+  private readonly lastFaqByChannel = new Map<string, number>();
+
+  claim(attempt: FaqReplyAttempt, now = Date.now()): boolean {
+    const channelKey = `${attempt.guildId}:${attempt.channelId}`;
+    const userKey = `${attempt.guildId}:${attempt.userId}`;
+    const faqKey = `${channelKey}:${attempt.faqId}`;
+    if (
+      now - (this.lastByChannel.get(channelKey) ?? -Infinity) < 15_000 ||
+      now - (this.lastByUser.get(userKey) ?? -Infinity) < 60_000 ||
+      now - (this.lastFaqByChannel.get(faqKey) ?? -Infinity) < 120_000
+    ) {
+      return false;
+    }
+    this.lastByChannel.set(channelKey, now);
+    this.lastByUser.set(userKey, now);
+    this.lastFaqByChannel.set(faqKey, now);
+    return true;
+  }
 }
 
 // Small aliases make the pure module convenient for callers and focused tests.

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { answerFaq, matchFaqQuestion, normalizeFaqText } from "../src/bot/faq.ts";
+import { answerFaq, FaqReplyLimiter, matchFaqQuestion, normalizeFaqText } from "../src/bot/faq.ts";
 import {
   automaticAnswerChannelIdsFor,
   validateGuildSettingsDocument,
@@ -20,7 +20,19 @@ test("FAQ answers only a strong known question and stays silent when unsure", ()
   assert.equal(answerFaq("Can someone help me?"), undefined);
   assert.equal(answerFaq("How long does this take?"), undefined);
   assert.equal(answerFaq("I bought something and have a problem"), undefined);
+  assert.equal(answerFaq("Please stop discussing blue pants here"), undefined);
+  assert.equal(answerFaq("I am not asking how to become a quartermaster"), undefined);
   assert.equal(matchFaqQuestion("ticket"), undefined);
+});
+
+test("FAQ cooldowns suppress channel, user, and duplicate-answer bursts", () => {
+  const limiter = new FaqReplyLimiter();
+  const attempt = { guildId: "guild", channelId: "channel", userId: "user", faqId: "ticket-order" };
+  assert.equal(limiter.claim(attempt, 1_000_000), true);
+  assert.equal(limiter.claim({ ...attempt, userId: "other", faqId: "check-awards" }, 1_010_000), false);
+  assert.equal(limiter.claim({ ...attempt, channelId: "other-channel", faqId: "check-awards" }, 1_020_000), false);
+  assert.equal(limiter.claim({ ...attempt, userId: "other", faqId: "ticket-order" }, 1_070_000), false);
+  assert.equal(limiter.claim({ ...attempt, userId: "other", faqId: "ticket-order" }, 1_121_000), true);
 });
 
 test("automatic answer setup accepts legacy absence and rejects unsafe shapes", () => {

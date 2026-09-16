@@ -100,7 +100,7 @@ import {
   type CommandPermissionName,
   type GuildSetup,
 } from "./setup-store";
-import { answerFaq } from "./faq";
+import { FaqReplyLimiter, matchFaqQuestion } from "./faq";
 import {
   administratorInEscalationWindow,
   getSecurityState,
@@ -170,6 +170,8 @@ const settingsCommand = new SlashCommandBuilder()
 const payoutCommand = new SlashCommandBuilder()
   .setName("payout")
   .setDescription("Preview and confirm the current uniform payout reset.");
+
+const faqReplyLimiter = new FaqReplyLimiter();
 
 const moderationCommands = [
   new SlashCommandBuilder()
@@ -2410,6 +2412,15 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
       if (!channel || channel.guild?.id !== guild.id ||
           (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement)) {
         throw new Error("Automatic answers can use only text or announcement channels in this server.");
+      }
+      const botMember = guild.members.me;
+      const permissions = botMember && channel.permissionsFor(botMember);
+      if (!permissions?.has([
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+      ])) {
+        throw new Error("Quartermaster needs View Channel, Send Messages, and Read Message History in every automatic-answer channel.");
       }
     }
     let oldChannels: string[] = [];
@@ -5481,10 +5492,15 @@ async function connectDiscord(): Promise<void> {
       const setup = await getGuildSetup(message.guildId);
       if (!setup || !automaticAnswerChannelIdsFor(setup).includes(message.channelId)) return;
       if (await maintenanceActive(message.guildId)) return;
-      const answer = answerFaq(message.content);
-      if (!answer) return;
+      const match = matchFaqQuestion(message.content);
+      if (!match || !faqReplyLimiter.claim({
+        guildId: message.guildId,
+        channelId: message.channelId,
+        userId: message.author.id,
+        faqId: match.id,
+      })) return;
       await message.reply({
-        content: answer,
+        content: match.answer,
         allowedMentions: { parse: [], repliedUser: false },
       });
     })().catch((error) => {
