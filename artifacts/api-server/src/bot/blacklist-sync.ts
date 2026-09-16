@@ -1,5 +1,5 @@
 import type { Collection, Guild, GuildMember } from "discord.js";
-import { fetchGuildMembers } from "./guild-members";
+import { fetchGuildMembers, GuildMemberListError } from "./guild-members";
 import { logger } from "../lib/logger";
 import {
   fetchBlacklistIndex,
@@ -1115,11 +1115,23 @@ async function synchronizeBlacklistsUnlocked(
       }
       return getBlacklistSyncStatus();
     } catch (error) {
-      const failure = error as { name?: unknown; code?: unknown; stack?: unknown };
+      const failure = error as {
+        name?: unknown;
+        code?: unknown;
+        stack?: unknown;
+        status?: unknown;
+        method?: unknown;
+        path?: unknown;
+        message?: unknown;
+      };
+      const memberListFailure = error instanceof GuildMemberListError;
       logger.error({
         stage,
         errorType: typeof failure?.name === "string" ? failure.name : "Unknown",
         code: typeof failure?.code === "number" ? failure.code : undefined,
+        discordStatus: memberListFailure ? failure.status : undefined,
+        discordMethod: memberListFailure ? failure.method : undefined,
+        discordPath: memberListFailure ? failure.path : undefined,
         frames: typeof failure?.stack === "string"
           ? failure.stack.split("\n").filter((line) => /^\s+at .*\/src\/bot\//.test(line)).slice(0, 4)
           : [],
@@ -1138,8 +1150,9 @@ async function synchronizeBlacklistsUnlocked(
           [
             {
               name: "Result",
-              value:
-                "No complete synchronization result was produced. The next scheduled scan will retry.",
+              value: memberListFailure && typeof failure.message === "string"
+                ? failure.message
+                : "No complete synchronization result was produced. The next scheduled scan will retry.",
             },
           ],
           true,
