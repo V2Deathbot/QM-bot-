@@ -18,10 +18,11 @@ const {
   saveUniformSpreadsheetSettings, uniformCommands, uniformSheetRows,
   UniformDeliveryRecoveryError, uniformDeliveryRecoveryResponse, validateUniformSettings,
 } = await import("../src/bot/uniforms.ts");
+const { getRobloxGroupUrl } = await import("../src/bot/roblox.ts");
 const { setGoogleSheetsProxyForTests, resetGoogleSheetsProxyForTests } =
   await import("../src/bot/google-sheets.ts");
 const {
-  claimUniformDeliveryAction, getUniformDelivery, recoverLegacyNonceRejectedDelivery, resetUniformDeliveryStoreForTests,
+  claimUniformDeliveryAction, claimUniformDeliveryStage, getUniformDelivery, recoverLegacyNonceRejectedDelivery, resetUniformDeliveryStoreForTests,
   saveUniformDelivery, uniformDiscordNonce,
 } = await import("../src/bot/uniform-delivery-store.ts");
 const { getGuildSetup, saveGuildSetup, defaultUniformSettings } =
@@ -215,6 +216,13 @@ test("registers username inputs in the requested order", () => {
   }
   assert.equal(uniformCommands[0]!.toJSON().options?.[5]?.name, "channel");
   assert.equal(uniformCommands[1]!.toJSON().options?.[4]?.name, "channel");
+});
+
+test("rejects invalid Roblox group identifiers before constructing a provider URL", () => {
+  assert.equal(getRobloxGroupUrl("123"), "https://www.roblox.com/communities/123");
+  assert.throws(() => getRobloxGroupUrl("0"), /positive safe integer/i);
+  assert.throws(() => getRobloxGroupUrl("9007199254740992"), /positive safe integer/i);
+  assert.throws(() => getRobloxGroupUrl("123/../../private"), /positive safe integer/i);
 });
 
 test("maps /log and /moderated values to only their visible worksheet columns", () => {
@@ -762,6 +770,47 @@ test("atomically rejects an old customer message action after relog revision cha
   );
   assert.equal((await getUniformDelivery("relog-cas"))?.action, undefined);
   assert.equal(sends.length, 0);
+});
+
+test("atomically allows only one concurrent customer outcome claim", async () => {
+  await saveUniformDelivery({
+    submissionId: "concurrent-action", guildId: guild.id, command: "log", actorId: "submitter",
+    customerId: "customer-discord", seqmId: "seqm-discord", destinationChannelId: "customer-channel",
+    uploadLogChannelId: "log", spreadsheet: setup.uniforms!.spreadsheet!, rows: [],
+    sheetState: "saved", customerName: "Customer", customerRobloxId: 4,
+    assets: [{ id: 102, url: "https://www.roblox.com/catalog/102" }],
+    logNoticeState: "sent", customerDeliveryState: "sent", customerMessageId: "concurrent-message",
+    createdAt: new Date().toISOString(),
+  });
+  const outcomes = await Promise.allSettled([
+    claimUniformDeliveryAction("concurrent-action", "purchased", undefined, {
+      customerMessageId: "concurrent-message", customerMessageRevision: 0,
+    }),
+    claimUniformDeliveryAction("concurrent-action", "purchased", undefined, {
+      customerMessageId: "concurrent-message", customerMessageRevision: 0,
+    }),
+  ]);
+  assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
+  assert.equal(outcomes.filter((outcome) => outcome.status === "rejected").length, 1);
+  assert.equal((await getUniformDelivery("concurrent-action"))?.action?.state, "claimed");
+});
+
+test("atomically claims each Discord delivery outbox once", async () => {
+  await saveUniformDelivery({
+    submissionId: "concurrent-delivery", guildId: guild.id, command: "log", actorId: "submitter",
+    customerId: "customer-discord", seqmId: "seqm-discord", destinationChannelId: "customer-channel",
+    uploadLogChannelId: "log", spreadsheet: setup.uniforms!.spreadsheet!, rows: [],
+    sheetState: "saved", customerName: "Customer", customerRobloxId: 4,
+    assets: [{ id: 103, url: "https://www.roblox.com/catalog/103" }],
+    logNoticeState: "pending", customerDeliveryState: "pending", createdAt: new Date().toISOString(),
+  });
+  const outcomes = await Promise.allSettled([
+    claimUniformDeliveryStage("concurrent-delivery", "customerDelivery"),
+    claimUniformDeliveryStage("concurrent-delivery", "customerDelivery"),
+  ]);
+  assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
+  assert.equal(outcomes.filter((outcome) => outcome.status === "rejected").length, 1);
+  assert.equal((await getUniformDelivery("concurrent-delivery"))?.customerDeliveryState, "claimed");
 });
 
 test("moderated assistance opens an initial modal and posts an escaped request without a SEQM ping", async () => {

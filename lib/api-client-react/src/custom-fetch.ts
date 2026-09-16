@@ -26,7 +26,33 @@ let _authTokenGetter: AuthTokenGetter | null = null;
  * Pass `null` to clear the base URL.
  */
 export function setBaseUrl(url: string | null): void {
-  _baseUrl = url ? url.replace(/\/+$/, "") : null;
+  if (!url) {
+    _baseUrl = null;
+    return;
+  }
+
+  const normalized = url.trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new TypeError("setBaseUrl requires an absolute HTTP(S) URL.");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new TypeError("setBaseUrl requires an absolute HTTP(S) URL.");
+  }
+  if (
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new TypeError(
+      "setBaseUrl requires an HTTP(S) URL without credentials, query, or hash.",
+    );
+  }
+
+  _baseUrl = normalized.replace(/\/+$/, "");
 }
 
 /**
@@ -76,6 +102,40 @@ function resolveUrl(input: RequestInfo | URL): string {
   if (typeof input === "string") return input;
   if (isUrl(input)) return input.toString();
   return input.url;
+}
+
+/**
+ * Bearer tokens belong only to the configured API origin.  A custom fetch
+ * mutator is often shared by code that also fetches user-supplied or
+ * third-party URLs; attaching the application token to those requests would
+ * disclose it to that origin.
+ *
+ * Resolve the URL exactly as the fetch caller will.  In particular, strings
+ * such as `//attacker.example` and backslash variants are network-path
+ * references in browsers and must not be trusted merely because they begin
+ * with `/`.
+ */
+function isTrustedAuthTarget(input: RequestInfo | URL): boolean {
+  const rawUrl = resolveUrl(input);
+  const browserBaseUrl =
+    typeof location === "undefined" ? undefined : location.href;
+  const resolutionBase = browserBaseUrl ?? (_baseUrl ? `${_baseUrl}/` : undefined);
+
+  try {
+    const target = new URL(rawUrl, resolutionBase);
+    const trustedOrigin = _baseUrl
+      ? new URL(_baseUrl).origin
+      : browserBaseUrl
+        ? new URL(browserBaseUrl).origin
+        : null;
+    return (
+      trustedOrigin !== null &&
+      trustedOrigin !== "null" &&
+      target.origin === trustedOrigin
+    );
+  } catch {
+    return false;
+  }
 }
 
 function mergeHeaders(...sources: Array<HeadersInit | undefined>): Headers {
@@ -351,7 +411,11 @@ export async function customFetch<T = unknown>(
 
   // Attach bearer token when an auth getter is configured and no
   // Authorization header has been explicitly provided.
-  if (_authTokenGetter && !headers.has("authorization")) {
+  if (
+    _authTokenGetter &&
+    !headers.has("authorization") &&
+    isTrustedAuthTarget(input)
+  ) {
     const token = await _authTokenGetter();
     if (token) {
       headers.set("authorization", `Bearer ${token}`);

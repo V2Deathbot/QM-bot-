@@ -21,6 +21,29 @@ type ChartContextProps = {
 
 const ChartContext = React.createContext<ChartContextProps | null>(null)
 
+function safeCssIdentifier(value: string, fallback: string): string {
+  const safe = value.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 64)
+  return safe || fallback
+}
+
+function safeCssColor(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null
+  }
+
+  const color = value.trim()
+  if (
+    color.length > 128 ||
+    /[<>{}"'`;\\]/.test(color) ||
+    !/^(?:#[0-9a-f]{3,8}|[a-z][a-z0-9-]{0,31}|(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color-mix)\([a-z0-9#%,.\s+/%-]+\)|var\(--[a-z0-9_-]{1,64}\))$/i.test(
+      color,
+    )
+  ) {
+    return null
+  }
+  return color
+}
+
 function useChart() {
   const context = React.useContext(ChartContext)
 
@@ -41,7 +64,7 @@ const ChartContainer = React.forwardRef<
   }
 >(({ id, className, children, config, ...props }, ref) => {
   const uniqueId = React.useId()
-  const chartId = `chart-${id || uniqueId.replace(/:/g, "")}`
+  const chartId = `chart-${safeCssIdentifier(id || uniqueId, "chart")}`
 
   return (
     <ChartContext.Provider value={{ config }}>
@@ -74,26 +97,25 @@ const ChartStyle = ({ id, config }: { id: string; config: ChartConfig }) => {
   }
 
   return (
-    <style
-      dangerouslySetInnerHTML={{
-        __html: Object.entries(THEMES)
-          .map(
-            ([theme, prefix]) => `
+    <style>{Object.entries(THEMES)
+      .map(
+        ([theme, prefix]) => `
 ${prefix} [data-chart=${id}] {
 ${colorConfig
   .map(([key, itemConfig]) => {
     const color =
       itemConfig.theme?.[theme as keyof typeof itemConfig.theme] ||
       itemConfig.color
-    return color ? `  --color-${key}: ${color};` : null
+    const safeColor = safeCssColor(color)
+    return safeColor
+      ? `  --color-${safeCssIdentifier(key, "value")}: ${safeColor};`
+      : null
   })
   .join("\n")}
 }
 `
-          )
-          .join("\n"),
-      }}
-    />
+      )
+      .join("\n")}</style>
   )
 }
 

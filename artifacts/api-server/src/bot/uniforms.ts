@@ -47,6 +47,7 @@ import {
   findUniformDeliveriesForChannel,
   findLegacyNonceRejectedDelivery,
   recoverLegacyNonceRejectedDelivery,
+  claimUniformDeliveryStage,
   saveUniformDelivery,
   uniformDiscordNonce,
   updateUniformDelivery,
@@ -1579,7 +1580,7 @@ async function sendPendingDelivery(
     throw new Error("A prior Discord delivery attempt is unresolved. No duplicate message will be sent; an administrator must verify the recorded channel.");
   }
   if (current.logNoticeState !== "sent") {
-    current = await updateUniformDelivery(record.submissionId, (item) => { item.logNoticeState = "claimed"; });
+    current = await claimUniformDeliveryStage(record.submissionId, "logNotice");
     let notice: unknown;
     try {
       notice = await logChannel.send({
@@ -1608,7 +1609,7 @@ async function sendPendingDelivery(
     }
   }
   if (current.customerDeliveryState !== "sent") {
-    current = await updateUniformDelivery(record.submissionId, (item) => { item.customerDeliveryState = "claimed"; });
+    current = await claimUniformDeliveryStage(record.submissionId, "customerDelivery");
     let message: unknown;
     try {
       message = await destination.send({

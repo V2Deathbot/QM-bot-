@@ -727,6 +727,7 @@ const originalFetch = globalThis.fetch;
       value: {
         id: "security-bot",
         tag: "security-bot#0000",
+        setPresence: () => undefined,
       },
     });
     queueMicrotask(() => this.emit(Events.ClientReady, this));
@@ -1279,6 +1280,43 @@ test("setup unlock always presents and requires a confirmation, even if normal c
   client!.emit("interactionCreate", confirmation);
   await settle();
   assert.equal((await getSecurityState(guild.id)).lockdown.active, false);
+});
+
+test("a settings grant cannot trigger emergency lockdown without current Administrator permission", async () => {
+  await setSecurity({});
+  const setupStore = await import("../src/bot/setup-store.ts");
+  const current = await setupStore.getGuildSetup(guild.id);
+  assert.ok(current);
+  const grantedUser = "12345678901234573";
+  members.set(grantedUser, { administrator: false });
+  await saveGuildSetup({
+    ...current!,
+    commandPermissions: {
+      settings: { roleIds: [], memberIds: [grantedUser] },
+    },
+  });
+
+  try {
+    const { root } = await openSettings(grantedUser);
+    const global = await chooseSettingsCategory(grantedUser, root, "global");
+    const security = await chooseSettingsAction(grantedUser, global, "setup:security");
+    const lockdown = button(
+      grantedUser,
+      renderedButton(latestComponentPayload(security), "Lockdown Settings"),
+    );
+    await dispatchRaw(lockdown);
+    const lockNow = renderedButton(latestComponentPayload(lockdown), "Lock Down Now");
+    await dispatchRaw(button(grantedUser, lockNow));
+
+    assert.equal(
+      (await getSecurityState(guild.id)).lockdown.active,
+      false,
+      "settings grants must not mutate emergency security state",
+    );
+    assert.match(replies.at(-1) ?? "", /current Discord Administrator/i);
+  } finally {
+    members.delete(grantedUser);
+  }
 });
 
 test("a confirmation remains bound to its original member when usernames change before confirmation", async () => {

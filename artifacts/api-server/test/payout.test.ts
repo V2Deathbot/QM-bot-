@@ -81,6 +81,9 @@ test("payout parser validates source schema and aggregates case-insensitive role
   const formulaError = source();
   formulaError[3]![2] = "#REF!";
   assert.throws(() => summarizePayoutSource(formulaError), /finite.*numeric/i);
+  const malformedLabel = source();
+  malformedLabel[0]![0] = "Grand Total Due: 1e9";
+  assert.throws(() => summarizePayoutSource(malformedLabel), /invalid total/i);
 });
 
 test("payout reporting chunks whole lines without truncating them", () => {

@@ -248,11 +248,39 @@ export async function claimUniformDeliveryAction(
     // begins. Do not let an already-open old button interleave an action with
     // that replacement.
     if (record.relog && record.relog.state !== "sent") return;
-    if (record.terminal || record.action) return;
+    // This callback runs inside the persistent-store transaction.  Returning
+    // the existing record here made two concurrent customer clicks both look
+    // like the caller had won the claim, so both could perform the irreversible
+    // Sold/Discord work.  A competing claim must fail without changing the
+    // durable record.
+    if (record.terminal || record.action) {
+      throw new Error("This customer outcome is already claimed or unresolved. It will not be sent again automatically.");
+    }
     record.action = {
       kind, ...(reason ? { reason } : {}), state: "claimed",
       nonce: uniformDiscordNonce(kind, record.submissionId),
     };
+  });
+}
+
+/**
+ * Atomically claims one Discord delivery outbox.  The caller must persist the
+ * claim before contacting Discord; a concurrent retry therefore observes a
+ * non-pending state and cannot issue a second message.
+ */
+export async function claimUniformDeliveryStage(
+  submissionId: string,
+  stage: "logNotice" | "customerDelivery",
+): Promise<UniformDeliveryRecord> {
+  return updateUniformDelivery(submissionId, (record) => {
+    const state = stage === "logNotice"
+      ? record.logNoticeState
+      : record.customerDeliveryState;
+    if (state !== "pending") {
+      throw new Error("This Discord delivery is already claimed or unresolved. No duplicate message will be sent.");
+    }
+    if (stage === "logNotice") record.logNoticeState = "claimed";
+    else record.customerDeliveryState = "claimed";
   });
 }
 

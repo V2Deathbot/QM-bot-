@@ -33,12 +33,40 @@ function isPositiveSafeInteger(value: number): boolean {
   return Number.isSafeInteger(value) && value > 0;
 }
 
+function isSafeRobloxText(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= 50 &&
+    !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function validatedRobloxUser(value: unknown): RobloxUser | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Partial<RobloxUser>;
+  if (!isPositiveSafeInteger(candidate.id as number) ||
+      !isSafeRobloxText(candidate.name)) {
+    return undefined;
+  }
+  const displayName = isSafeRobloxText(candidate.displayName)
+    ? candidate.displayName
+    : candidate.name;
+  return {
+    id: candidate.id!,
+    name: candidate.name,
+    displayName,
+  };
+}
+
 export async function findRobloxUser(username: string): Promise<RobloxUser> {
+  const requested = username.trim();
+  if (!isSafeRobloxText(requested)) {
+    throw new Error("The Roblox username must be a non-empty printable value.");
+  }
   const response = await fetch("https://users.roblox.com/v1/usernames/users", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      usernames: [username.trim()],
+      usernames: [requested],
       excludeBannedUsers: false,
     }),
   });
@@ -47,11 +75,20 @@ export async function findRobloxUser(username: string): Promise<RobloxUser> {
     throw new Error(`Roblox user lookup failed (${response.status}).`);
   }
 
-  const payload = (await response.json()) as RobloxUserLookupResponse;
-  const user = payload.data?.[0];
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error("Roblox user lookup returned an invalid response.");
+  }
+  const data = payload && typeof payload === "object" &&
+    Array.isArray((payload as RobloxUserLookupResponse).data)
+    ? (payload as RobloxUserLookupResponse).data
+    : undefined;
+  const user = validatedRobloxUser(data?.[0]);
 
   if (!user) {
-    throw new Error(`No Roblox user was found for "${username}".`);
+    throw new Error(`No Roblox user was found for "${requested}".`);
   }
 
   return user;
@@ -87,25 +124,15 @@ export async function findRobloxUserById(id: number): Promise<RobloxUser> {
     throw new Error("Roblox user lookup returned an invalid response.");
   }
 
-  if (
-    !user ||
-    typeof user !== "object" ||
-    !isPositiveSafeInteger((user as { id?: unknown }).id as number) ||
-    (user as { id: number }).id !== id ||
-    typeof (user as { name?: unknown }).name !== "string" ||
-    !(user as { name: string }).name.trim()
-  ) {
+  const candidate = validatedRobloxUser(user);
+  if (!candidate || candidate.id !== id) {
     throw new Error("Roblox user lookup returned an invalid response.");
   }
 
-  const candidate = user as Partial<RobloxUser>;
   return {
     id,
-    name: candidate.name!,
-    displayName:
-      typeof candidate.displayName === "string"
-        ? candidate.displayName
-        : candidate.name!,
+    name: candidate.name,
+    displayName: candidate.displayName,
   };
 }
 
@@ -157,9 +184,11 @@ export async function ownsRobloxAsset(
 }
 
 export function getRobloxGroupUrl(groupId: string): string {
-  if (!/^\d+$/.test(groupId.trim())) {
-    throw new Error("The Roblox group id must contain only numbers.");
+  const normalized = groupId.trim();
+  if (!/^\d+$/.test(normalized) ||
+      !isPositiveSafeInteger(Number(normalized))) {
+    throw new Error("The Roblox group id must be a positive safe integer.");
   }
 
-  return `https://www.roblox.com/communities/${groupId.trim()}`;
+  return `https://www.roblox.com/communities/${normalized}`;
 }

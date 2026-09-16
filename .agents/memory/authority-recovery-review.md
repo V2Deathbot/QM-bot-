@@ -14,3 +14,9 @@ Provider recovery must work independently of Discord membership; destructive con
 **Why:** Nonmember support exposed recovery that only ran after a member joined and confirmations that silently selected a replacement card. Happy-path tests did not reveal either gap.
 
 **How to apply:** Test failed provider writes while the target remains absent through subsequent polls, and replacement records between confirmation and execution. For shared Discord identities, test overlapping restrictions and final-revocation role restoration.
+
+Do not use clean automated security scans as a substitute for reviewing interactive authorization and URL parsing.
+
+**Why:** A full scan reported no findings while manual review found a settings-component permission bypass and a bearer-token origin check that missed browser-normalized network-path URLs.
+
+**How to apply:** Review component actions independently of slash-command gates, and test credential forwarding with protocol-relative and backslash URL variants, not only ordinary absolute URLs.

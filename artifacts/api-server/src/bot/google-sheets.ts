@@ -154,6 +154,11 @@ interface DataRange {
   endRow?: number;
   normalized: string;
 }
+// Google Sheets currently caps a grid at 10 million rows and 18,278 columns.
+// Applying the same finite bounds to settings and persisted targets prevents a
+// malformed A1 value from becoming an unbounded provider request.
+const MAX_SHEET_ROW = 10_000_000;
+const MAX_SHEET_COLUMN = 18_278;
 function columnNumber(letters: string): number {
   return [...letters].reduce((number, letter) => number * 26 + letter.charCodeAt(0) - 64, 0);
 }
@@ -182,6 +187,12 @@ export function normalizeUniformDataRange(input: string | undefined, width: numb
   const endColumn = columnNumber(match[3]!);
   const startRow = Number(match[2]!);
   const endRow = match[4] ? Number(match[4]) : undefined;
+  if (!Number.isSafeInteger(startColumn) || !Number.isSafeInteger(endColumn) ||
+      startColumn > MAX_SHEET_COLUMN || endColumn > MAX_SHEET_COLUMN ||
+      !Number.isSafeInteger(startRow) || startRow > MAX_SHEET_ROW ||
+      (endRow !== undefined && (!Number.isSafeInteger(endRow) || endRow > MAX_SHEET_ROW))) {
+    throw new Error(`${label} is outside the Google Sheets grid limits.`);
+  }
   if (endColumn - startColumn + 1 !== width || endColumn < startColumn) {
     throw new Error(`${label} must be exactly ${width} columns wide.`);
   }
@@ -191,11 +202,21 @@ export function normalizeUniformDataRange(input: string | undefined, width: numb
 }
 function parseDataRange(value: string): DataRange {
   const match = /^([A-Z]+)([1-9]\d*):([A-Z]+)([1-9]\d*)?$/.exec(value)!;
+  const startColumn = columnNumber(match[1]!);
+  const endColumn = columnNumber(match[3]!);
+  const startRow = Number(match[2]!);
+  const endRow = match[4] ? Number(match[4]) : undefined;
+  if (!Number.isSafeInteger(startColumn) || !Number.isSafeInteger(endColumn) ||
+      startColumn > MAX_SHEET_COLUMN || endColumn > MAX_SHEET_COLUMN ||
+      !Number.isSafeInteger(startRow) || startRow > MAX_SHEET_ROW ||
+      (endRow !== undefined && (!Number.isSafeInteger(endRow) || endRow > MAX_SHEET_ROW))) {
+    throw new Error("The configured spreadsheet range is outside the Google Sheets grid limits.");
+  }
   return {
-    startColumn: columnNumber(match[1]!),
-    endColumn: columnNumber(match[3]!),
-    startRow: Number(match[2]!),
-    endRow: match[4] ? Number(match[4]) : undefined,
+    startColumn,
+    endColumn,
+    startRow,
+    endRow,
     normalized: value,
   };
 }
@@ -248,9 +269,12 @@ export async function getPayoutSheetGrids(spreadsheetId: string): Promise<Payout
     const title = properties?.title;
     const rowCount = properties?.gridProperties?.rowCount;
     const columnCount = properties?.gridProperties?.columnCount;
-    if (typeof title !== "string" || typeof sheetId !== "number" || !Number.isInteger(sheetId) ||
-        typeof rowCount !== "number" || !Number.isInteger(rowCount) ||
-        typeof columnCount !== "number" || !Number.isInteger(columnCount)) return [];
+    if (typeof title !== "string" || !title.trim() ||
+        typeof sheetId !== "number" || !Number.isSafeInteger(sheetId) || sheetId < 0 ||
+        typeof rowCount !== "number" || !Number.isSafeInteger(rowCount) ||
+        rowCount < 0 || rowCount > MAX_SHEET_ROW ||
+        typeof columnCount !== "number" || !Number.isSafeInteger(columnCount) ||
+        columnCount < 0 || columnCount > MAX_SHEET_COLUMN) return [];
     return [{
       title,
       sheetId,
@@ -434,9 +458,16 @@ function destinationFor(config: SpreadsheetValidationResult, kind: "log" | "mode
 function recordKey(destination: string, submissionId: string): string { return `${destination}\u0000${submissionId}`; }
 function nonempty(cell: unknown): boolean { return String(cell ?? "").trim() !== ""; }
 function equalsValues(actual: unknown[][], expected: string[][]): boolean {
-  return expected.every((row, rowIndex) => row.every(
-    (cell, columnIndex) => String(actual[rowIndex]?.[columnIndex] ?? "") === cell,
-  ));
+  // The Values API omits trailing empty cells.  Treating a missing row/cell as
+  // an empty string would therefore "verify" an uncertain write when the
+  // provider returned no data at all.  Uniform rows are fully populated, so a
+  // reservation is only committed after an exact rectangular match.
+  return actual.length === expected.length &&
+    expected.every((row, rowIndex) =>
+      Array.isArray(actual[rowIndex]) &&
+      actual[rowIndex]!.length === row.length &&
+      row.every((cell, columnIndex) => String(actual[rowIndex]![columnIndex]) === cell),
+    );
 }
 async function readRange(spreadsheetId: string, tab: string, range: string): Promise<unknown[][]> {
   const output = await jsonResponse<ValuesResponse>(

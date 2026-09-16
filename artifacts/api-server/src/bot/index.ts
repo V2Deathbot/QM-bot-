@@ -2592,6 +2592,10 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
     return;
   }
   if (id === "setup:lock-now") {
+    // Lockdown is an emergency state mutation, not a settings-only
+    // configuration change.  A settings grant may open the wizard, but it
+    // must not let a non-Administrator disable all destructive commands.
+    await requireCurrentAdministrator(guild, interaction.user.id, setup, "Setup control lockdown");
     const active = id === "setup:lock-now";
     await mutateSecurityState(guild.id, (state) => {
       state.lockdown = active

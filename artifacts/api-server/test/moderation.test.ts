@@ -1389,8 +1389,9 @@ test("keeps commands disabled after registration failure and enables them on ret
   (Client.prototype as unknown as {
     login: (token?: string) => Promise<string>;
   }).login = async function (this: Client) {
-    (this as unknown as { user: { tag: string } }).user = {
+    (this as unknown as { user: { tag: string; setPresence: () => void } }).user = {
       tag: "test-bot#0000",
+      setPresence: () => undefined,
     };
     this.emit(Events.ClientReady, this);
     return "test-discord-token";

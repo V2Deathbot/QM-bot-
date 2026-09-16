@@ -36,7 +36,12 @@ function runImporter(sourceDir: string): Promise<{ code: number | null; output: 
       ["--filter", "@workspace/scripts", "run", "import-bot-data", "--", `--source-dir=${sourceDir}`, `--document-prefix=${prefix}`],
       {
         cwd: path.resolve(import.meta.dirname, "../.."),
-        env: { ...process.env, BOT_IMPORT_ENV: "development", BOT_IMPORT_TEST_MODE: "1" },
+        env: {
+          ...process.env,
+          BOT_IMPORT_ENV: "development",
+          BOT_IMPORT_TEST_MODE: "1",
+          NODE_ENV: "development",
+        },
         stdio: ["ignore", "pipe", "pipe"],
       },
     );

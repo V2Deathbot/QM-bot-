@@ -1,24 +1,21 @@
 import { Router, type IRouter } from "express";
-import { getConfigurationStatus } from "../bot/config";
-import { getBotStatus, getPublicBotStatus } from "../bot";
-import { checkTrelloReadiness } from "../bot/trello";
+import { getPublicBotStatus } from "../bot";
 
 const router: IRouter = Router();
 
 router.get("/bot/status/public", async (_req, res, next) => {
   try {
+    res.setHeader("Cache-Control", "no-store");
     res.json(await getPublicBotStatus());
   } catch (error) {
     next(error);
   }
 });
 
-router.get("/bot/status", async (_req, res) => {
-  const trello = await checkTrelloReadiness();
-  res.json({
-    ...getBotStatus(),
-    ...getConfigurationStatus(),
-    trello,
+router.get("/bot/status", (_req, res) => {
+  res.status(403).json({
+    error:
+      "Detailed diagnostics are available through the Discord administrator status command.",
   });
 });
 

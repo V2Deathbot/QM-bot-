@@ -126,7 +126,14 @@ export function parseGrandTotalLabel(value: unknown): number {
   if (typeof value !== "string") throw new Error("Payout Logging1 A1 must contain a Grand Total Due label.");
   const match = /^\s*grand\s*total\s*due\s*:\s*(.+?)\s*$/i.exec(value);
   if (!match) throw new Error('Payout Logging1 A1 must be labeled "Grand Total Due:".');
-  let number = match[1]!.trim().replace(/[^\d,.'\-\s]/g, "").replace(/[\s']/g, "");
+  const rawNumber = match[1]!.trim();
+  // Strip only known presentation characters.  Silently deleting arbitrary
+  // letters turns values such as "1e9" into "19", allowing a malformed or
+  // tampered total label to pass the role-total comparison.
+  if (!/^[\d,.'\-\s$€£¥₹]+$/.test(rawNumber)) {
+    throw new Error("Payout Logging1 A1 contains an invalid total.");
+  }
+  let number = rawNumber.replace(/[$€£¥₹]/g, "").replace(/[\s']/g, "");
   if (!number || /-/.test(number) && !/^-/.test(number)) throw new Error("Payout Logging1 A1 contains an invalid total.");
   const comma = number.lastIndexOf(",");
   const dot = number.lastIndexOf(".");

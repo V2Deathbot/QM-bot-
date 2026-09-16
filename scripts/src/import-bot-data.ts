@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  readFile,
+  realpath,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import { pool } from "../../lib/db/src/index.ts";
 import { validateGuildSettingsDocument } from "../../artifacts/api-server/src/bot/setup-store.ts";
@@ -50,9 +58,9 @@ function checksum(input: string): string {
 
 async function main(): Promise<void> {
   if (process.env["BOT_IMPORT_ENV"] !== "development" ||
-      process.env["NODE_ENV"] === "production" ||
+      process.env["NODE_ENV"] !== "development" ||
       process.env["REPLIT_DEPLOYMENT"] === "1") {
-    throw new Error("This importer is development-only. Set BOT_IMPORT_ENV=development; never run it in production.");
+    throw new Error("This importer is development-only. Set BOT_IMPORT_ENV=development and NODE_ENV=development; never run it in production.");
   }
   const sourceArgument = argument("--source-dir");
   if (!sourceArgument) {
@@ -149,15 +157,22 @@ async function main(): Promise<void> {
   // Backup only after every document has been committed and checksum-verified.
   // It is a copy, never a move; originals remain available for rollback review.
   const backupDir = path.join(source, ".import-backups", `${new Date().toISOString().replace(/[:.]/g, "-")}-${checksum(source).slice(0, 12)}`);
-  await mkdir(backupDir, { recursive: true });
-  await Promise.all(loaded.map(async (item) => copyFile(path.join(source, item.file), path.join(backupDir, item.file))));
-  await writeFile(path.join(backupDir, "manifest.json"), JSON.stringify(
+  await mkdir(backupDir, { recursive: true, mode: 0o700 });
+  await chmod(backupDir, 0o700);
+  await Promise.all(loaded.map(async (item) => {
+    const destination = path.join(backupDir, item.file);
+    await copyFile(path.join(source, item.file), destination);
+    await chmod(destination, 0o600);
+  }));
+  const manifestPath = path.join(backupDir, "manifest.json");
+  await writeFile(manifestPath, JSON.stringify(
     loaded.map(({ name, file, count, sourceChecksum }) => ({
       name, file, count, sourceChecksum,
     })),
     null,
     2,
   ));
+  await chmod(manifestPath, 0o600);
   for (const item of loaded) {
     // Counts and digests provide a non-sensitive audit trail; never print data.
     console.log(`${item.name}: count=${item.count} sha256=${item.sourceChecksum} verified`);

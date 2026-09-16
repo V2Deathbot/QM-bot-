@@ -45,6 +45,7 @@ test("normalizes spreadsheet URLs, quotes tabs, and validates user data rectangl
   assert.throws(() => normalizeUniformDataRange("A1:E", 5, "/log"), /below the header/i);
   assert.throws(() => normalizeUniformDataRange("A2:D", 5, "/log"), /exactly 5/i);
   assert.throws(() => normalizeUniformDataRange("Other!A2:E", 5, "/log"), /A1 rectangle/i);
+  assert.throws(() => normalizeUniformDataRange("A10000001:E", 5, "/log"), /grid limits/i);
   assert.equal(
     normalizeUniformSpreadsheetConfig({ ...base, createMissingTabs: true }).createMissingTabs,
     false,
@@ -204,6 +205,26 @@ test("verifies an unknown write response using its persisted reserved target wit
   });
   assert.deepEqual(result, { alreadyWritten: true, count: 0 });
   assert.equal(updateCalls, 1, "unknown responses are verified, not retried blindly");
+});
+
+test("does not verify a reservation when Sheets returns a truncated or missing rectangle", async () => {
+  let updateCalls = 0;
+  // Keep the intentionally unresolved reservation out of the shared test
+  // destination: later tests must still be able to allocate their first row.
+  const isolatedConfig = { ...base, logTab: "Missing Response Logs" };
+  setGoogleSheetsProxyForTests(async (_pathname, options) => {
+    if (options?.method === "GET") return response({ values: [] });
+    updateCalls++;
+    throw new Error("connector response timed out before the write was confirmed");
+  });
+  await assert.rejects(
+    appendUniformRows({
+      config: isolatedConfig, logKind: "log", submissionId: "missing-write-response",
+      rows: [["QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/10"]],
+    }),
+    /timed out before the write was confirmed/i,
+  );
+  assert.equal(updateCalls, 1);
 });
 
 test("replaces the exact ledger row link in place and marks only its real Sold F cells", async () => {
