@@ -5,10 +5,11 @@ import {
   hybridFaqVoicePrompt,
 } from "../src/bot/faq-ai.ts";
 
-test("hybrid FAQ voice is warm but keeps humor away from sensitive rules", () => {
-  assert.match(hybridFaqVoicePrompt, /warm, upbeat/i);
-  assert.match(hybridFaqVoicePrompt, /occasionally add one gentle Quartermaster-themed joke/i);
-  assert.match(hybridFaqVoicePrompt, /Never joke about the member, their rank, eligibility/i);
+test("hybrid FAQ voice permits playful sarcasm without changing official facts", () => {
+  assert.match(hybridFaqVoicePrompt, /confident, lively, funny/i);
+  assert.match(hybridFaqVoicePrompt, /light sarcasm, playful teasing, memes/i);
+  assert.match(hybridFaqVoicePrompt, /ranks, eligibility, mistakes, blacklists, moderation, and enforcement/i);
+  assert.match(hybridFaqVoicePrompt, /do not use slurs, threats, sexual content/i);
   assert.match(hybridFaqVoicePrompt, /Do not add requirements, prices, ranks/i);
 });
 
