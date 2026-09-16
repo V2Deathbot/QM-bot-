@@ -101,6 +101,7 @@ import {
   type GuildSetup,
 } from "./setup-store";
 import { FaqReplyLimiter, matchFaqQuestion } from "./faq";
+import { createHybridFaqAnswer } from "./faq-ai";
 import {
   administratorInEscalationWindow,
   getSecurityState,
@@ -5499,8 +5500,9 @@ async function connectDiscord(): Promise<void> {
         userId: message.author.id,
         faqId: match.id,
       })) return;
+      const answer = await createHybridFaqAnswer(message.content, match);
       await message.reply({
-        content: match.answer,
+        content: answer,
         allowedMentions: { parse: [], repliedUser: false },
       });
     })().catch((error) => {
