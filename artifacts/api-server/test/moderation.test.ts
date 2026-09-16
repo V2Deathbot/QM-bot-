@@ -134,10 +134,6 @@ async function requestBotEndpoint(
   }
 }
 
-async function requestBotStatus() {
-  return requestBotEndpoint("GET", "/api/bot/status");
-}
-
 async function requestBotRefresh() {
   const result = await refreshBot();
   return {
@@ -1280,21 +1276,12 @@ test("reports the exact missing Trello lists with actionable status details", as
   };
 
   try {
-    const status = await requestBotStatus();
-    const trello = status.body.trello as {
-      ready: boolean;
-      status: string;
-      missingLists: string[];
-      error: string | null;
-    };
-
-    assert.equal(status.statusCode, 200);
+    const trello = await checkTrelloReadiness();
     assert.equal(trello.ready, false);
     assert.equal(trello.status, "missing_lists");
     assert.deepEqual(trello.missingLists, missingLists);
     assert.match(trello.error ?? "", /Create or rename them, then refresh the bot/);
-    assert.match(status.raw, new RegExp(missingLists.join("|")));
-    assert.doesNotMatch(status.raw, /test-key|test-token/);
+    assert.doesNotMatch(JSON.stringify(trello), /test-key|test-token/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1513,7 +1500,7 @@ test("keeps commands disabled after registration failure and enables them on ret
   }
 });
 
-test("shows the next automatic Trello retry in bot status", async () => {
+test("shows the next automatic Trello retry in in-process bot status", async () => {
   const previousConfig = { ...mutableTrelloConfig };
   const originalFetch = globalThis.fetch;
   Object.assign(mutableTrelloConfig, {
@@ -1525,17 +1512,10 @@ test("shows the next automatic Trello retry in bot status", async () => {
 
   try {
     const result = await refreshBot();
-    const response = await requestBotStatus();
-    const recovery = response.body.recovery as {
-      retryCount: number;
-      nextRetryAt: string | null;
-      lastRetryAt: string | null;
-      lastRetryOutcome: string | null;
-    };
+    const recovery = getBotStatus().recovery;
     const retryScheduledFor = Date.parse(recovery.nextRetryAt ?? "");
 
     assert.equal(result.trello.status, "unavailable");
-    assert.equal(response.statusCode, 200);
     assert.equal(recovery.retryCount, 1);
     assert.equal(recovery.lastRetryAt, null);
     assert.equal(recovery.lastRetryOutcome, null);

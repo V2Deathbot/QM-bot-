@@ -279,7 +279,7 @@ export async function requireTrelloReadiness(
   if (!currentOrChecked.ready) {
     throw new Error(
       currentOrChecked.error ??
-        "Trello is not ready. Check GET /api/bot/status for setup details.",
+        "Trello is not ready. Check the Discord administrator status command for setup details.",
     );
   }
 }
