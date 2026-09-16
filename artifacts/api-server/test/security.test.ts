@@ -1847,7 +1847,6 @@ test("/settings traverses categories and opens nonce-bound parameter modals", as
     global: [
       "setup:discord",
       "setup:permissions",
-      "setup:automatic-answers",
       "setup:security", "settings-action:lockdown", "settings-action:unlock",
       "setup:identity", "setup:audit",
       "settings-action:status", "settings-action:maintenance-enable",
