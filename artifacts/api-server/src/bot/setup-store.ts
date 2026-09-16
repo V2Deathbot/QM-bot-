@@ -22,6 +22,8 @@ export interface GuildSetup {
   identity?: IdentitySettings;
   /** Optional uniform-log destinations. Legacy access fields are retained as inert data. */
   uniforms?: UniformSettings;
+  /** Text and announcement channels in which the conservative FAQ responder may answer. */
+  automaticAnswerChannelIds?: string[];
   /** Legacy blacklist grants retained as inert data for storage compatibility. */
   blacklistAuthorizedRoleIds?: string[];
   blacklistAuthorizedMemberIds?: string[];
@@ -174,6 +176,26 @@ export function uniformSettingsFor(setup: GuildSetup): UniformSettings {
   };
 }
 
+const discordSnowflakePattern = /^\d{5,25}$/;
+
+/** Return the configured FAQ destinations, with safe defaults for legacy records. */
+export function automaticAnswerChannelIdsFor(setup: GuildSetup): string[] {
+  const channels = setup.automaticAnswerChannelIds ?? [];
+  return [...new Set(channels.filter((id) => discordSnowflakePattern.test(id)))].slice(0, 10);
+}
+
+function normalizeSetupForStorage(setup: GuildSetup): GuildSetup {
+  if (setup.automaticAnswerChannelIds === undefined) return setup;
+  if (setup.automaticAnswerChannelIds.length > 10 ||
+      setup.automaticAnswerChannelIds.some((id) => !discordSnowflakePattern.test(id))) {
+    throw new Error("Automatic answer channels must contain at most 10 valid Discord channel IDs.");
+  }
+  return {
+    ...setup,
+    automaticAnswerChannelIds: [...new Set(setup.automaticAnswerChannelIds)],
+  };
+}
+
 /** Blacklist submitter grants are deliberately separate from all other roles. */
 export function blacklistAccessFor(setup: GuildSetup): {
   authorizedRoleIds: string[];
@@ -272,6 +294,13 @@ function isGuildSetup(value: unknown): value is GuildSetup {
   const validOptionalIds = (ids: unknown): boolean =>
     ids === undefined ||
     (Array.isArray(ids) && ids.every((id) => typeof id === "string" && /^\d{5,25}$/.test(id)));
+  const automaticAnswerChannels = candidate["automaticAnswerChannelIds"];
+  const validAutomaticAnswerChannels =
+    automaticAnswerChannels === undefined ||
+    (Array.isArray(automaticAnswerChannels) &&
+      automaticAnswerChannels.length <= 10 &&
+      new Set(automaticAnswerChannels).size === automaticAnswerChannels.length &&
+      automaticAnswerChannels.every((id) => typeof id === "string" && /^\d{5,25}$/.test(id)));
   const permissions = candidate["commandPermissions"];
   const validCommandPermissions = permissions === undefined || Boolean(
     permissions && typeof permissions === "object" &&
@@ -288,6 +317,7 @@ function isGuildSetup(value: unknown): value is GuildSetup {
     typeof candidate["auditChannelId"] === "string" &&
     validOptionalIds(candidate["blacklistAuthorizedRoleIds"]) &&
     validOptionalIds(candidate["blacklistAuthorizedMemberIds"]) &&
+    validAutomaticAnswerChannels &&
     validCommandPermissions &&
     typeof candidate["updatedBy"] === "string" &&
     typeof candidate["updatedAt"] === "string"
@@ -346,14 +376,15 @@ export async function getGuildSetup(
 export async function saveGuildSetup(
   setup: GuildSetup,
 ): Promise<GuildSetup> {
+  const normalized = normalizeSetupForStorage(setup);
   return mutateBotDocument(storeOptions, (store) => {
     migrateObsoletePresence(store);
     const index = store.guilds.findIndex(
-      (candidate) => candidate.guildId === setup.guildId,
+      (candidate) => candidate.guildId === normalized.guildId,
     );
-    if (index === -1) store.guilds.push(setup);
-    else store.guilds[index] = setup;
-    return setup;
+    if (index === -1) store.guilds.push(normalized);
+    else store.guilds[index] = normalized;
+    return normalized;
   });
 }
 
@@ -371,7 +402,7 @@ export async function updateGuildSetup(
     migrateObsoletePresence(store);
     const index = store.guilds.findIndex((candidate) => candidate.guildId === guildId);
     const current = index === -1 ? undefined : store.guilds[index];
-    const updated = await updater(current);
+    const updated = normalizeSetupForStorage(await updater(current));
     if (updated.guildId !== guildId) {
       throw new Error("The guild setup mutation returned the wrong guild.");
     }

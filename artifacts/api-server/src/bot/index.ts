@@ -96,9 +96,11 @@ import {
   commandPermissionNames,
   commandPermissionName,
   hasCommandPermissionEntry,
+  automaticAnswerChannelIdsFor,
   type CommandPermissionName,
   type GuildSetup,
 } from "./setup-store";
+import { answerFaq } from "./faq";
 import {
   administratorInEscalationWindow,
   getSecurityState,
@@ -1148,6 +1150,7 @@ function settingsCategoryOptions(
       return [
         { label: "Payout Owner & Discord Roles", value: "setup:discord", description: "Set the payout owner and named Quartermaster roles" },
         { label: "Permissions", value: "setup:permissions", description: "Configure narrowly-scoped uploading and blacklist access grants" },
+        { label: "Automatic Answers", value: "setup:automatic-answers", description: "Choose where the conservative FAQ responder may answer" },
         { label: "Security Configuration", value: "setup:security", description: "Limits, protections, and confirmations" },
         { label: "Security Lockdown", value: "settings-action:lockdown", description: "Immediately stop destructive actions" },
         { label: "Security Unlock", value: "settings-action:unlock", description: "Unlock after confirmation" },
@@ -1160,6 +1163,47 @@ function settingsCategoryOptions(
         { label: "View Configuration", value: "setup:view", description: "Review active server configuration" },
       ];
   }
+}
+
+function automaticAnswersPanel(setup: GuildSetup, nonce: string): {
+  embeds: EmbedBuilder[];
+  components: Array<
+    ActionRowBuilder<ChannelSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>
+  >;
+} {
+  const channels = automaticAnswerChannelIdsFor(setup);
+  const configured = channels.length
+    ? channels.map((id) => `<#${id}>`).join(", ")
+    : "None — automatic answers are disabled";
+  return {
+    embeds: [outcomeEmbed(
+      "Automatic Answers",
+      "Quartermaster answers only closely matching questions from its fixed FAQ and stays silent when uncertain. Select 1–10 text or announcement channels where it may answer. No selected channels means this feature is disabled.",
+      channels.length ? "success" : "info",
+      [{ name: "Configured channels", value: configured }],
+    )],
+    components: [
+      new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(
+        new ChannelSelectMenuBuilder()
+          .setCustomId(`setup:automatic-answers-select:${nonce}`)
+          .setPlaceholder("Select 1–10 answer channels")
+          .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+          .setMinValues(1)
+          .setMaxValues(10),
+      ),
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`setup:automatic-answers-clear:${nonce}`)
+          .setLabel("Clear All Channels")
+          .setStyle(ButtonStyle.Danger)
+          .setDisabled(channels.length === 0),
+        new ButtonBuilder()
+          .setCustomId(`settings:back:category:global:${nonce}`)
+          .setLabel("Back to Global")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  };
 }
 
 function settingsMenu(
@@ -1179,8 +1223,8 @@ function settingsMenu(
         ? "Maintenance is active. Choose an emergency category. Normal configuration and moderation controls are hidden and remain unavailable."
         : configured
           ? `**Core setup: ${setup?.auditChannelId && setup?.seniorQuartermasterRoleId && setup?.quartermasterRoleId && setup?.securityOwnerId ? "complete" : "incomplete—review Payout Owner & Discord Roles"}**\n` +
-            `**Optional locations: ${setup?.uniforms?.spreadsheet ? "spreadsheet configured" : "spreadsheet not configured"}; ${setup?.uniforms?.logChannelId || setup?.uniforms?.moderatedChannelId ? "uniform channel configured" : "uniform channels not configured"}**\n\n` +
-            "Choose a category to manage Quartermaster. Controls are private, expire after 10 minutes, and re-check your current Administrator, server-owner, or application-owner/granted command access. **Uploading** contains uniform channels, spreadsheet, and recovery. **Blacklisting** contains blacklist rules, Trello monitoring, records, and identity lookup. **Global** contains the payout owner, security, audit, maintenance, and per-command Permissions."
+             `**Optional locations: ${setup?.uniforms?.spreadsheet ? "spreadsheet configured" : "spreadsheet not configured"}; ${setup?.uniforms?.logChannelId || setup?.uniforms?.moderatedChannelId ? "uniform channel configured" : "uniform channels not configured"}; ${setup && automaticAnswerChannelIdsFor(setup).length ? "automatic answers configured" : "automatic answers disabled"}**\n\n` +
+             "Choose a category to manage Quartermaster. Controls are private, expire after 10 minutes, and re-check your current Administrator, server-owner, or application-owner/granted command access. **Uploading** contains uniform channels, spreadsheet, and recovery. **Blacklisting** contains blacklist rules, Trello monitoring, records, and identity lookup. **Global** contains the payout owner, automatic answers, security, audit, maintenance, and per-command Permissions."
           : "Initial setup is required. Open Global to select the audit channel, Senior Quartermaster, Quartermaster, and Security / Payout Owner. Emergency status and security controls remain available.",
     )],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
@@ -1842,6 +1886,7 @@ function settingsCategoryForAction(id: string): SettingsCategory | undefined {
   ) return "global";
   if (id === "setup:audit" || id === "setup:discord") return "global";
   if (id === "setup:permissions") return "global";
+  if (id === "setup:automatic-answers") return "global";
   if (
     id === "setup:uniforms" ||
     id === "setup:uniforms-config" ||
@@ -2272,6 +2317,7 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
     const pageIds = new Set([
       "setup:blacklist", "setup:trello", "setup:security", "setup:lockdown",
       "setup:audit", "setup:discord", "setup:permissions", "setup:identity", "setup:uniforms", "setup:bot-state", "setup:view",
+      "setup:automatic-answers",
     ]);
     if (pageIds.has(id)) {
       const current = settingsNavigation(activeSession).at(-1);
@@ -2344,6 +2390,49 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
   }
   if (id === "setup:permissions") {
     await interaction.update(permissionsPanel(setup, activeSession?.nonce ?? nonce ?? ""));
+    return;
+  }
+  if (id === "setup:automatic-answers") {
+    await interaction.update(automaticAnswersPanel(setup, activeSession?.nonce ?? nonce ?? ""));
+    return;
+  }
+  if (id === "setup:automatic-answers-clear" || id === "setup:automatic-answers-select") {
+    if (id.endsWith("-select") && !interaction.isChannelSelectMenu()) {
+      throw new Error("Choose answer channels with the Discord channel selector.");
+    }
+    const selected = id.endsWith("-select")
+      ? [...new Set((interaction as ChannelSelectMenuInteraction).values)]
+      : [];
+    if (selected.length > 10) throw new Error("Select no more than 10 answer channels.");
+    for (const channelId of selected) {
+      if (!/^\d{5,25}$/.test(channelId)) throw new Error("The selected channel ID is invalid.");
+      const channel = await guild.channels.fetch(channelId).catch(() => null);
+      if (!channel || channel.guild?.id !== guild.id ||
+          (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement)) {
+        throw new Error("Automatic answers can use only text or announcement channels in this server.");
+      }
+    }
+    let oldChannels: string[] = [];
+    const updated = await updateGuildSetup(guild.id, (latest) => {
+      const base = latest ?? setup;
+      oldChannels = automaticAnswerChannelIdsFor(base);
+      return {
+        ...base,
+        automaticAnswerChannelIds: selected,
+        updatedBy: interaction.user.id,
+        updatedAt: new Date().toISOString(),
+      };
+    });
+    await auditBestEffort(guild, updated, {
+      action: "Automatic answer channels changed",
+      status: "success",
+      actorId: interaction.user.id,
+      fields: [
+        { name: "Old", value: oldChannels.length ? oldChannels.map((id) => `<#${id}>`).join(", ") : "Disabled" },
+        { name: "New", value: selected.length ? selected.map((id) => `<#${id}>`).join(", ") : "Disabled" },
+      ],
+    });
+    await interaction.update(automaticAnswersPanel(updated, activeSession?.nonce ?? nonce ?? ""));
     return;
   }
   if (id.startsWith("setup:permissions-command:")) {
@@ -5139,6 +5228,8 @@ async function connectDiscord(): Promise<void> {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMembers,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
       GatewayIntentBits.DirectMessages,
     ],
     partials: [Partials.Channel],
@@ -5381,6 +5472,27 @@ async function connectDiscord(): Promise<void> {
           "Joined member blacklist check failed",
         );
       });
+  });
+
+  client.on(Events.MessageCreate, (message) => {
+    void (async () => {
+      if (message.author.bot || !message.guildId || !message.content.trim()) return;
+      if (!config.discordGuildId || message.guildId !== config.discordGuildId) return;
+      const setup = await getGuildSetup(message.guildId);
+      if (!setup || !automaticAnswerChannelIdsFor(setup).includes(message.channelId)) return;
+      if (await maintenanceActive(message.guildId)) return;
+      const answer = answerFaq(message.content);
+      if (!answer) return;
+      await message.reply({
+        content: answer,
+        allowedMentions: { parse: [], repliedUser: false },
+      });
+    })().catch((error) => {
+      logger.error(
+        { err: error, guildId: message.guildId, channelId: message.channelId },
+        "Automatic FAQ answer failed",
+      );
+    });
   });
 
   client.on("error", (error) => {
