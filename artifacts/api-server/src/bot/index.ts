@@ -5108,6 +5108,32 @@ async function replyInteractionError(
   }
 }
 
+async function replyCommandInteractionError(
+  interaction: ChatInputCommandInteraction,
+  error: unknown,
+): Promise<void> {
+  logger.error(
+    {
+      err: error,
+      commandName: interaction.commandName,
+      guildId: interaction.guildId,
+      userId: interaction.user.id,
+      deferred: interaction.deferred,
+      replied: interaction.replied,
+    },
+    "Discord command interaction failed outside its command handler",
+  );
+  const message = error instanceof Error
+    ? error.message
+    : "The command failed unexpectedly.";
+  const payload = errorResponse(message, "Command Unavailable");
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply(payload).catch(() => undefined);
+  } else {
+    await interaction.reply({ ...payload, ephemeral: true }).catch(() => undefined);
+  }
+}
+
 async function connectDiscord(): Promise<void> {
   const client = new Client({
     intents: [
@@ -5164,7 +5190,9 @@ async function connectDiscord(): Promise<void> {
 
   client.on("interactionCreate", (interaction) => {
     if (interaction.isChatInputCommand()) {
-      void handleInteraction(interaction);
+      void handleInteraction(interaction).catch((error) =>
+        replyCommandInteractionError(interaction, error),
+      );
     } else if (interaction.isButton()) {
       void (async () => {
         if (interaction.customId.startsWith("maintenance-confirm:") ||
