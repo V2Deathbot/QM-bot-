@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createHybridFaqAnswer } from "../src/bot/faq-ai.ts";
+import {
+  createHybridFaqAnswer,
+  hybridFaqVoicePrompt,
+} from "../src/bot/faq-ai.ts";
+
+test("hybrid FAQ voice is warm but keeps humor away from sensitive rules", () => {
+  assert.match(hybridFaqVoicePrompt, /warm, upbeat/i);
+  assert.match(hybridFaqVoicePrompt, /occasionally add one gentle Quartermaster-themed joke/i);
+  assert.match(hybridFaqVoicePrompt, /Never joke about the member, their rank, eligibility/i);
+  assert.match(hybridFaqVoicePrompt, /Do not add requirements, prices, ranks/i);
+});
 
 test("hybrid FAQ safely falls back to the fixed answer when AI is unavailable", async () => {
   const previousBaseUrl = process.env["AI_INTEGRATIONS_OPENAI_BASE_URL"];
