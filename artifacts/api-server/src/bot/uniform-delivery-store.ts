@@ -97,6 +97,7 @@ export interface UniformDeliveryRecord {
     auditState?: "pending" | "claimed" | "sent" | "unresolved";
     rowIndex: number;
     newAsset: { id: number; url: string };
+    publisherName?: string;
     oldCustomerMessageId?: string;
     nonce: string;
     startedAt: string;
@@ -113,6 +114,7 @@ export interface UniformDeliveryRecord {
       | "moderated"
       | "unresolved";
     actorId: string;
+    publisherName?: string;
     rowIndex: number;
     uniformType: string;
     attachment: {

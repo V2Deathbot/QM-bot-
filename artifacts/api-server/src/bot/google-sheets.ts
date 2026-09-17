@@ -63,6 +63,8 @@ export interface ReplaceUniformRowLinkInput {
   /** Zero-based asset/row index in this submission's original ledger entry. */
   rowIndex: number;
   newLink: string;
+  /** Optional replacement for the publisher cell in the same guarded row update. */
+  publisherName?: string;
 }
 
 export interface ReplaceUniformRowLinkResult {
@@ -547,7 +549,13 @@ export async function replaceUniformRowLink(
     const linkColumn = target.endColumn;
     const intended = expected.map((row) => [...row]);
     intended[input.rowIndex]![width - 1] = input.newLink;
-    const cellRange = `${columnLetters(linkColumn)}${target.startRow + input.rowIndex}`;
+    if (input.publisherName) {
+      intended[input.rowIndex]![input.logKind === "log" ? 2 : 1] = input.publisherName;
+    }
+    const rowNumber = target.startRow + input.rowIndex;
+    const cellRange = input.publisherName
+      ? `${columnLetters(target.startColumn)}${rowNumber}:${columnLetters(target.endColumn)}${rowNumber}`
+      : `${columnLetters(linkColumn)}${rowNumber}`;
     const actual = await readRange(config.spreadsheetId, tab, entry.targetRange);
     const matchesOriginal = equalsValues(actual, expected);
     const matchesIntended = equalsValues(actual, intended);
@@ -568,7 +576,8 @@ export async function replaceUniformRowLink(
       await jsonResponse(await proxy(
         `${rangePath(config.spreadsheetId, tab, cellRange)}?valueInputOption=RAW`,
         { method: "PUT", headers: { "Content-Type": "application/json" }, body: {
-          range: `${quoteSheetTab(tab)}!${cellRange}`, majorDimension: "ROWS", values: [[input.newLink]],
+          range: `${quoteSheetTab(tab)}!${cellRange}`, majorDimension: "ROWS",
+          values: input.publisherName ? [intended[input.rowIndex]!] : [[input.newLink]],
         } },
       ), "uniform relog update");
     } catch (error) {

@@ -26,6 +26,7 @@ import { inflateSync } from "node:zlib";
 import { purchaseFooter } from "./purchase-footers";
 import {
   findRobloxUser,
+  findRobloxUserById,
   ownsRobloxAsset,
   RobloxInventoryPrivateError,
   RobloxOwnershipUnavailableError,
@@ -77,6 +78,7 @@ import {
   validateSpreadsheetConfiguration,
   type UniformSheetRow,
 } from "./google-sheets";
+import { getSecurityState } from "./security-store";
 
 /**
  * Uniform logging deliberately has no provider side effects.  In particular,
@@ -97,6 +99,7 @@ const classicShirtWidth = 585;
 const classicShirtHeight = 559;
 const maximumUniformAttachmentBytes = 10 * 1024 * 1024;
 const maximumUniformDecodedBytes = 8 * 1024 * 1024;
+const uniformPublisherRoleId = "1548958021160411216";
 
 export const uniformCommands = [
   new SlashCommandBuilder()
@@ -771,6 +774,22 @@ function memberHasRole(member: GuildMember, roleIds: string[]): boolean {
   return Boolean(cache?.has && roleIds.some((id) => cache.has!(id)));
 }
 
+async function linkedPublisherName(guildId: string, discordUserId: string): Promise<string> {
+  const linkedIds = [...new Set(
+    (await getSecurityState(guildId)).identityLedger
+      .filter((entry) => entry.discordUserId === discordUserId)
+      .map((entry) => entry.robloxUserId),
+  )];
+  if (linkedIds.length !== 1) {
+    throw new Error(
+      linkedIds.length
+        ? "Your Discord account has multiple Roblox identities recorded. An Administrator must resolve the identity binding before you can publish uniforms."
+        : "Your Discord account has no linked Roblox identity. Link and verify your Roblox account before publishing uniforms.",
+    );
+  }
+  return (await findRobloxUserById(linkedIds[0]!)).name;
+}
+
 /**
  * Named Quartermaster roles are a convenience authorization layer for uniform
  * work only.  They are combined at the point of authorization, never copied
@@ -1245,6 +1264,7 @@ async function selectAndStartRelog(
   rowIndex: number,
   newAsset: UniformAsset,
   guild: Guild,
+  publisherName = record.publishing?.publisherName ?? "Quartermaster Bot",
 ): Promise<UniformDeliveryRecord> {
   if (!Array.isArray(record.rows) || !Array.isArray(record.assets) ||
       !Number.isInteger(rowIndex) || rowIndex < 0 || rowIndex >= record.assets.length ||
@@ -1263,6 +1283,10 @@ async function selectAndStartRelog(
     throw new Error("The recorded delivery no longer matches its original spreadsheet rows. No cells or messages were changed.");
   }
   const current = await startRelog(record, rowIndex, newAsset);
+  await updateUniformDelivery(record.submissionId, (item) => {
+    if (item.relog?.state !== "claimed") throw new Error("The relog publisher could not be recorded.");
+    item.relog.publisherName = publisherName;
+  });
   return continueRelog(current, guild);
 }
 
@@ -1287,6 +1311,7 @@ async function continueRelog(record: UniformDeliveryRecord, guild: Guild): Promi
       submissionId: current.submissionId,
       rowIndex: relog.rowIndex,
       newLink: relog.newAsset.url,
+      publisherName: relog.publisherName,
     });
     current = await updateUniformDelivery(current.submissionId, (item) => {
       const operation = item.relog;
@@ -1298,6 +1323,7 @@ async function continueRelog(record: UniformDeliveryRecord, guild: Guild): Promi
         throw new Error("The recorded relog row is incomplete. No customer message was sent.");
       }
       row[row.length - 1] = operation.newAsset.url;
+      if (operation.publisherName) row[item.command === "log" ? 2 : 1] = operation.publisherName;
       item.assets[operation.rowIndex] = operation.newAsset;
       operation.state = "sheet-updated";
     });
@@ -1511,7 +1537,7 @@ async function sendRelogPublishingHandoff(
       ? Buffer.from(current.relogHandoff!.sourceDataBase64, "base64")
       : undefined;
     const message = await channel.send({
-      content: `<@${current.seqmId}>`,
+      content: `<@&${uniformPublisherRoleId}>`,
       embeds: [relogPublishingEmbed(current)],
       components: relogPublishingComponents(current),
       files: [{
@@ -1520,7 +1546,7 @@ async function sendRelogPublishingHandoff(
           .replace(/[^a-z0-9_.-]+/gi, "-")
           .slice(0, 100),
       }],
-      allowedMentions: { parse: [], users: [current.seqmId] },
+      allowedMentions: { parse: [], roles: [uniformPublisherRoleId] },
       nonce: uniformDiscordNonce("relog", `${current.submissionId}:${operation.nonce}`),
       enforceNonce: true,
     });
@@ -1568,7 +1594,10 @@ async function relogPublishingRecordFor(
     record,
     await getGuildSetup(interaction.guildId!),
   )) {
-    throw new Error("You are no longer authorized to complete this replacement.");
+    const member = await currentMember(interaction.guild!, interaction.user.id);
+    if (!memberHasRole(member, [uniformPublisherRoleId])) {
+      throw new Error("You are no longer authorized to complete this replacement.");
+    }
   }
   return record;
 }
@@ -1622,11 +1651,13 @@ export async function handleUniformRelogPublishingButton(
     return;
   }
   await interaction.deferUpdate();
+  const publisherName = await linkedPublisherName(record.guildId, interaction.user.id);
   record = await updateUniformDelivery(submissionId, (item) => {
     if (item.relogHandoff?.nonce !== nonce || item.relogHandoff.state !== "awaiting-result") {
       throw new Error("This replacement handoff is no longer awaiting a result.");
     }
     item.relogHandoff.state = "moderation-claimed";
+    item.relogHandoff.publisherName = publisherName;
   });
   try {
     const setup = await getGuildSetup(record.guildId);
@@ -1636,7 +1667,7 @@ export async function handleUniformRelogPublishingButton(
     const sourceRow = record.rows[record.relogHandoff!.rowIndex] ?? [];
     const moderatedRows = [[
       typeof sourceRow[0] === "string" ? sourceRow[0] : "",
-      record.publishing?.publisherName ?? "Quartermaster Bot",
+      publisherName,
       record.customerName,
       "",
     ]];
@@ -1710,16 +1741,18 @@ export async function handleUniformRelogPublishingModal(
     throw new Error(`The replacement Classic Shirt must be named exactly "${record.customerName}".`);
   }
   await interaction.deferReply({ ephemeral: true });
+  const publisherName = await linkedPublisherName(record.guildId, interaction.user.id);
   const rowIndex = record.relogHandoff!.rowIndex;
   record = await updateUniformDelivery(submissionId, (item) => {
     if (item.relogHandoff?.nonce !== nonce || item.relogHandoff.state !== "awaiting-result") {
       throw new Error("This replacement handoff is no longer awaiting a result.");
     }
     item.relogHandoff.state = "publish-claimed";
+    item.relogHandoff.publisherName = publisherName;
     item.relogHandoff.publishedAsset = asset;
   });
   try {
-    record = await selectAndStartRelog(record, rowIndex, asset, interaction.guild!);
+    record = await selectAndStartRelog(record, rowIndex, asset, interaction.guild!, publisherName);
     record = await updateUniformDelivery(submissionId, (item) => {
       if (item.relogHandoff?.nonce !== nonce) {
         throw new Error("The replacement handoff changed before completion.");
@@ -2253,7 +2286,7 @@ async function sendPublishingHandoff(
         ? Buffer.from(publishing.sourceDataBase64, "base64")
         : publishing.attachment.url);
     const message = await channel.send({
-      content: `<@${record.seqmId}>`,
+      content: `<@&${uniformPublisherRoleId}>`,
       embeds: [publishingHandoffEmbed(current)],
       components: publishingHandoffComponents(current),
       files: [{
@@ -2262,7 +2295,7 @@ async function sendPublishingHandoff(
           .replace(/[^a-z0-9_.-]+/gi, "-")
           .slice(0, 100),
       }],
-      allowedMentions: { parse: [], users: [record.seqmId] },
+      allowedMentions: { parse: [], roles: [uniformPublisherRoleId] },
       nonce: uniformDiscordNonce("notice", record.submissionId),
       enforceNonce: true,
     });
@@ -2305,6 +2338,7 @@ async function publishingRecordFor(
     throw new Error("This publishing control is not attached to its recorded handoff message.");
   }
   const member = await currentMember(interaction.guild!, interaction.user.id);
+  if (memberHasRole(member, [uniformPublisherRoleId])) return record;
   if (interaction.guild!.ownerId === member.id ||
       member.permissions.has(PermissionFlagsBits.Administrator) ||
       interaction.user.id === record.seqmId) {
@@ -2321,7 +2355,7 @@ async function publishingRecordFor(
     return record;
   }
   {
-    throw new Error("Only the original submitter, assigned Senior Quartermaster, or an Administrator can complete this upload.");
+    throw new Error("Only the publishing role, original submitter, assigned Senior Quartermaster, or an Administrator can complete this upload.");
   }
 }
 
@@ -2376,11 +2410,15 @@ export async function handleUniformPublishingButton(
     return;
   }
   await interaction.deferUpdate();
+  const publisherName = await linkedPublisherName(record.guildId, interaction.user.id);
   let current = await updateUniformDelivery(submissionId, (item) => {
     if (item.publishing?.state !== "awaiting-result") {
       throw new Error("This publishing handoff is no longer awaiting a result.");
     }
     item.publishing.state = "moderation-claimed";
+    item.publishing.publisherName = publisherName;
+    const row = item.rows[0];
+    if (row) row[2] = publisherName;
   });
   try {
     const setup = await getGuildSetup(record.guildId);
@@ -2475,17 +2513,20 @@ export async function handleUniformPublishingModal(
     throw new Error(`The published Classic Shirt must be named exactly "${record.customerName}".`);
   }
   await interaction.deferReply({ ephemeral: true });
+  const publisherName = await linkedPublisherName(record.guildId, interaction.user.id);
   record = await updateUniformDelivery(submissionId, (item) => {
     if (item.publishing?.state !== "awaiting-result") {
       throw new Error("This publishing handoff is no longer awaiting a result.");
     }
     item.publishing.state = "publish-claimed";
+    item.publishing.publisherName = publisherName;
     item.assets = [asset];
     const row = item.rows[0];
     if (!row || row.length !== LOG_UNIFORM_COLUMN_COUNT) {
       throw new Error("The pending uniform spreadsheet row is incomplete.");
     }
     row[row.length - 1] = asset.url;
+    row[2] = publisherName;
   });
   try {
     await appendUniformRows({
