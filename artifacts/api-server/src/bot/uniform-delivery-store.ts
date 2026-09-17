@@ -2,7 +2,14 @@ import { createHash } from "node:crypto";
 import { config } from "./config";
 import { mutateBotDocument, readBotDocument, resetPersistentStoreForTests } from "./persistent-store";
 
-export type UniformDiscordNonceKind = "notice" | "customer" | "purchased" | "assistance" | "sold" | "relog";
+export type UniformDiscordNonceKind =
+  | "notice"
+  | "customer"
+  | "purchased"
+  | "assistance"
+  | "sold"
+  | "relog"
+  | "moderated";
 
 /**
  * Discord accepts nonces up to 25 characters. Interaction IDs are already
@@ -48,6 +55,30 @@ export interface UniformDeliveryRecord {
   customerRobloxId?: number;
   /** Real ticket channel name frozen at submission time; never infer it from a Discord user. */
   ticketChannelName?: string;
+  /** Attachment-driven Roblox publishing handoff for new uniform submissions. */
+  publishing?: {
+    state:
+      | "handoff-pending"
+      | "handoff-claimed"
+      | "awaiting-result"
+      | "publish-claimed"
+      | "published"
+      | "moderation-claimed"
+      | "moderated"
+      | "unresolved";
+    uniformType: string;
+    publisherName: string;
+    attachment: {
+      name: string;
+      contentType: "image/png";
+      size: number;
+      url: string;
+    };
+    /** Temporary durable source, removed once Discord confirms the handoff message. */
+    sourceDataBase64?: string;
+    handoffMessageId?: string;
+    completedAt?: string;
+  };
   /** The original upload audit message, when it was durably recorded. */
   auditMessageId?: string;
   logNoticeState: "pending" | "claimed" | "sent" | "unresolved";
@@ -69,6 +100,34 @@ export interface UniformDeliveryRecord {
     oldCustomerMessageId?: string;
     nonce: string;
     startedAt: string;
+  };
+  /** Replacement PNG publishing handoff. The old row/message remain authoritative until published. */
+  relogHandoff?: {
+    state:
+      | "handoff-pending"
+      | "handoff-claimed"
+      | "awaiting-result"
+      | "publish-claimed"
+      | "published"
+      | "moderation-claimed"
+      | "moderated"
+      | "unresolved";
+    actorId: string;
+    rowIndex: number;
+    uniformType: string;
+    attachment: {
+      name: string;
+      contentType: "image/png";
+      size: number;
+      url: string;
+    };
+    nonce: string;
+    /** Temporary durable source, removed once Discord confirms the handoff message. */
+    sourceDataBase64?: string;
+    /** Verified catalog asset retained so publish-claimed recovery can resume after restart. */
+    publishedAsset?: { id: number; url: string };
+    handoffMessageId?: string;
+    completedAt?: string;
   };
   /**
    * A one-time, manually confirmed migration marker for a delivery rejected

@@ -25,6 +25,12 @@ export class RobloxOwnershipUnavailableError extends Error {
   }
 }
 
+export interface RobloxClassicShirt {
+  id: number;
+  name: string;
+  isForSale: boolean;
+}
+
 interface RobloxUserLookupResponse {
   data?: Array<RobloxUser>;
 }
@@ -181,6 +187,51 @@ export async function ownsRobloxAsset(
     }
   }
   throw new RobloxOwnershipUnavailableError();
+}
+
+export async function verifyPublishedClassicShirt(
+  assetId: number,
+): Promise<RobloxClassicShirt> {
+  if (!isPositiveSafeInteger(assetId)) {
+    throw new Error("The Roblox Classic Shirt asset ID must be a positive safe integer.");
+  }
+  let response: Response;
+  try {
+    response = await fetch(`https://economy.roblox.com/v2/assets/${assetId}/details`, {
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch {
+    throw new Error("Roblox could not verify the published Classic Shirt.");
+  }
+  if (!response.ok) {
+    throw new Error(`Roblox could not verify the published Classic Shirt (HTTP ${response.status}).`);
+  }
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error("Roblox returned an invalid Classic Shirt response.");
+  }
+  const value = payload as {
+    AssetId?: unknown;
+    AssetTypeId?: unknown;
+    Name?: unknown;
+    IsForSale?: unknown;
+  };
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    value.AssetId !== assetId ||
+    value.AssetTypeId !== 11 ||
+    typeof value.Name !== "string" ||
+    typeof value.IsForSale !== "boolean"
+  ) {
+    throw new Error("The supplied Roblox link is not a published Classic Shirt.");
+  }
+  if (!value.IsForSale) {
+    throw new Error("The Roblox Classic Shirt is not on sale yet.");
+  }
+  return { id: assetId, name: value.Name, isForSale: value.IsForSale };
 }
 
 export function getRobloxGroupUrl(groupId: string): string {

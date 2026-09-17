@@ -32,3 +32,9 @@ For in-place spreadsheet corrections, recover against both the exact original ro
 **Why:** Sheets can commit a correction before local bookkeeping is saved. Checking only the original values would then block recovery of a successful correction.
 
 **How to apply:** Keep the intended change durable before writing. Verify the entire affected row, not just its link, and never guess original rows from customer names.
+
+Keep Roblox Classic Shirt publishing as an explicit human Creator Dashboard handoff, and never retry an ambiguous Discord handoff automatically.
+
+**Why:** Roblox does not provide a supported Classic Shirt publishing endpoint. Browser credentials, MFA, CAPTCHA, and session automation would cross the approved security boundary, while replaying an uncertain Discord send can create duplicate publication requests.
+
+**How to apply:** Automate validation, durable handoff state, exact catalog-result verification, Sheets updates, delivery, replacement, and ownership checks. Block unresolved handoffs until an authorized administrator reconciles them.

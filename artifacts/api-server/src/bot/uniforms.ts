@@ -11,6 +11,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
   UserSelectMenuBuilder,
+  type Attachment,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Guild,
@@ -21,12 +22,14 @@ import {
   type UserSelectMenuInteraction,
 } from "discord.js";
 import { randomBytes } from "node:crypto";
+import { inflateSync } from "node:zlib";
 import { purchaseFooter } from "./purchase-footers";
 import {
   findRobloxUser,
   ownsRobloxAsset,
   RobloxInventoryPrivateError,
   RobloxOwnershipUnavailableError,
+  verifyPublishedClassicShirt,
   type RobloxUser,
 } from "./roblox";
 import {
@@ -85,15 +88,24 @@ const allowedRobloxHosts = new Set([
   "www.roblox.com",
   "create.roblox.com",
 ]);
+const allowedUniformTypes = new Set([
+  "ClassA", "ClassA_MP", "ClassA_HG", "ClassB", "Ike", "Bomber", "Flight",
+  "Alpha", "Bravo", "DressBlue", "DressWhite",
+  "White", "Khaki", "Blue", "Gray", "Overcoat",
+]);
+const classicShirtWidth = 585;
+const classicShirtHeight = 559;
+const maximumUniformAttachmentBytes = 10 * 1024 * 1024;
+const maximumUniformDecodedBytes = 8 * 1024 * 1024;
 
 export const uniformCommands = [
   new SlashCommandBuilder()
     .setName("log")
-    .setDescription("Log a completed uniform upload.")
+    .setDescription("Submit a Classic Shirt for publishing and customer delivery.")
     .addStringOption((option) =>
       option
-        .setName("qm")
-        .setDescription("Exact Roblox username for the Quartermaster.")
+        .setName("customer")
+        .setDescription("Exact Roblox username for the customer.")
         .setRequired(true),
     )
     .addStringOption((option) =>
@@ -104,54 +116,40 @@ export const uniformCommands = [
     )
     .addStringOption((option) =>
       option
-        .setName("publisher")
-        .setDescription("Exact Roblox username for the publisher.")
+        .setName("qm")
+        .setDescription("Exact Roblox username for the Quartermaster.")
         .setRequired(true),
     )
     .addStringOption((option) =>
       option
-        .setName("customer")
-        .setDescription("Exact Roblox username for the customer.")
-        .setRequired(true),
+        .setName("uniform_type")
+        .setDescription("Uniform type used as the Roblox shirt description.")
+        .setRequired(true)
+        .addChoices(
+          { name: "Army · ClassA", value: "ClassA" },
+          { name: "Army · ClassA_MP", value: "ClassA_MP" },
+          { name: "Army · ClassA_HG", value: "ClassA_HG" },
+          { name: "Army · ClassB", value: "ClassB" },
+          { name: "Army · Ike", value: "Ike" },
+          { name: "Army · Bomber", value: "Bomber" },
+          { name: "Army · Flight", value: "Flight" },
+          { name: "Marines · Alpha", value: "Alpha" },
+          { name: "Marines · Bravo", value: "Bravo" },
+          { name: "Marines · DressBlue", value: "DressBlue" },
+          { name: "Marines · DressWhite", value: "DressWhite" },
+          { name: "Navy · White", value: "White" },
+          { name: "Navy · Khaki", value: "Khaki" },
+          { name: "Navy · Blue", value: "Blue" },
+          { name: "Navy · Gray", value: "Gray" },
+          { name: "Navy · Overcoat", value: "Overcoat" },
+        ),
     )
-    .addStringOption((option) =>
-      option
-        .setName("shirtid1")
-        .setDescription("Roblox uniform asset ID or allowlisted Roblox URL.")
-        .setRequired(true),
-    )
-    // Discord requires every required option to precede the optional asset
-    // inputs. Keep this customer destination with the required command data.
     .addChannelOption((option) =>
-      option.setName("channel").setDescription("Customer delivery channel.").setRequired(true)
+      option.setName("channel").setDescription("Customer ticket channel.").setRequired(true)
         .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
     )
-    .addStringOption((option) =>
-      option.setName("shirtid2").setDescription("Uniform asset ID or Roblox URL.").setRequired(false),
-    )
-    .addStringOption((option) =>
-      option.setName("shirtid3").setDescription("Uniform asset ID or Roblox URL.").setRequired(false),
-    )
-    .addStringOption((option) =>
-      option.setName("shirtid4").setDescription("Uniform asset ID or Roblox URL.").setRequired(false),
-    )
-    .addStringOption((option) =>
-      option.setName("shirtid5").setDescription("Uniform asset ID or Roblox URL.").setRequired(false),
-    )
-    .addStringOption((option) =>
-      option.setName("shirtid6").setDescription("Uniform asset ID or Roblox URL.").setRequired(false),
-    )
-    .addStringOption((option) =>
-      option.setName("shirtid7").setDescription("Uniform asset ID or Roblox URL.").setRequired(false),
-    )
-    .addStringOption((option) =>
-      option.setName("shirtid8").setDescription("Uniform asset ID or Roblox URL.").setRequired(false),
-    )
-    .addStringOption((option) =>
-      option.setName("shirtid9").setDescription("Uniform asset ID or Roblox URL.").setRequired(false),
-    )
-    .addStringOption((option) =>
-      option.setName("shirtid10").setDescription("Uniform asset ID or Roblox URL.").setRequired(false),
+    .addAttachmentOption((option) =>
+      option.setName("uniform").setDescription("Classic Shirt PNG using the Roblox template.").setRequired(true),
     ),
   new SlashCommandBuilder()
     .setName("moderated")
@@ -188,13 +186,13 @@ export const uniformCommands = [
   // selected from durable channel-bound records, not supplied as usernames.
   new SlashCommandBuilder()
     .setName("relog")
-    .setDescription("Replace a delivered uniform link for a customer.")
+    .setDescription("Submit a replacement Classic Shirt PNG for an existing customer delivery.")
     .addChannelOption((option) =>
       option.setName("channel").setDescription("Original customer delivery channel.").setRequired(true)
         .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
     )
-    .addStringOption((option) =>
-      option.setName("newlink").setDescription("Replacement Roblox asset ID or URL.").setRequired(true),
+    .addAttachmentOption((option) =>
+      option.setName("uniform").setDescription("Replacement Classic Shirt PNG using the Roblox template.").setRequired(true),
     ),
 ] as const;
 
@@ -231,7 +229,12 @@ export class UniformNotificationError extends Error {
   }
 }
 
-type DiscordDeliveryStage = "upload-log notice" | "customer delivery" | "purchase audit" | "relog audit";
+type DiscordDeliveryStage =
+  | "upload-log notice"
+  | "customer delivery"
+  | "purchase audit"
+  | "relog handoff"
+  | "relog audit";
 
 interface DiscordFailureDetails {
   status?: number;
@@ -327,6 +330,7 @@ interface PendingUniformConfirmation {
   actorId: string;
   command: UniformCommandName;
   submission: UniformSubmission;
+  attachmentBuffer?: Buffer;
   destinationChannelId: string;
   ticketChannelName: string;
   customerId?: string;
@@ -340,7 +344,9 @@ interface PendingRelogConfirmation {
   guildId: string;
   actorId: string;
   channelId: string;
-  newAsset: UniformAsset;
+  newAsset?: UniformAsset;
+  replacementAttachment?: NonNullable<UniformSubmission["sourceAttachment"]>;
+  attachmentBuffer?: Buffer;
   choices: Array<{ submissionId: string; rowIndex: number }>;
   expiresAt: number;
 }
@@ -365,9 +371,17 @@ export interface UniformSubmission {
     qm?: RobloxUser;
     seqm?: RobloxUser;
     uploader?: RobloxUser;
-    publisher: RobloxUser;
+    publisher?: RobloxUser;
   };
   assets: UniformAsset[];
+  uniformType?: string;
+  publisherName?: string;
+  sourceAttachment?: {
+    name: string;
+    contentType: "image/png";
+    size: number;
+    url: string;
+  };
 }
 
 function positiveAssetId(value: string): number {
@@ -453,6 +467,168 @@ function optionString(
   return value;
 }
 
+function optionAttachment(
+  interaction: ChatInputCommandInteraction,
+  name: string,
+  required = false,
+): Attachment | undefined {
+  const getter = (interaction.options as unknown as {
+    getAttachment?: (optionName: string, isRequired?: boolean) => Attachment | null;
+  }).getAttachment;
+  const value = typeof getter === "function"
+    ? getter.call(interaction.options, name, required)
+    : null;
+  if (!value && required) throw new Error(`Missing required attachment "${name}".`);
+  return value ?? undefined;
+}
+
+async function validatedClassicShirtAttachment(
+  interaction: ChatInputCommandInteraction,
+  optionName = "uniform",
+): Promise<{
+  attachment: NonNullable<UniformSubmission["sourceAttachment"]>;
+  buffer: Buffer;
+}> {
+  const attachment = optionAttachment(interaction, optionName, true)!;
+  if (
+    attachment.contentType !== "image/png" ||
+    !attachment.name.toLowerCase().endsWith(".png")
+  ) {
+    throw new Error("The uniform attachment must be a PNG file.");
+  }
+  if (
+    !Number.isSafeInteger(attachment.size) ||
+    attachment.size <= 0 ||
+    attachment.size > maximumUniformAttachmentBytes
+  ) {
+    throw new Error("The uniform PNG must be between 1 byte and 10 MB.");
+  }
+  let response: Response;
+  try {
+    response = await fetch(attachment.url, { signal: AbortSignal.timeout(10_000) });
+  } catch {
+    throw new Error("The uniform PNG could not be downloaded from Discord.");
+  }
+  if (!response.ok) {
+    throw new Error(`The uniform PNG could not be downloaded from Discord (HTTP ${response.status}).`);
+  }
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length !== attachment.size || bytes.length > maximumUniformAttachmentBytes) {
+    throw new Error("The downloaded uniform PNG size did not match the Discord attachment.");
+  }
+  const { width, height } = validatedPngDimensions(bytes);
+  if (width !== classicShirtWidth || height !== classicShirtHeight) {
+    throw new Error(
+      `The Classic Shirt PNG must be exactly ${classicShirtWidth}×${classicShirtHeight} pixels.`,
+    );
+  }
+  return {
+    attachment: {
+      name: attachment.name.slice(0, 100),
+      contentType: "image/png",
+      size: attachment.size,
+      url: attachment.url,
+    },
+    buffer: bytes,
+  };
+}
+
+function pngCrc32(bytes: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function validatedPngDimensions(bytes: Buffer): { width: number; height: number } {
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  if (bytes.length < 45 || !bytes.subarray(0, signature.length).equals(signature)) {
+    throw new Error("The uniform attachment is not a valid PNG image.");
+  }
+  let offset = signature.length;
+  let width = 0;
+  let height = 0;
+  let bitDepth = 0;
+  let colorType = 0;
+  let sawHeader = false;
+  let sawEnd = false;
+  let sawPalette = false;
+  const compressed: Buffer[] = [];
+  while (offset < bytes.length) {
+    if (offset + 12 > bytes.length) throw new Error("The uniform PNG is truncated.");
+    const length = bytes.readUInt32BE(offset);
+    const typeStart = offset + 4;
+    const dataStart = typeStart + 4;
+    const dataEnd = dataStart + length;
+    const crcOffset = dataEnd;
+    if (length > maximumUniformAttachmentBytes || crcOffset + 4 > bytes.length) {
+      throw new Error("The uniform PNG contains an invalid chunk.");
+    }
+    const type = bytes.toString("ascii", typeStart, dataStart);
+    if (!/^[A-Za-z]{4}$/.test(type)) throw new Error("The uniform PNG contains an invalid chunk type.");
+    const expectedCrc = bytes.readUInt32BE(crcOffset);
+    const actualCrc = pngCrc32(bytes.subarray(typeStart, dataEnd));
+    if (actualCrc !== expectedCrc) throw new Error("The uniform PNG failed its integrity check.");
+    if (!sawHeader) {
+      if (type !== "IHDR" || length !== 13) throw new Error("The uniform PNG has no valid image header.");
+      width = bytes.readUInt32BE(dataStart);
+      height = bytes.readUInt32BE(dataStart + 4);
+      bitDepth = bytes[dataStart + 8]!;
+      colorType = bytes[dataStart + 9]!;
+      const validDepths: Record<number, number[]> = {
+        0: [1, 2, 4, 8, 16],
+        2: [8, 16],
+        3: [1, 2, 4, 8],
+        4: [8, 16],
+        6: [8, 16],
+      };
+      if (
+        !validDepths[colorType]?.includes(bitDepth) ||
+        bytes[dataStart + 10] !== 0 ||
+        bytes[dataStart + 11] !== 0 ||
+        bytes[dataStart + 12] !== 0
+      ) {
+        throw new Error("The uniform PNG uses unsupported or invalid image settings.");
+      }
+      sawHeader = true;
+    } else if (type === "IHDR") {
+      throw new Error("The uniform PNG contains more than one image header.");
+    }
+    if (type === "PLTE") sawPalette = length > 0 && length % 3 === 0;
+    if (type === "IDAT") compressed.push(bytes.subarray(dataStart, dataEnd));
+    if (type === "IEND") {
+      if (length !== 0) throw new Error("The uniform PNG has an invalid end marker.");
+      offset = crcOffset + 4;
+      sawEnd = true;
+      break;
+    }
+    offset = crcOffset + 4;
+  }
+  if (!sawHeader || !sawEnd || offset !== bytes.length || !compressed.length) {
+    throw new Error("The uniform PNG is incomplete.");
+  }
+  try {
+    const decoded = inflateSync(Buffer.concat(compressed), {
+      maxOutputLength: maximumUniformDecodedBytes,
+    });
+    if (colorType === 3 && !sawPalette) throw new Error("missing palette");
+    const channels = colorType === 0 ? 1 : colorType === 2 ? 3 : colorType === 3 ? 1 : colorType === 4 ? 2 : 4;
+    const rowBytes = Math.ceil((width * channels * bitDepth) / 8);
+    const expectedLength = height * (rowBytes + 1);
+    if (decoded.length !== expectedLength) throw new Error("invalid scanline length");
+    for (let row = 0; row < height; row += 1) {
+      if (decoded[row * (rowBytes + 1)]! > 4) throw new Error("invalid scanline filter");
+    }
+  } catch {
+    throw new Error("The uniform PNG image data is corrupt or too large.");
+  }
+  return { width, height };
+}
+
 function assetInputsFor(
   interaction: ChatInputCommandInteraction,
   command: UniformCommandName,
@@ -492,7 +668,6 @@ function userInputsFor(
         { key: "customer", label: "Customer" },
         { key: "qm", label: "Quartermaster" },
         { key: "seqm", label: "Senior Quartermaster" },
-        { key: "publisher", label: "Publisher" },
       ]
     : [
         { key: "customer", label: "Customer" },
@@ -504,7 +679,7 @@ function userInputsFor(
 async function resolveSubmission(
   interaction: ChatInputCommandInteraction,
   command: UniformCommandName,
-): Promise<UniformSubmission> {
+): Promise<{ submission: UniformSubmission; attachmentBuffer?: Buffer }> {
   const inputs = userInputsFor(interaction, command);
   const unique = new Map<string, { input: string; labels: string[] }>();
   for (const { key, label } of inputs) {
@@ -535,6 +710,47 @@ async function resolveSubmission(
     users[key] = resolved.get(input.toLowerCase())!;
   }
 
+  if (command === "log") {
+    const legacyAssetInput = optionString(interaction, "shirtid1");
+    const uniformType = (
+      optionString(interaction, "uniform_type") ??
+      (legacyAssetInput ? "ClassA" : "")
+    ).trim();
+    if (!allowedUniformTypes.has(uniformType)) {
+      throw new Error("Select one of the approved Army, Marines, or Navy uniform types.");
+    }
+    // Preserve handler compatibility with confirmations created before the
+    // attachment-first command contract was registered. New Discord commands
+    // cannot supply these removed options.
+    if (legacyAssetInput) {
+      return {
+        submission: {
+          command,
+          users,
+          assets: [parseUniformAssetInput(legacyAssetInput)],
+          uniformType,
+          publisherName:
+            optionString(interaction, "publisher")?.trim() ||
+            interaction.client.user?.username?.trim() ||
+            "Quartermaster Bot",
+        },
+      };
+    }
+    const { attachment, buffer } = await validatedClassicShirtAttachment(interaction);
+    const publisherName = interaction.client.user?.username?.trim() || "Quartermaster Bot";
+    return {
+      submission: {
+        command,
+        users,
+        assets: [],
+        uniformType,
+        publisherName,
+        sourceAttachment: attachment,
+      },
+      attachmentBuffer: buffer,
+    };
+  }
+
   const assets = assetInputsFor(interaction, command).map((input) => {
     try {
       return parseUniformAssetInput(input);
@@ -544,7 +760,7 @@ async function resolveSubmission(
     }
   });
 
-  return { command, users, assets };
+  return { submission: { command, users, assets } };
 }
 
 function memberHasRole(member: GuildMember, roleIds: string[]): boolean {
@@ -684,19 +900,33 @@ export function uniformSheetRows(
     throw new Error("The Discord interaction has no submission ID.");
   }
   const users = submission.users;
+  const publisherName = submission.publisherName ?? users.publisher?.name ?? "Quartermaster Bot";
   // The visible worksheet has a user-established schema. Do not add IDs,
   // dates, command type, notification state, or any other metadata to it.
+  if (
+    submission.command === "log" &&
+    submission.sourceAttachment &&
+    submission.assets.length === 0
+  ) {
+    return [[
+      sheetValue(users.qm?.name),
+      sheetValue(users.seqm?.name),
+      sheetValue(publisherName),
+      sheetValue(users.customer.name),
+      "",
+    ]];
+  }
   return submission.assets.map((asset) => submission.command === "log"
     ? [
         sheetValue(users.qm?.name),
         sheetValue(users.seqm?.name),
-        sheetValue(users.publisher.name),
+        sheetValue(publisherName),
         sheetValue(users.customer.name),
         sheetValue(asset.url),
       ]
     : [
         sheetValue(users.uploader?.name),
-        sheetValue(users.publisher.name),
+        sheetValue(publisherName),
         sheetValue(users.customer.name),
         sheetValue(asset.url),
       ]);
@@ -791,12 +1021,16 @@ export function uniformSubmissionEmbed(
         { name: "Customer", value: profileLink(submission.users.customer), inline: true },
         { name: "Quartermaster", value: profileLink(submission.users.qm!), inline: true },
         { name: "Senior Quartermaster", value: profileLink(submission.users.seqm!), inline: true },
-        { name: "Publisher", value: profileLink(submission.users.publisher), inline: true },
+        { name: "Publisher", value: submission.users.publisher
+          ? profileLink(submission.users.publisher)
+          : safePresentationText(submission.publisherName ?? "Quartermaster Bot"), inline: true },
       ]
     : [
         { name: "Customer", value: profileLink(submission.users.customer), inline: true },
         { name: "Uploader", value: profileLink(submission.users.uploader!), inline: true },
-        { name: "Publisher", value: profileLink(submission.users.publisher), inline: true },
+        { name: "Publisher", value: submission.users.publisher
+          ? profileLink(submission.users.publisher)
+          : safePresentationText(submission.publisherName ?? "Quartermaster Bot"), inline: true },
       ];
   const assetFields = submission.assets.map((asset, index) => ({
     name: `Uniform ${index + 1}`,
@@ -837,13 +1071,15 @@ export async function handleUniformCommand(
   );
   const selectedChannel = interaction.options.getChannel("channel", true);
   const ticketChannel = await requireUniformChannel(interaction.guild!, selectedChannel.id, command);
-  const submission = await resolveSubmission(interaction, command);
+  const resolved = await resolveSubmission(interaction, command);
+  const submission = resolved.submission;
   const submissionId = interaction.id;
   if (!submissionId) throw new Error("The Discord interaction has no submission ID.");
   const nonce = randomBytes(16).toString("hex");
   const pending: PendingUniformConfirmation = {
     nonce, submissionId, guildId: interaction.guildId!, actorId: interaction.user.id,
-    command, submission, destinationChannelId: selectedChannel.id,
+    command, submission, attachmentBuffer: resolved.attachmentBuffer,
+    destinationChannelId: selectedChannel.id,
     ticketChannelName: typeof ticketChannel.name === "string" && ticketChannel.name.trim()
       ? ticketChannel.name.trim()
       : "Ticket name unavailable",
@@ -864,7 +1100,9 @@ export async function handleUniformCommand(
         { name: "Customer", value: "Not selected", inline: true },
         ...(command === "log" ? [{ name: "Senior Quartermaster", value: "Not selected", inline: true }] : []),
         { name: "Delivery channel", value: `<#${selectedChannel.id}>`, inline: true },
-        { name: "Assets", value: `${submission.assets.length} uniform asset${submission.assets.length === 1 ? "" : "s"}` },
+        { name: command === "log" ? "Uniform type" : "Assets", value: command === "log"
+          ? safePresentationText(submission.uniformType ?? "Unknown")
+          : `${submission.assets.length} uniform asset${submission.assets.length === 1 ? "" : "s"}` },
       ],
     )],
     components: uniformConfirmationComponents(nonce, command, false),
@@ -921,7 +1159,10 @@ function relogSelectionPayload(pending: PendingRelogConfirmation, records: Unifo
       "More than one recorded delivery or asset matches this channel. Select the exact original asset to replace. No spreadsheet cells or customer messages have changed.",
       "info",
       undefined,
-      [{ name: "Replacement asset", value: `[Open Roblox asset](${pending.newAsset.url})` }],
+      [{ name: pending.replacementAttachment ? "Replacement PNG" : "Replacement asset", value:
+        pending.replacementAttachment
+          ? safePresentationText(pending.replacementAttachment.name)
+          : `[Open Roblox asset](${pending.newAsset!.url})` }],
     )],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
       new StringSelectMenuBuilder()
@@ -990,9 +1231,9 @@ async function startRelog(
       nonce: `u-relog-${randomBytes(8).toString("hex")}`,
       startedAt: new Date().toISOString(),
     };
-    // Invalidate old controls before the sheet operation. Customer controls
-    // bind to this durable message ID, not merely the submission ID.
-    delete item.customerMessageId;
+    // Keep the old message ID as recovery metadata until the replacement
+    // message is confirmed. claimUniformDeliveryAction blocks its controls
+    // while this relog is in progress.
     item.customerMessageRevision = (item.customerMessageRevision ?? 0) + 1;
     delete item.terminal;
     delete item.action;
@@ -1157,12 +1398,363 @@ async function sendRelogAudit(record: UniformDeliveryRecord, guild: Guild): Prom
   }
 }
 
+function relogPublishingComponents(record: UniformDeliveryRecord, disabled = false) {
+  const nonce = record.relogHandoff!.nonce;
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`uniform:relog-publish-success:${record.submissionId}:${nonce}`)
+      .setLabel("Complete Replacement Upload")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(disabled),
+    new ButtonBuilder()
+      .setCustomId(`uniform:relog-publish-moderated:${record.submissionId}:${nonce}`)
+      .setLabel("Roblox Moderation Denied")
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(disabled),
+  )];
+}
+
+function relogPublishingEmbed(record: UniformDeliveryRecord): EmbedBuilder {
+  const handoff = record.relogHandoff!;
+  return presentationEmbed(
+    "Replacement Classic Shirt Awaiting Roblox Upload",
+    "Upload the attached replacement PNG through Roblox Creator Dashboard. The existing spreadsheet row and customer message remain unchanged until a published catalog link is completed.",
+    "info",
+    undefined,
+    [
+      { name: "Roblox item name", value: safePresentationText(record.customerName), inline: true },
+      { name: "Roblox description", value: safePresentationText(handoff.uniformType), inline: true },
+      { name: "Customer ticket", value: `<#${record.destinationChannelId}>`, inline: true },
+      { name: "Original asset", value: record.assets[handoff.rowIndex]?.url ?? "Unavailable" },
+    ],
+  );
+}
+
+function relogHandoffStartedPayload(record: UniformDeliveryRecord) {
+  return {
+    embeds: [presentationEmbed(
+      "Replacement Awaiting Roblox Upload",
+      "The replacement PNG and instructions were posted to the upload-log channel. The existing spreadsheet row and customer message are still unchanged.",
+      "info",
+      undefined,
+      [{ name: "Customer ticket", value: `<#${record.destinationChannelId}>`, inline: true }],
+    )],
+    components: [],
+    allowedMentions: noMentions,
+  };
+}
+
+async function startRelogPublishingHandoff(
+  record: UniformDeliveryRecord,
+  rowIndex: number,
+  actorId: string,
+  attachment: NonNullable<UniformSubmission["sourceAttachment"]>,
+  attachmentBuffer: Buffer | undefined,
+  guild: Guild,
+): Promise<UniformDeliveryRecord> {
+  if (record.relogHandoff && record.relogHandoff.state !== "published" &&
+      record.relogHandoff.state !== "moderated") {
+    throw new Error("A replacement publishing handoff is already active or unresolved for this delivery.");
+  }
+  if (!record.customerMessageId || !record.assets[rowIndex] || !record.rows[rowIndex] ||
+      record.rows[rowIndex]?.at(-1) !== record.assets[rowIndex]?.url) {
+    throw new Error("The selected original asset has no trusted delivery metadata. No replacement was started.");
+  }
+  const ledgerRows = await verifyUniformSubmissionRows(
+    record.spreadsheet, record.command, record.submissionId,
+  );
+  if (record.rows.length !== ledgerRows.length ||
+      record.rows.some((row, index) => row.length !== ledgerRows[index]?.length ||
+        row.some((cell, column) => cell !== ledgerRows[index]![column]))) {
+    throw new Error("The recorded delivery no longer matches its original spreadsheet rows. No replacement was started.");
+  }
+  const nonce = randomBytes(8).toString("hex");
+  let current = await updateUniformDelivery(record.submissionId, (item) => {
+    if (item.relogHandoff && item.relogHandoff.state !== "published" &&
+        item.relogHandoff.state !== "moderated") {
+      throw new Error("A replacement publishing handoff is already active.");
+    }
+    item.relogHandoff = {
+      state: "handoff-pending",
+      actorId,
+      rowIndex,
+      uniformType: item.publishing?.uniformType ?? "Replacement",
+      attachment,
+      nonce,
+      ...(attachmentBuffer
+        ? { sourceDataBase64: attachmentBuffer.toString("base64") }
+        : {}),
+    };
+  });
+  return sendRelogPublishingHandoff(current, guild, attachmentBuffer);
+}
+
+async function sendRelogPublishingHandoff(
+  record: UniformDeliveryRecord,
+  guild: Guild,
+  attachmentBuffer?: Buffer,
+): Promise<UniformDeliveryRecord> {
+  const operation = record.relogHandoff;
+  if (!operation || operation.state !== "handoff-pending") {
+    throw new Error("This replacement handoff is not ready to send.");
+  }
+  let current = await updateUniformDelivery(record.submissionId, (item) => {
+    if (item.relogHandoff?.nonce !== operation.nonce ||
+        item.relogHandoff.state !== "handoff-pending") {
+      throw new Error("This replacement handoff is already claimed or unresolved.");
+    }
+    item.relogHandoff.state = "handoff-claimed";
+  });
+  const channel = await requireUniformChannel(guild, current.uploadLogChannelId, current.command);
+  try {
+    const durableBytes = current.relogHandoff!.sourceDataBase64
+      ? Buffer.from(current.relogHandoff!.sourceDataBase64, "base64")
+      : undefined;
+    const message = await channel.send({
+      content: `<@${current.seqmId}>`,
+      embeds: [relogPublishingEmbed(current)],
+      components: relogPublishingComponents(current),
+      files: [{
+        attachment: attachmentBuffer ?? durableBytes ?? current.relogHandoff!.attachment.url,
+        name: `${current.customerName}-${current.relogHandoff!.uniformType}-replacement.png`
+          .replace(/[^a-z0-9_.-]+/gi, "-")
+          .slice(0, 100),
+      }],
+      allowedMentions: { parse: [], users: [current.seqmId] },
+      nonce: uniformDiscordNonce("relog", `${current.submissionId}:${operation.nonce}`),
+      enforceNonce: true,
+    });
+    const handoffMessageId = sentMessageId(message);
+    if (!handoffMessageId) throw new Error("Discord did not return a message ID for the replacement handoff.");
+    current = await updateUniformDelivery(record.submissionId, (item) => {
+      if (item.relogHandoff?.nonce !== operation.nonce || item.relogHandoff.state !== "handoff-claimed") {
+        throw new Error("The replacement handoff changed before its message ID was recorded.");
+      }
+      item.relogHandoff.state = "awaiting-result";
+      item.relogHandoff.handoffMessageId = handoffMessageId;
+      delete item.relogHandoff.sourceDataBase64;
+    });
+    return current;
+  } catch (error) {
+    const failure = error instanceof UniformDiscordDeliveryError
+      ? error
+      : discordDeliveryFailure("relog handoff", error);
+    await updateUniformDelivery(record.submissionId, (item) => {
+      if (item.relogHandoff?.nonce === operation.nonce && item.relogHandoff.state === "handoff-claimed") {
+        item.relogHandoff.state = failure.retryable ? "handoff-pending" : "unresolved";
+      }
+    }).catch(() => undefined);
+    throw failure;
+  }
+}
+
+async function relogPublishingRecordFor(
+  interaction: ButtonInteraction | ModalSubmitInteraction,
+  submissionId: string,
+  nonce: string,
+): Promise<UniformDeliveryRecord> {
+  const record = await getUniformDelivery(submissionId);
+  if (!record || record.guildId !== interaction.guildId ||
+      !record.relogHandoff || record.relogHandoff.nonce !== nonce) {
+    throw new Error("This replacement publishing handoff is unavailable.");
+  }
+  if ("message" in interaction && interaction.message &&
+      record.relogHandoff.handoffMessageId !== interaction.message.id) {
+    throw new Error("This replacement control is not attached to its recorded handoff message.");
+  }
+  if (!await relogAuthorized(
+    interaction.guild!,
+    interaction.user.id,
+    record,
+    await getGuildSetup(interaction.guildId!),
+  )) {
+    throw new Error("You are no longer authorized to complete this replacement.");
+  }
+  return record;
+}
+
+async function editRelogPublishingHandoff(
+  record: UniformDeliveryRecord,
+  guild: Guild,
+  embed: EmbedBuilder,
+): Promise<void> {
+  const messageId = record.relogHandoff?.handoffMessageId;
+  if (!messageId) return;
+  const channel = await requireUniformChannel(guild, record.uploadLogChannelId, record.command);
+  const message = await channel.messages?.fetch(messageId);
+  if (!message) return;
+  await message.edit({
+    content: "",
+    embeds: [embed],
+    components: relogPublishingComponents(record, true),
+    allowedMentions: noMentions,
+  });
+}
+
+export async function handleUniformRelogPublishingButton(
+  interaction: ButtonInteraction,
+): Promise<void> {
+  const [, control, submissionId, nonce] = interaction.customId.split(":");
+  const action = control === "relog-publish-success"
+    ? "success"
+    : control === "relog-publish-moderated"
+      ? "moderated"
+      : undefined;
+  if (!action || !submissionId || !nonce) throw new Error("That replacement action is unavailable.");
+  let record = await relogPublishingRecordFor(interaction, submissionId, nonce);
+  if (record.relogHandoff!.state !== "awaiting-result") {
+    throw new Error("This replacement handoff is already completed or being processed.");
+  }
+  if (action === "success") {
+    await interaction.showModal(
+      new ModalBuilder()
+        .setCustomId(`uniform:relog-publish-modal:${submissionId}:${nonce}`)
+        .setTitle("Complete Replacement Upload")
+        .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("catalog_link")
+            .setLabel("Replacement Roblox catalog link")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(500),
+        )),
+    );
+    return;
+  }
+  await interaction.deferUpdate();
+  record = await updateUniformDelivery(submissionId, (item) => {
+    if (item.relogHandoff?.nonce !== nonce || item.relogHandoff.state !== "awaiting-result") {
+      throw new Error("This replacement handoff is no longer awaiting a result.");
+    }
+    item.relogHandoff.state = "moderation-claimed";
+  });
+  try {
+    const setup = await getGuildSetup(record.guildId);
+    if (!setup) throw new Error("This server no longer has a valid bot setup.");
+    const moderatedChannelId = uniformAccessSettings(setup, "moderated").moderatedChannelId;
+    const channel = await requireUniformChannel(interaction.guild!, moderatedChannelId, "moderated");
+    const sourceRow = record.rows[record.relogHandoff!.rowIndex] ?? [];
+    const moderatedRows = [[
+      typeof sourceRow[0] === "string" ? sourceRow[0] : "",
+      record.publishing?.publisherName ?? "Quartermaster Bot",
+      record.customerName,
+      "",
+    ]];
+    await appendUniformRows({
+      config: record.spreadsheet,
+      logKind: "moderated",
+      rows: moderatedRows,
+      submissionId: `relog-moderated:${record.submissionId}:${nonce}`,
+    });
+    await channel.send({
+      content: `<@${record.seqmId}>`,
+      embeds: [presentationEmbed(
+        "Replacement Upload Unsuccessful",
+        "Roblox moderation denied the replacement. The original successful row and customer message remain unchanged.",
+        "error",
+        undefined,
+        [
+          { name: "Customer", value: safePresentationText(record.customerName), inline: true },
+          { name: "Ticket", value: `<#${record.destinationChannelId}>`, inline: true },
+        ],
+      )],
+      allowedMentions: { parse: [], users: [record.seqmId] },
+      nonce: uniformDiscordNonce("moderated", `${record.submissionId}:${nonce}`),
+      enforceNonce: true,
+    });
+    record = await updateUniformDelivery(submissionId, (item) => {
+      if (item.relogHandoff?.nonce !== nonce ||
+          item.relogHandoff.state !== "moderation-claimed") {
+        throw new Error("The replacement moderation state changed before completion.");
+      }
+      item.relogHandoff.state = "moderated";
+      item.relogHandoff.completedAt = new Date().toISOString();
+    });
+    await editRelogPublishingHandoff(record, interaction.guild!, presentationEmbed(
+      "Replacement Rejected by Roblox",
+      "The rejection was logged in the moderated worksheet. The original successful delivery remains active.",
+      "error",
+    )).catch(() => undefined);
+    await interaction.editReply({
+      embeds: [presentationEmbed("Replacement Rejection Recorded", "No customer message or successful spreadsheet row was changed.", "success")],
+      components: relogPublishingComponents(record, true),
+      allowedMentions: noMentions,
+    });
+  } catch (error) {
+    const { status } = discordFailureDetails(error);
+    const definitelyRejected = status === 400 || status === 403;
+    await updateUniformDelivery(submissionId, (item) => {
+      if (item.relogHandoff?.nonce === nonce &&
+          item.relogHandoff.state === "moderation-claimed") {
+        item.relogHandoff.state = definitelyRejected ? "awaiting-result" : "unresolved";
+      }
+    }).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function handleUniformRelogPublishingModal(
+  interaction: ModalSubmitInteraction,
+): Promise<void> {
+  const [, control, submissionId, nonce] = interaction.customId.split(":");
+  if (control !== "relog-publish-modal" || !submissionId || !nonce) {
+    throw new Error("That replacement completion is unavailable.");
+  }
+  let record = await relogPublishingRecordFor(interaction, submissionId, nonce);
+  if (record.relogHandoff!.state !== "awaiting-result") {
+    throw new Error("This replacement handoff is already completed or being processed.");
+  }
+  const asset = parseUniformAssetInput(interaction.fields.getTextInputValue("catalog_link"));
+  const published = await verifyPublishedClassicShirt(asset.id);
+  if (published.name !== record.customerName) {
+    throw new Error(`The replacement Classic Shirt must be named exactly "${record.customerName}".`);
+  }
+  await interaction.deferReply({ ephemeral: true });
+  const rowIndex = record.relogHandoff!.rowIndex;
+  record = await updateUniformDelivery(submissionId, (item) => {
+    if (item.relogHandoff?.nonce !== nonce || item.relogHandoff.state !== "awaiting-result") {
+      throw new Error("This replacement handoff is no longer awaiting a result.");
+    }
+    item.relogHandoff.state = "publish-claimed";
+    item.relogHandoff.publishedAsset = asset;
+  });
+  try {
+    record = await selectAndStartRelog(record, rowIndex, asset, interaction.guild!);
+    record = await updateUniformDelivery(submissionId, (item) => {
+      if (item.relogHandoff?.nonce !== nonce) {
+        throw new Error("The replacement handoff changed before completion.");
+      }
+      item.relogHandoff.state = "published";
+      item.relogHandoff.completedAt = new Date().toISOString();
+    });
+    await editRelogPublishingHandoff(record, interaction.guild!, relogAuditEmbed(record)).catch(() => undefined);
+    await interaction.editReply(relogSuccessPayload(record));
+  } catch (error) {
+    const latest = await getUniformDelivery(submissionId).catch(() => undefined);
+    if (!latest?.relog) {
+      await updateUniformDelivery(submissionId, (item) => {
+        if (item.relogHandoff?.nonce === nonce &&
+            item.relogHandoff.state === "publish-claimed") {
+          item.relogHandoff.state = "awaiting-result";
+        }
+      }).catch(() => undefined);
+    }
+    throw new UniformDeliveryRecoveryError(
+      submissionId,
+      error instanceof Error ? error.message : "The replacement delivery could not be completed.",
+      retryControlFor(latest),
+    );
+  }
+}
+
 export async function handleUniformRelogCommand(
   interaction: ChatInputCommandInteraction,
 ): Promise<void> {
   const selected = interaction.options.getChannel("channel", true);
   await requireUniformChannel(interaction.guild!, selected.id, "log");
-  const newAsset = parseUniformAssetInput(optionString(interaction, "newlink", true) ?? "");
+  const legacyLink = optionString(interaction, "newlink");
+  const newAsset = legacyLink ? parseUniformAssetInput(legacyLink) : undefined;
+  const replacement = legacyLink ? undefined : await validatedClassicShirtAttachment(interaction);
   const records = await findUniformDeliveriesForChannel(interaction.guildId!, selected.id);
   const setup = await getGuildSetup(interaction.guildId!);
   const authorized: UniformDeliveryRecord[] = [];
@@ -1180,10 +1772,22 @@ export async function handleUniformRelogCommand(
   }
   if (choices.length === 1) {
     const choice = choices[0]!;
+    if (replacement) {
+      const result = await startRelogPublishingHandoff(
+        authorized.find((record) => record.submissionId === choice.submissionId)!,
+        choice.rowIndex,
+        interaction.user.id,
+        replacement.attachment,
+        replacement.buffer,
+        interaction.guild!,
+      );
+      await interaction.editReply(relogHandoffStartedPayload(result));
+      return;
+    }
     try {
       const result = await selectAndStartRelog(
         authorized.find((record) => record.submissionId === choice.submissionId)!,
-        choice.rowIndex, newAsset, interaction.guild!,
+        choice.rowIndex, newAsset!, interaction.guild!,
       );
       await interaction.editReply(relogSuccessPayload(result));
     } catch (error) {
@@ -1200,7 +1804,12 @@ export async function handleUniformRelogCommand(
   const nonce = randomBytes(16).toString("hex");
   const pending: PendingRelogConfirmation = {
     nonce, guildId: interaction.guildId!, actorId: interaction.user.id,
-    channelId: selected.id, newAsset, choices, expiresAt: Date.now() + uniformConfirmationLifetimeMs,
+    channelId: selected.id,
+    ...(newAsset ? { newAsset } : {}),
+    ...(replacement
+      ? { replacementAttachment: replacement.attachment, attachmentBuffer: replacement.buffer }
+      : {}),
+    choices, expiresAt: Date.now() + uniformConfirmationLifetimeMs,
   };
   pendingRelogConfirmations.set(nonce, pending);
   await interaction.editReply(relogSelectionPayload(pending, authorized));
@@ -1226,8 +1835,16 @@ export async function handleUniformRelogSelection(
   pendingRelogConfirmations.delete(nonce);
   await interaction.deferUpdate();
   try {
-    const result = await selectAndStartRelog(record, rowIndex, pending.newAsset, interaction.guild!);
-    await interaction.editReply(relogSuccessPayload(result));
+    if (pending.replacementAttachment) {
+      const result = await startRelogPublishingHandoff(
+        record, rowIndex, interaction.user.id, pending.replacementAttachment,
+        pending.attachmentBuffer, interaction.guild!,
+      );
+      await interaction.editReply(relogHandoffStartedPayload(result));
+    } else {
+      const result = await selectAndStartRelog(record, rowIndex, pending.newAsset!, interaction.guild!);
+      await interaction.editReply(relogSuccessPayload(result));
+    }
   } catch (error) {
     const current = await getUniformDelivery(submissionId).catch(() => undefined);
     if (!current?.relog) throw error;
@@ -1285,7 +1902,9 @@ function confirmationEmbed(pending: PendingUniformConfirmation): EmbedBuilder {
         ? [{ name: "Senior Quartermaster", value: pending.seqmId ? `<@${pending.seqmId}>` : "Not selected", inline: true }]
         : []),
       { name: "Delivery channel", value: `<#${pending.destinationChannelId}>`, inline: true },
-      { name: "Assets", value: pending.submission.assets.map((asset) => `[${asset.id}](${asset.url})`).join(", ") },
+      { name: pending.command === "log" ? "Uniform type" : "Assets", value: pending.command === "log"
+        ? safePresentationText(pending.submission.uniformType ?? "Unknown")
+        : pending.submission.assets.map((asset) => `[${asset.id}](${asset.url})`).join(", ") },
     ],
   );
 }
@@ -1486,6 +2105,7 @@ function hasRetryableDelivery(record: UniformDeliveryRecord | undefined): boolea
   return Boolean(
     record &&
     record.sheetState === "saved" &&
+    (!record.publishing || record.publishing.state === "published") &&
     (record.logNoticeState === "pending" || record.customerDeliveryState === "pending") &&
     record.logNoticeState !== "unresolved" &&
     record.customerDeliveryState !== "unresolved",
@@ -1498,11 +2118,30 @@ function hasRetryableDelivery(record: UniformDeliveryRecord | undefined): boolea
  * Discord operation is unresolved, however, no automatic replay is safe.
  */
 function canRetryDelivery(record: UniformDeliveryRecord | undefined): boolean {
+  if (record?.relogHandoff) {
+    if (record.relogHandoff.state === "handoff-pending") return true;
+    if (record.relogHandoff.state === "publish-claimed") {
+      return Boolean(
+        record.relogHandoff.publishedAsset &&
+        (!record.relog ||
+          record.relog.state === "claimed" ||
+          record.relog.state === "sheet-updated" ||
+          record.relog.state === "pending" ||
+          (record.relog.state === "sent" && record.relog.auditState === "pending")),
+      );
+    }
+    if (record.relogHandoff.state !== "published") return false;
+  }
   if (record?.relog) {
     return record.relog.state === "claimed" ||
       record.relog.state === "sheet-updated" ||
       record.relog.state === "pending" ||
       (record.relog.state === "sent" && record.relog.auditState === "pending");
+  }
+  if (record?.publishing) {
+    if (record.publishing.state === "handoff-pending" ||
+        record.publishing.state === "publish-claimed") return true;
+    if (record.publishing.state !== "published") return false;
   }
   return Boolean(
     record &&
@@ -1556,6 +2195,340 @@ export function uniformDeliveryRecoveryResponse(error: UniformDeliveryRecoveryEr
 function sentMessageId(value: unknown): string {
   if (!value || typeof value !== "object") return "";
   return typeof (value as { id?: unknown }).id === "string" ? (value as { id: string }).id : "";
+}
+
+function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
+  const publishing = record.publishing!;
+  return presentationEmbed(
+    "Classic Shirt Awaiting Roblox Upload",
+    "Upload the attached PNG through Roblox Creator Dashboard as a group Classic Shirt. Place it on sale, then record the catalog link here. If Roblox rejects it, record the moderation denial instead.",
+    "info",
+    undefined,
+    [
+      { name: "Roblox item name", value: safePresentationText(record.customerName), inline: true },
+      { name: "Roblox description", value: safePresentationText(publishing.uniformType), inline: true },
+      { name: "Publisher", value: safePresentationText(publishing.publisherName), inline: true },
+      { name: "Customer ticket", value: `<#${record.destinationChannelId}>`, inline: true },
+      { name: "PNG", value: safePresentationText(publishing.attachment.name), inline: true },
+    ],
+  );
+}
+
+function publishingHandoffComponents(record: UniformDeliveryRecord, disabled = false) {
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`uniform:publish-success:${record.submissionId}`)
+      .setLabel("Complete Published Upload")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(disabled),
+    new ButtonBuilder()
+      .setCustomId(`uniform:publish-moderated:${record.submissionId}`)
+      .setLabel("Roblox Moderation Denied")
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(disabled),
+  )];
+}
+
+async function sendPublishingHandoff(
+  record: UniformDeliveryRecord,
+  guild: Guild,
+  attachmentBuffer?: Buffer,
+): Promise<UniformDeliveryRecord> {
+  const publishing = record.publishing;
+  if (!publishing) throw new Error("This uniform has no publishing handoff.");
+  if (publishing.state === "awaiting-result") return record;
+  if (publishing.state !== "handoff-pending") {
+    throw new Error("The publishing handoff outcome is unresolved and will not be sent again automatically.");
+  }
+  const channel = await requireUniformChannel(guild, record.uploadLogChannelId, "log");
+  let current = await updateUniformDelivery(record.submissionId, (item) => {
+    if (item.publishing?.state !== "handoff-pending") {
+      throw new Error("This publishing handoff is already claimed.");
+    }
+    item.publishing.state = "handoff-claimed";
+  });
+  try {
+    const source = attachmentBuffer ??
+      (publishing.sourceDataBase64
+        ? Buffer.from(publishing.sourceDataBase64, "base64")
+        : publishing.attachment.url);
+    const message = await channel.send({
+      content: `<@${record.seqmId}>`,
+      embeds: [publishingHandoffEmbed(current)],
+      components: publishingHandoffComponents(current),
+      files: [{
+        attachment: source,
+        name: `${record.customerName}-${publishing.uniformType}.png`
+          .replace(/[^a-z0-9_.-]+/gi, "-")
+          .slice(0, 100),
+      }],
+      allowedMentions: { parse: [], users: [record.seqmId] },
+      nonce: uniformDiscordNonce("notice", record.submissionId),
+      enforceNonce: true,
+    });
+    const handoffMessageId = sentMessageId(message);
+    if (!handoffMessageId) throw new Error("Discord did not return a message ID for the publishing handoff.");
+    current = await updateUniformDelivery(record.submissionId, (item) => {
+      if (item.publishing?.state !== "handoff-claimed") {
+        throw new Error("The publishing handoff state changed before its message ID was recorded.");
+      }
+      item.publishing.state = "awaiting-result";
+      item.publishing.handoffMessageId = handoffMessageId;
+      delete item.publishing.sourceDataBase64;
+      item.auditMessageId = handoffMessageId;
+      item.logNoticeState = "sent";
+    });
+    return current;
+  } catch (error) {
+    const failure = error instanceof UniformDiscordDeliveryError
+      ? error
+      : discordDeliveryFailure("upload-log notice", error);
+    await updateUniformDelivery(record.submissionId, (item) => {
+      if (item.publishing?.state === "handoff-claimed") {
+        item.publishing.state = failure.retryable ? "handoff-pending" : "unresolved";
+      }
+    }).catch(() => undefined);
+    throw failure;
+  }
+}
+
+async function publishingRecordFor(
+  interaction: ButtonInteraction | ModalSubmitInteraction,
+  submissionId: string,
+): Promise<UniformDeliveryRecord> {
+  const record = await getUniformDelivery(submissionId);
+  if (!record || record.guildId !== interaction.guildId || !record.publishing) {
+    throw new Error("This publishing handoff is unavailable.");
+  }
+  if ("message" in interaction && interaction.message &&
+      record.publishing.handoffMessageId !== interaction.message.id) {
+    throw new Error("This publishing control is not attached to its recorded handoff message.");
+  }
+  const member = await currentMember(interaction.guild!, interaction.user.id);
+  if (interaction.guild!.ownerId === member.id ||
+      member.permissions.has(PermissionFlagsBits.Administrator) ||
+      interaction.user.id === record.seqmId) {
+    return record;
+  }
+  if (interaction.user.id === record.actorId) {
+    const setup = await getGuildSetup(record.guildId);
+    if (!setup) throw new Error("This server no longer has a valid bot setup.");
+    await requireUniformSubmitter(
+      interaction.guild!,
+      interaction.user.id,
+      uniformAccessSettings(setup, "log"),
+    );
+    return record;
+  }
+  {
+    throw new Error("Only the original submitter, assigned Senior Quartermaster, or an Administrator can complete this upload.");
+  }
+}
+
+async function editPublishingHandoff(
+  record: UniformDeliveryRecord,
+  guild: Guild,
+  embed: EmbedBuilder,
+): Promise<void> {
+  const messageId = record.publishing?.handoffMessageId;
+  if (!messageId) return;
+  const channel = await requireUniformChannel(guild, record.uploadLogChannelId, "log");
+  const message = await channel.messages?.fetch(messageId);
+  if (!message) return;
+  await message.edit({
+    content: "",
+    embeds: [embed],
+    components: publishingHandoffComponents(record, true),
+    allowedMentions: noMentions,
+  });
+}
+
+export async function handleUniformPublishingButton(
+  interaction: ButtonInteraction,
+): Promise<void> {
+  const [, control, submissionId] = interaction.customId.split(":");
+  const action = control === "publish-success"
+    ? "success"
+    : control === "publish-moderated"
+      ? "moderated"
+      : undefined;
+  if (!submissionId || !action) {
+    throw new Error("That publishing action is unavailable.");
+  }
+  const record = await publishingRecordFor(interaction, submissionId);
+  if (record.publishing!.state !== "awaiting-result") {
+    throw new Error("This publishing handoff has already been completed or is being processed.");
+  }
+  if (action === "success") {
+    await interaction.showModal(
+      new ModalBuilder()
+        .setCustomId(`uniform:publish-modal:${submissionId}`)
+        .setTitle("Complete Classic Shirt Upload")
+        .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("catalog_link")
+            .setLabel("Published Roblox catalog link")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(500),
+        )),
+    );
+    return;
+  }
+  await interaction.deferUpdate();
+  let current = await updateUniformDelivery(submissionId, (item) => {
+    if (item.publishing?.state !== "awaiting-result") {
+      throw new Error("This publishing handoff is no longer awaiting a result.");
+    }
+    item.publishing.state = "moderation-claimed";
+  });
+  try {
+    const setup = await getGuildSetup(record.guildId);
+    if (!setup) throw new Error("This server no longer has a valid bot setup.");
+    const settings = uniformAccessSettings(setup, "moderated");
+    const moderatedChannelId = settings.moderatedChannelId;
+    const moderatedChannel = await requireUniformChannel(interaction.guild!, moderatedChannelId, "moderated");
+    const original = current.rows[0] ?? [];
+    const moderatedRows = [[
+      typeof original[0] === "string" ? original[0] : "",
+      current.publishing!.publisherName,
+      current.customerName,
+      "",
+    ]];
+    await appendUniformRows({
+      config: current.spreadsheet,
+      logKind: "moderated",
+      rows: moderatedRows,
+      submissionId: current.submissionId,
+    });
+    current = await updateUniformDelivery(submissionId, (item) => {
+      if (!item.publishing || item.publishing.state !== "moderation-claimed") {
+        throw new Error("The moderated upload state changed before its sheet result was recorded.");
+      }
+      item.rows = moderatedRows;
+      item.sheetState = "saved";
+    });
+    await moderatedChannel.send({
+      content: `<@${current.seqmId}>`,
+      embeds: [presentationEmbed(
+        "Uniform Upload Unsuccessful",
+        "Roblox moderation denied this Classic Shirt. It was logged in the moderated worksheet and nothing was sent to the customer.",
+        "error",
+        undefined,
+        [
+          { name: "Customer", value: safePresentationText(current.customerName), inline: true },
+          { name: "Uniform type", value: safePresentationText(current.publishing!.uniformType), inline: true },
+          { name: "Ticket", value: `<#${current.destinationChannelId}>`, inline: true },
+        ],
+      )],
+      allowedMentions: { parse: [], users: [current.seqmId] },
+      nonce: uniformDiscordNonce("moderated", current.submissionId),
+      enforceNonce: true,
+    });
+    current = await updateUniformDelivery(submissionId, (item) => {
+      if (!item.publishing || item.publishing.state !== "moderation-claimed") {
+        throw new Error("The moderated upload state changed before completion.");
+      }
+      item.customerDeliveryState = "sent";
+      item.publishing.state = "moderated";
+      item.publishing.completedAt = new Date().toISOString();
+    });
+    await editPublishingHandoff(record, interaction.guild!, presentationEmbed(
+      "Roblox Moderation Denied",
+      "This upload was logged in the moderated worksheet. No customer message was sent.",
+      "error",
+    )).catch(() => undefined);
+    await interaction.editReply({
+      embeds: [presentationEmbed("Moderation Denial Recorded", "The moderated worksheet and Senior Quartermaster notice were completed.", "success")],
+      components: publishingHandoffComponents(current, true),
+      allowedMentions: noMentions,
+    });
+  } catch (error) {
+    const current = await getUniformDelivery(submissionId).catch(() => undefined);
+    const failure = error instanceof UniformDiscordDeliveryError
+      ? error
+      : current?.sheetState === "saved"
+        ? discordDeliveryFailure("upload-log notice", error)
+        : undefined;
+    await updateUniformDelivery(submissionId, (item) => {
+      if (item.publishing?.state === "moderation-claimed") {
+        item.publishing.state = !failure || failure.retryable ? "awaiting-result" : "unresolved";
+      }
+    }).catch(() => undefined);
+    throw failure ?? error;
+  }
+}
+
+export async function handleUniformPublishingModal(
+  interaction: ModalSubmitInteraction,
+): Promise<void> {
+  const [, control, submissionId] = interaction.customId.split(":");
+  if (control !== "publish-modal") throw new Error("That publishing completion is unavailable.");
+  if (!submissionId) throw new Error("That publishing completion is unavailable.");
+  let record = await publishingRecordFor(interaction, submissionId);
+  if (record.publishing!.state !== "awaiting-result") {
+    throw new Error("This publishing handoff has already been completed or is being processed.");
+  }
+  const asset = parseUniformAssetInput(interaction.fields.getTextInputValue("catalog_link"));
+  const published = await verifyPublishedClassicShirt(asset.id);
+  if (published.name !== record.customerName) {
+    throw new Error(`The published Classic Shirt must be named exactly "${record.customerName}".`);
+  }
+  await interaction.deferReply({ ephemeral: true });
+  record = await updateUniformDelivery(submissionId, (item) => {
+    if (item.publishing?.state !== "awaiting-result") {
+      throw new Error("This publishing handoff is no longer awaiting a result.");
+    }
+    item.publishing.state = "publish-claimed";
+    item.assets = [asset];
+    const row = item.rows[0];
+    if (!row || row.length !== LOG_UNIFORM_COLUMN_COUNT) {
+      throw new Error("The pending uniform spreadsheet row is incomplete.");
+    }
+    row[row.length - 1] = asset.url;
+  });
+  try {
+    await appendUniformRows({
+      config: record.spreadsheet,
+      logKind: "log",
+      rows: record.rows,
+      submissionId: record.submissionId,
+    });
+    record = await updateUniformDelivery(submissionId, (item) => {
+      if (!item.publishing || item.publishing.state !== "publish-claimed") {
+        throw new Error("The published upload state changed before completion.");
+      }
+      item.sheetState = "saved";
+      item.logNoticeState = "sent";
+      item.publishing.state = "published";
+      item.publishing.completedAt = new Date().toISOString();
+    });
+    await editPublishingHandoff(record, interaction.guild!, uploadAuditEmbed(record)).catch(() => undefined);
+    const delivered = await sendPendingDelivery(record, interaction.guild!);
+    await interaction.editReply({
+      embeds: [presentationEmbed(
+        "Uniform Published and Delivered",
+        `The catalog link was saved and the customer delivery was posted to <#${delivered.destinationChannelId}>.`,
+        "success",
+        undefined,
+        [{ name: "Catalog link", value: asset.url }],
+      )],
+      components: [],
+      allowedMentions: noMentions,
+    });
+  } catch (error) {
+    const latest = await getUniformDelivery(submissionId).catch(() => undefined);
+    if (latest?.sheetState !== "saved") {
+      await updateUniformDelivery(submissionId, (item) => {
+        if (item.publishing?.state === "publish-claimed") item.publishing.state = "awaiting-result";
+      }).catch(() => undefined);
+    }
+    throw new UniformDeliveryRecoveryError(
+      submissionId,
+      error instanceof Error ? error.message : "The published uniform could not be completed.",
+      retryControlFor(latest),
+    );
+  }
 }
 
 async function sendPendingDelivery(
@@ -1686,6 +2659,19 @@ export async function handleUniformSubmitButton(
       customerRobloxId: pending.submission.users.customer.id,
       logNoticeState: "pending",
       customerDeliveryState: "pending", ticketChannelName: pending.ticketChannelName,
+      ...(pending.command === "log" && pending.submission.sourceAttachment && pending.submission.uniformType
+        ? {
+            publishing: {
+              state: "handoff-pending" as const,
+              uniformType: pending.submission.uniformType,
+              publisherName: pending.submission.publisherName ?? "Quartermaster Bot",
+              attachment: pending.submission.sourceAttachment,
+              ...(pending.attachmentBuffer
+                ? { sourceDataBase64: pending.attachmentBuffer.toString("base64") }
+                : {}),
+            },
+          }
+        : {}),
       createdAt: new Date().toISOString(),
     });
   }
@@ -1696,6 +2682,24 @@ export async function handleUniformSubmitButton(
   if (activeUniformSubmissions.has(key)) throw new Error("This uniform submission is already being processed.");
   activeUniformSubmissions.add(key);
   try {
+    if (record.publishing && record.publishing.state !== "published" && record.publishing.state !== "moderated") {
+      const handoff = await sendPublishingHandoff(record, interaction.guild!, pending.attachmentBuffer);
+      await interaction.editReply({
+        embeds: [presentationEmbed(
+          "Awaiting Roblox Upload",
+          "The validated PNG and upload instructions were posted to the configured upload-log channel. Complete the Roblox upload there; no spreadsheet row or customer message has been sent yet.",
+          "info",
+          undefined,
+          [
+            { name: "Uniform type", value: safePresentationText(handoff.publishing!.uniformType), inline: true },
+            { name: "Customer ticket", value: `<#${handoff.destinationChannelId}>`, inline: true },
+          ],
+        )],
+        components: [],
+        allowedMentions: noMentions,
+      });
+      return;
+    }
     if (record.sheetState !== "saved") {
       try {
         await appendUniformRows({ config: record.spreadsheet, logKind: record.command, rows: record.rows, submissionId: record.submissionId });
@@ -1767,7 +2771,7 @@ export async function handleUniformRetryButton(
     const latest = await getGuildSetup(record.guildId);
     if (!latest) throw new Error("This server no longer has a valid bot setup.");
     const settings = uniformAccessSettings(latest, record.command);
-    if (record.relog) {
+    if (record.relog || record.relogHandoff) {
       if (!await relogAuthorized(interaction.guild!, interaction.user.id, record, latest)) {
         throw new Error(record.command === "log"
           ? "Only the assigned Senior Quartermaster or a current Administrator can retry this relog."
@@ -1785,6 +2789,96 @@ export async function handleUniformRetryButton(
     // access by itself, and the guild binding above is checked before any
     // provider work.
     authorizationVerified = true;
+    if (record.relogHandoff?.state === "handoff-pending") {
+      const handoff = await sendRelogPublishingHandoff(record, interaction.guild!);
+      await interaction.editReply(relogHandoffStartedPayload(handoff));
+      return;
+    }
+    if (record.relogHandoff?.state === "publish-claimed") {
+      const operation = record.relogHandoff;
+      let delivered = record;
+      if (!delivered.relog) {
+        if (!operation.publishedAsset) {
+          throw new Error("The verified replacement asset is missing, so recovery cannot continue.");
+        }
+        delivered = await selectAndStartRelog(
+          delivered,
+          operation.rowIndex,
+          operation.publishedAsset,
+          interaction.guild!,
+        );
+      } else {
+        delivered = await continueRelog(delivered, interaction.guild!);
+      }
+      if (delivered.relog?.state !== "sent") {
+        throw new Error("The replacement delivery has not reached a confirmed sent state.");
+      }
+      delivered = await updateUniformDelivery(record.submissionId, (item) => {
+        if (item.relogHandoff?.nonce !== operation.nonce) {
+          throw new Error("The replacement handoff changed during recovery.");
+        }
+        item.relogHandoff.state = "published";
+        item.relogHandoff.completedAt = new Date().toISOString();
+      });
+      await editRelogPublishingHandoff(delivered, interaction.guild!, relogAuditEmbed(delivered)).catch(() => undefined);
+      await interaction.editReply(relogSuccessPayload(delivered));
+      return;
+    }
+    if (record.relogHandoff &&
+        record.relogHandoff.state !== "published" &&
+        record.relogHandoff.state !== "moderated") {
+      throw new Error("This replacement publishing handoff is awaiting a result or unresolved. Retry Delivery cannot bypass Roblox publication.");
+    }
+    if (record.publishing) {
+      const state = record.publishing.state;
+      if (state === "handoff-pending") {
+        const handoff = await sendPublishingHandoff(record, interaction.guild!);
+        await interaction.editReply({
+          embeds: [presentationEmbed(
+            "Publishing Handoff Restored",
+            "The original pending handoff was posted. Complete it in the upload-log channel; no spreadsheet row or customer message was sent.",
+            "success",
+          )],
+          components: [],
+          allowedMentions: noMentions,
+        });
+        return;
+      }
+      if (state === "handoff-claimed" || state === "moderation-claimed") {
+        await updateUniformDelivery(record.submissionId, (item) => {
+          if (item.publishing?.state === state) item.publishing.state = "unresolved";
+        });
+        throw new Error("The publishing provider outcome is unresolved and will not be replayed automatically.");
+      }
+      if (state === "awaiting-result") {
+        throw new Error("This uniform is still awaiting a Roblox publishing result in the upload-log channel.");
+      }
+      if (state === "moderated") {
+        throw new Error("This uniform was rejected by Roblox moderation and has no customer delivery to retry.");
+      }
+      if (state === "unresolved") {
+        throw new Error("The publishing handoff outcome is unresolved and will not be replayed automatically.");
+      }
+      if (state === "publish-claimed") {
+        await appendUniformRows({
+          config: record.spreadsheet,
+          logKind: "log",
+          rows: record.rows,
+          submissionId: record.submissionId,
+        });
+        await updateUniformDelivery(record.submissionId, (item) => {
+          if (item.publishing?.state !== "publish-claimed") {
+            throw new Error("The publishing result changed during recovery.");
+          }
+          item.sheetState = "saved";
+          item.logNoticeState = "sent";
+          item.publishing.state = "published";
+          item.publishing.completedAt = new Date().toISOString();
+        });
+      } else if (record.sheetState !== "saved") {
+        throw new Error("The published uniform has no confirmed spreadsheet row and will not be delivered.");
+      }
+    }
     await fetchedMember(interaction.guild!, record.customerId);
     if (record.command === "log") await fetchedMember(interaction.guild!, record.seqmId);
     await requireUniformChannel(interaction.guild!, record.destinationChannelId, record.command);
@@ -1794,7 +2888,7 @@ export async function handleUniformRetryButton(
       return;
     }
     await requireUniformChannel(interaction.guild!, record.uploadLogChannelId, record.command);
-    if (record.sheetState !== "saved") {
+    if (!record.publishing && record.sheetState !== "saved") {
       await appendUniformRows({ config: record.spreadsheet, logKind: record.command, rows: record.rows, submissionId: record.submissionId });
       await updateUniformDelivery(record.submissionId, (item) => { item.sheetState = "saved"; });
     }

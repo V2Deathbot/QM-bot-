@@ -134,6 +134,10 @@ import {
   handleUniformRecoveryModal,
   handleUniformRelogCommand,
   handleUniformRelogSelection,
+  handleUniformRelogPublishingButton,
+  handleUniformRelogPublishingModal,
+  handleUniformPublishingButton,
+  handleUniformPublishingModal,
   handleUniformSpreadsheetSettingsModal,
   handleUniformSubmitButton,
   handleUniformRetryButton,
@@ -5199,6 +5203,16 @@ async function connectDiscord(): Promise<void> {
           await withUniformInteractionActivity(interaction.guildId, () => handleUniformRetryButton(interaction, maintenanceActive));
           return;
         }
+        if (interaction.customId.startsWith("uniform:publish-success:") ||
+            interaction.customId.startsWith("uniform:publish-moderated:")) {
+          await withUniformInteractionActivity(interaction.guildId, () => handleUniformPublishingButton(interaction));
+          return;
+        }
+        if (interaction.customId.startsWith("uniform:relog-publish-success:") ||
+            interaction.customId.startsWith("uniform:relog-publish-moderated:")) {
+          await withUniformInteractionActivity(interaction.guildId, () => handleUniformRelogPublishingButton(interaction));
+          return;
+        }
         if (interaction.customId.startsWith("uniform:cancel:")) {
           await withUniformInteractionActivity(interaction.guildId, () => handleUniformCancelButton(interaction));
           return;
@@ -5316,6 +5330,22 @@ async function connectDiscord(): Promise<void> {
             return;
           }
           await withUniformInteractionActivity(interaction.guildId, () => handleUniformAssistanceModal(interaction));
+          return;
+        }
+        if (interaction.customId.startsWith("uniform:publish-modal:")) {
+          if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
+            await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
+            return;
+          }
+          await withUniformInteractionActivity(interaction.guildId, () => handleUniformPublishingModal(interaction));
+          return;
+        }
+        if (interaction.customId.startsWith("uniform:relog-publish-modal:")) {
+          if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
+            await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
+            return;
+          }
+          await withUniformInteractionActivity(interaction.guildId, () => handleUniformRelogPublishingModal(interaction));
           return;
         }
         if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
