@@ -2659,6 +2659,59 @@ export async function recoverPendingUniformReviews(guild: Guild): Promise<void> 
   }
 }
 
+async function completePublishedUniform(
+  record: UniformDeliveryRecord,
+  guild: Guild,
+  asset: { id: number; url: string },
+  publisherName: string,
+): Promise<UniformDeliveryRecord> {
+  record = await updateUniformDelivery(record.submissionId, (item) => {
+    if (item.publishing?.state !== "awaiting-result") {
+      throw new Error("This publishing handoff is no longer awaiting a result.");
+    }
+    item.publishing.state = "publish-claimed";
+    item.publishing.publisherName = publisherName;
+    item.assets = [asset];
+    const row = item.rows[0];
+    if (!row || row.length !== LOG_UNIFORM_COLUMN_COUNT) {
+      throw new Error("The pending uniform spreadsheet row is incomplete.");
+    }
+    row[row.length - 1] = asset.url;
+    row[2] = publisherName;
+  });
+  try {
+    await appendUniformRows({
+      config: record.spreadsheet,
+      logKind: "log",
+      rows: record.rows,
+      submissionId: record.submissionId,
+    });
+    record = await updateUniformDelivery(record.submissionId, (item) => {
+      if (!item.publishing || item.publishing.state !== "publish-claimed") {
+        throw new Error("The published upload state changed before completion.");
+      }
+      item.sheetState = "saved";
+      item.logNoticeState = "sent";
+      item.publishing.state = "published";
+      item.publishing.completedAt = new Date().toISOString();
+    });
+    await editPublishingHandoff(record, guild, uploadAuditEmbed(record)).catch(() => undefined);
+    return sendPendingDelivery(record, guild);
+  } catch (error) {
+    const latest = await getUniformDelivery(record.submissionId).catch(() => undefined);
+    if (latest?.sheetState !== "saved") {
+      await updateUniformDelivery(record.submissionId, (item) => {
+        if (item.publishing?.state === "publish-claimed") item.publishing.state = "awaiting-result";
+      }).catch(() => undefined);
+    }
+    throw new UniformDeliveryRecoveryError(
+      record.submissionId,
+      error instanceof Error ? error.message : "The published uniform could not be completed.",
+      retryControlFor(latest),
+    );
+  }
+}
+
 export async function handleUniformPublishingModal(
   interaction: ModalSubmitInteraction,
 ): Promise<void> {
@@ -2686,6 +2739,37 @@ export async function handleUniformPublishingModal(
       item.publishing.seqmName = seqmName;
       item.publishing.approvedAsset = asset;
     });
+    let alreadyPublished = false;
+    try {
+      await verifyPublishedClassicShirt(asset.id);
+      alreadyPublished = true;
+    } catch {
+      // A failed public lookup means the SEQM's manually reviewed asset still
+      // follows the normal publisher handoff; it must not block this workflow.
+    }
+    if (alreadyPublished) {
+      const delivered = await completePublishedUniform(
+        record,
+        interaction.guild!,
+        asset,
+        seqmName,
+      );
+      await interaction.editReply({
+        embeds: [presentationEmbed(
+          "Uniform Already Published and Delivered",
+          `The shirt was already on sale, so it bypassed publishers and was delivered to <#${delivered.destinationChannelId}>.`,
+          "success",
+          undefined,
+          [
+            { name: "Publisher", value: safePresentationText(seqmName), inline: true },
+            { name: "Catalog link", value: asset.url },
+          ],
+        )],
+        components: [],
+        allowedMentions: noMentions,
+      });
+      return;
+    }
     const forwarded = await forwardApprovedUniform(record, interaction.guild!);
     await interaction.editReply({
       embeds: [presentationEmbed(
@@ -2709,38 +2793,13 @@ export async function handleUniformPublishingModal(
     throw new Error(`The published Classic Shirt must be named exactly "${record.customerName}".`);
   }
   const publisherName = await discordPublisherName(interaction);
-  record = await updateUniformDelivery(submissionId, (item) => {
-    if (item.publishing?.state !== "awaiting-result") {
-      throw new Error("This publishing handoff is no longer awaiting a result.");
-    }
-    item.publishing.state = "publish-claimed";
-    item.publishing.publisherName = publisherName;
-    item.assets = [asset];
-    const row = item.rows[0];
-    if (!row || row.length !== LOG_UNIFORM_COLUMN_COUNT) {
-      throw new Error("The pending uniform spreadsheet row is incomplete.");
-    }
-    row[row.length - 1] = asset.url;
-    row[2] = publisherName;
-  });
   try {
-    await appendUniformRows({
-      config: record.spreadsheet,
-      logKind: "log",
-      rows: record.rows,
-      submissionId: record.submissionId,
-    });
-    record = await updateUniformDelivery(submissionId, (item) => {
-      if (!item.publishing || item.publishing.state !== "publish-claimed") {
-        throw new Error("The published upload state changed before completion.");
-      }
-      item.sheetState = "saved";
-      item.logNoticeState = "sent";
-      item.publishing.state = "published";
-      item.publishing.completedAt = new Date().toISOString();
-    });
-    await editPublishingHandoff(record, interaction.guild!, uploadAuditEmbed(record)).catch(() => undefined);
-    const delivered = await sendPendingDelivery(record, interaction.guild!);
+    const delivered = await completePublishedUniform(
+      record,
+      interaction.guild!,
+      asset,
+      publisherName,
+    );
     await interaction.editReply({
       embeds: [presentationEmbed(
         "Uniform Published and Delivered",
@@ -2753,17 +2812,7 @@ export async function handleUniformPublishingModal(
       allowedMentions: noMentions,
     });
   } catch (error) {
-    const latest = await getUniformDelivery(submissionId).catch(() => undefined);
-    if (latest?.sheetState !== "saved") {
-      await updateUniformDelivery(submissionId, (item) => {
-        if (item.publishing?.state === "publish-claimed") item.publishing.state = "awaiting-result";
-      }).catch(() => undefined);
-    }
-    throw new UniformDeliveryRecoveryError(
-      submissionId,
-      error instanceof Error ? error.message : "The published uniform could not be completed.",
-      retryControlFor(latest),
-    );
+    throw error;
   }
 }
 

@@ -370,6 +370,50 @@ test("startup releases a previously pending manually reviewed shirt exactly once
   assert.equal(rows.get("Uniform Logs"), undefined);
 });
 
+test("SEQM sends an already published shirt directly to the customer and is recorded as publisher", async () => {
+  const record = pendingModerationRecord("seqm-already-published");
+  record.publishing.state = "awaiting-result";
+  await saveUniformDelivery(record);
+  sentMessages.add("review-message");
+  const edits: unknown[] = [];
+  await handleUniformPublishingModal({
+    customId: "uniform:publish-modal:seqm-already-published",
+    guild, guildId: guild.id, user: { id: "seqm-discord" },
+    fields: { getTextInputValue: () => "https://www.roblox.com/catalog/123" },
+    deferReply: async () => undefined,
+    editReply: async (payload: unknown) => { edits.push(payload); },
+  } as never);
+  assert.deepEqual(rows.get("Uniform Logs"), [[
+    "Publishing Quartermaster", "Senior Publisher", "Senior Publisher",
+    "Customer", "https://www.roblox.com/catalog/123",
+  ]]);
+  assert.equal(sends.filter((entry) => (entry as { id: string }).id === "publisher").length, 0);
+  assert.equal(sends.filter((entry) => (entry as { id: string }).id === "customer-channel").length, 1);
+  assert.equal((await getUniformDelivery("seqm-already-published"))?.publishing?.state, "published");
+  assert.match(JSON.stringify(edits), /Already Published And Delivered/);
+});
+
+test("SEQM still forwards a manually approved shirt when Roblox cannot confirm it is published", async () => {
+  const record = pendingModerationRecord("seqm-needs-publisher");
+  record.publishing.state = "awaiting-result";
+  await saveUniformDelivery(record);
+  sentMessages.add("review-message");
+  economyResponseStatus = 400;
+  await handleUniformPublishingModal({
+    customId: "uniform:publish-modal:seqm-needs-publisher",
+    guild, guildId: guild.id, user: { id: "seqm-discord" },
+    fields: { getTextInputValue: () => "https://www.roblox.com/catalog/123" },
+    deferReply: async () => undefined,
+    editReply: async () => undefined,
+  } as never);
+  const saved = await getUniformDelivery("seqm-needs-publisher");
+  assert.equal(saved?.publishing?.stage, "publisher");
+  assert.equal(saved?.publishing?.state, "awaiting-result");
+  assert.equal(sends.filter((entry) => (entry as { id: string }).id === "publisher").length, 1);
+  assert.equal(sends.filter((entry) => (entry as { id: string }).id === "customer-channel").length, 0);
+  assert.equal(rows.get("Uniform Logs"), undefined);
+});
+
 test("rejects invalid Roblox group identifiers before constructing a provider URL", () => {
   assert.equal(getRobloxGroupUrl("123"), "https://www.roblox.com/communities/123");
   assert.throws(() => getRobloxGroupUrl("0"), /positive safe integer/i);
