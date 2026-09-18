@@ -772,8 +772,12 @@ function memberHasRole(member: GuildMember, roleIds: string[]): boolean {
   return Boolean(cache?.has && roleIds.some((id) => cache.has!(id)));
 }
 
-function discordPublisherName(interaction: ButtonInteraction | ModalSubmitInteraction): string {
-  return interaction.user.username?.trim() || interaction.user.id;
+async function discordPublisherName(interaction: ButtonInteraction | ModalSubmitInteraction): Promise<string> {
+  const member = await currentMember(interaction.guild!, interaction.user.id);
+  return member.displayName?.trim() ||
+    interaction.user.globalName?.trim() ||
+    interaction.user.username?.trim() ||
+    interaction.user.id;
 }
 
 /**
@@ -1637,7 +1641,7 @@ export async function handleUniformRelogPublishingButton(
     return;
   }
   await interaction.deferUpdate();
-  const publisherName = discordPublisherName(interaction);
+  const publisherName = await discordPublisherName(interaction);
   record = await updateUniformDelivery(submissionId, (item) => {
     if (item.relogHandoff?.nonce !== nonce || item.relogHandoff.state !== "awaiting-result") {
       throw new Error("This replacement handoff is no longer awaiting a result.");
@@ -1727,7 +1731,7 @@ export async function handleUniformRelogPublishingModal(
     throw new Error(`The replacement Classic Shirt must be named exactly "${record.customerName}".`);
   }
   await interaction.deferReply({ ephemeral: true });
-  const publisherName = discordPublisherName(interaction);
+  const publisherName = await discordPublisherName(interaction);
   const rowIndex = record.relogHandoff!.rowIndex;
   record = await updateUniformDelivery(submissionId, (item) => {
     if (item.relogHandoff?.nonce !== nonce || item.relogHandoff.state !== "awaiting-result") {
@@ -2396,7 +2400,7 @@ export async function handleUniformPublishingButton(
     return;
   }
   await interaction.deferUpdate();
-  const publisherName = discordPublisherName(interaction);
+  const publisherName = await discordPublisherName(interaction);
   let current = await updateUniformDelivery(submissionId, (item) => {
     if (item.publishing?.state !== "awaiting-result") {
       throw new Error("This publishing handoff is no longer awaiting a result.");
@@ -2501,7 +2505,7 @@ export async function handleUniformPublishingModal(
     throw new Error(`The published Classic Shirt must be named exactly "${record.customerName}".`);
   }
   await interaction.deferReply({ ephemeral: true });
-  const publisherName = discordPublisherName(interaction);
+  const publisherName = await discordPublisherName(interaction);
   record = await updateUniformDelivery(submissionId, (item) => {
     if (item.publishing?.state !== "awaiting-result") {
       throw new Error("This publishing handoff is no longer awaiting a result.");

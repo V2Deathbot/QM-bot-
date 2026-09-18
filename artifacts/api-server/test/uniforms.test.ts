@@ -164,7 +164,11 @@ const guild = {
   id: "guild", ownerId: "owner", members: {
     me: { id: "bot" },
     fetch: async (request: string | { user: string }) => ({
-      ...member, id: typeof request === "string" ? request : request.user,
+      ...member,
+      id: typeof request === "string" ? request : request.user,
+      displayName: (typeof request === "string" ? request : request.user) === "seqm-discord"
+        ? "Senior Publisher"
+        : "Publishing Quartermaster",
       guild: { id: "guild" },
     }),
   },
@@ -383,7 +387,7 @@ test("holds an attachment submission until a verified Classic Shirt link complet
     editReply: async (payload: unknown) => { completionEdits.push(payload); },
   } as never);
   assert.deepEqual(rows.get("Uniform Logs"), [[
-    "QM", "SEQM", "submitter", "Customer", "https://www.roblox.com/catalog/9001",
+    "QM", "SEQM", "Publishing Quartermaster", "Customer", "https://www.roblox.com/catalog/9001",
   ]]);
   assert.equal(sends.length, 2);
   assert.equal((sends[1] as { id: string }).id, "customer-channel");
@@ -423,7 +427,7 @@ test("routes a rejected attachment only to the moderated sheet and Senior Quarte
     editReply: async (payload: unknown) => { edits.push(payload); },
   } as never);
   assert.equal(rows.get("Uniform Logs"), undefined);
-  assert.deepEqual(rows.get("Moderated Logs"), [["QM", "submitter", "Customer", ""]]);
+  assert.deepEqual(rows.get("Moderated Logs"), [["QM", "Publishing Quartermaster", "Customer", ""]]);
   assert.equal(sends.length, 2);
   assert.equal((sends[1] as { id: string }).id, "moderated");
   assert.equal((sends[1] as { payload: { content: string } }).payload.content, "<@seqm-discord>");
@@ -812,7 +816,7 @@ test("logs a rejected replacement without changing its successful row or custome
   assert.equal(rejected?.rows[0]?.at(-1), "https://www.roblox.com/catalog/42");
   assert.equal(rejected?.customerMessageId, original?.customerMessageId);
   assert.equal(rows.get("Uniform Logs")?.[0]?.at(-1), "https://www.roblox.com/catalog/42");
-  assert.deepEqual(rows.get("Moderated Logs"), [["QM", "seqm-discord", "Customer", ""]]);
+  assert.deepEqual(rows.get("Moderated Logs"), [["QM", "Senior Publisher", "Customer", ""]]);
   assert.ok(sends.every((message, index) =>
     index < 2 || (message as { id: string }).id !== "relog-rejected-ticket"));
 });
