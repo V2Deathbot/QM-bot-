@@ -7,4 +7,4 @@ Discord may retain an enforced message nonce after the associated message is del
 
 **Why:** Treating every 404 as ambiguous permanently blocked a saved uniform delivery after its upload-log notice disappeared.
 
-**How to apply:** Limit the fallback to Discord code 10008 on message creation. Preserve the normal unresolved/no-replay behavior for timeouts, network failures, and other outcomes where Discord may have accepted the message.
+**How to apply:** Give separate workflow stages distinct nonces. Limit the fallback to Discord code 10008 on message creation. Preserve unresolved/no-replay behavior for outcomes where Discord may have accepted the message.

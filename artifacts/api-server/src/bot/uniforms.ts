@@ -2366,7 +2366,7 @@ async function sendPublishingHandoff(
       (publishing.sourceDataBase64
         ? Buffer.from(publishing.sourceDataBase64, "base64")
         : publishing.attachment.url)]);
-    const message = await channel.send({
+    const handoffPayload = {
       content: publishing.stage === "publisher"
         ? `<@&${uniformPublisherRoleId}>`
         : `<@&${publishing.seqmRoleId}>`,
@@ -2382,9 +2382,25 @@ async function sendPublishingHandoff(
         parse: [],
         roles: [publishing.stage === "publisher" ? uniformPublisherRoleId : publishing.seqmRoleId!],
       },
-      nonce: uniformDiscordNonce("notice", record.submissionId),
+      nonce: uniformDiscordNonce(
+        "notice",
+        `${record.submissionId}:${publishing.stage === "publisher" ? "publisher" : "seqm"}`,
+      ),
       enforceNonce: true,
-    });
+    };
+    let message: unknown;
+    try {
+      message = await channel.send(handoffPayload);
+    } catch (error) {
+      const { code } = discordFailureDetails(error);
+      if (code !== 10008) throw error;
+      const { nonce: _nonce, enforceNonce: _enforceNonce, ...freshHandoffPayload } = handoffPayload;
+      logger.warn(
+        { stage: "publishing handoff", discordCode: code, publishingStage: publishing.stage },
+        "Recreating a Discord publishing handoff without its stale nonce",
+      );
+      message = await channel.send(freshHandoffPayload);
+    }
     const handoffMessageId = sentMessageId(message);
     if (!handoffMessageId) throw new Error("Discord did not return a message ID for the publishing handoff.");
     current = await updateUniformDelivery(record.submissionId, (item) => {
@@ -3562,7 +3578,8 @@ async function completePurchasedAudit(record: UniformDeliveryRecord, guild: Guil
 export async function handleUniformCustomerButton(interaction: ButtonInteraction): Promise<void> {
   const [, action, submissionId] = interaction.customId.split(":");
   if ((action !== "purchase" && action !== "assist") || !submissionId) throw new Error("That uniform delivery control is unavailable.");
-  const record = await boundDelivery(interaction, submissionId);
+  let record = await boundDelivery(interaction, submissionId);
+  let purchaseRowsAlreadyMarked = false;
   if (record.terminal) {
     // A prior terminal outbox send succeeded but the message edit may have
     // failed. Repair the visible controls without sending another outcome.
@@ -3571,7 +3588,35 @@ export async function handleUniformCustomerButton(interaction: ButtonInteraction
     return;
   }
   if (record.action) {
-    throw new Error("This customer outcome is already claimed or unresolved. It will not be sent again automatically.");
+    const recoverablePublishedPurchase =
+      action === "purchase" &&
+      record.command === "log" &&
+      record.action.kind === "purchased" &&
+      record.action.state === "unresolved" &&
+      !record.action.purchaseSheetState &&
+      !record.terminal &&
+      record.publishing?.state === "published";
+    if (!recoverablePublishedPurchase) {
+      throw new Error("This customer outcome is already claimed or unresolved. It will not be sent again automatically.");
+    }
+    // Published handoffs historically looked up the base submission ID even
+    // though their successful rows were recorded under the :published ledger
+    // ID. That deterministic pre-send failure is safe to release for retry.
+    await markUniformRowsSold(
+      record.spreadsheet,
+      record.command,
+      `${record.submissionId}:published`,
+    );
+    purchaseRowsAlreadyMarked = true;
+    record = await updateUniformDelivery(record.submissionId, (item) => {
+      if (item.action?.kind !== "purchased" ||
+          item.action.state !== "unresolved" ||
+          item.action.purchaseSheetState ||
+          item.terminal) {
+        throw new Error("This customer outcome is no longer eligible for spreadsheet recovery.");
+      }
+      delete item.action;
+    });
   }
   if (action === "assist") {
     await interaction.showModal(
@@ -3633,7 +3678,19 @@ export async function handleUniformCustomerButton(interaction: ButtonInteraction
     // A /log acknowledgement is not successful unless its immutable original
     // ledger rows were marked in the fixed Sold column first.
     if (record.command === "log") {
-      await markUniformRowsSold(record.spreadsheet, record.command, submissionId);
+      if (!purchaseRowsAlreadyMarked) {
+        await markUniformRowsSold(
+          record.spreadsheet,
+          record.command,
+          record.publishing ? `${submissionId}:published` : submissionId,
+        );
+      }
+      await updateUniformDelivery(submissionId, (item) => {
+        if (item.action?.kind !== "purchased" || item.action.state !== "claimed") {
+          throw new Error("The purchase outcome changed before its spreadsheet update was recorded.");
+        }
+        item.action.purchaseSheetState = "sold";
+      });
     }
     const channel = await requireUniformChannel(interaction.guild!, record.destinationChannelId, record.command);
     await channel.send({

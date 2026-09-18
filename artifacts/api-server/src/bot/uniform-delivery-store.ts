@@ -167,6 +167,8 @@ export interface UniformDeliveryRecord {
     kind: "purchased" | "assistance";
     reason?: string;
     state: "claimed" | "sent" | "unresolved";
+    /** Purchase sheet update completed before the customer confirmation was sent. */
+    purchaseSheetState?: "sold";
     /** Audit completion is separate from the customer-facing confirmation. */
     auditState?: "pending" | "claimed" | "sent" | "unresolved";
     nonce: string;

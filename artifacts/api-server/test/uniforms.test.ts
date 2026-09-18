@@ -26,7 +26,7 @@ const { setGoogleSheetsProxyForTests, resetGoogleSheetsProxyForTests } =
   await import("../src/bot/google-sheets.ts");
 const {
   claimUniformDeliveryAction, claimUniformDeliveryStage, getUniformDelivery, recoverLegacyNonceRejectedDelivery, resetUniformDeliveryStoreForTests,
-  saveUniformDelivery, uniformDiscordNonce,
+  saveUniformDelivery, uniformDiscordNonce, updateUniformDelivery,
 } = await import("../src/bot/uniform-delivery-store.ts");
 const { getGuildSetup, saveGuildSetup, defaultUniformSettings } =
   await import("../src/bot/setup-store.ts");
@@ -492,6 +492,7 @@ test("SEQM still forwards a manually approved shirt when Roblox cannot confirm i
   await saveUniformDelivery(record);
   sentMessages.add("review-message");
   economyResponseStatus = 400;
+  unknownMessageNonceFailures = 1;
   await handleUniformPublishingModal({
     customId: "uniform:publish-modal:seqm-needs-publisher",
     guild, guildId: guild.id, user: { id: "seqm-discord" },
@@ -503,6 +504,9 @@ test("SEQM still forwards a manually approved shirt when Roblox cannot confirm i
   assert.equal(saved?.publishing?.stage, "publisher");
   assert.equal(saved?.publishing?.state, "awaiting-result");
   assert.equal(sends.filter((entry) => (entry as { id: string }).id === "publisher").length, 1);
+  assert.equal((sends.find((entry) => (entry as { id: string }).id === "publisher") as {
+    payload: { nonce?: string };
+  }).payload.nonce, undefined);
   assert.equal(sends.filter((entry) => (entry as { id: string }).id === "customer-channel").length, 0);
   assert.equal(rows.get("Uniform Logs"), undefined);
 });
@@ -599,6 +603,19 @@ test("holds an attachment submission until a verified Classic Shirt link complet
   assert.equal(completed?.publishing?.state, "published");
   assert.deepEqual(completed?.assets, [{ id: 9001, url: "https://www.roblox.com/catalog/9001" }]);
   assert.match(JSON.stringify(completionEdits), /Uniform Published And Delivered/);
+
+  await claimUniformDeliveryAction("attachment-handoff", "purchased");
+  await updateUniformDelivery("attachment-handoff", (item) => {
+    if (!item.action) throw new Error("Expected a claimed purchase.");
+    item.action.state = "unresolved";
+  });
+  await handleUniformCustomerButton({
+    customId: "uniform:purchase:attachment-handoff",
+    guild, guildId: guild.id, channelId: "customer-channel",
+    message: { id: completed?.customerMessageId }, user: { id: "customer-discord" },
+    deferUpdate: async () => undefined, editReply: async () => undefined, update: async () => undefined,
+  } as never);
+  assert.equal((await getUniformDelivery("attachment-handoff"))?.terminal, "purchased");
 });
 
 test("routes a rejected attachment only to the moderated sheet and Senior Quartermaster", async () => {
