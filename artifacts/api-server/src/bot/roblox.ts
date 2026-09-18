@@ -32,6 +32,24 @@ export interface RobloxClassicShirt {
   description?: string;
 }
 
+async function robloxAssetProcessingState(assetId: number): Promise<string | undefined> {
+  try {
+    const response = await fetch(
+      `https://thumbnails.roblox.com/v1/assets?assetIds=${assetId}` +
+      "&returnPolicy=PlaceHolder&size=420x420&format=Png&isCircular=false",
+      { signal: AbortSignal.timeout(5_000) },
+    );
+    if (!response.ok) return undefined;
+    const payload = await response.json() as {
+      data?: Array<{ targetId?: unknown; state?: unknown }>;
+    };
+    const item = payload.data?.find((value) => value.targetId === assetId);
+    return typeof item?.state === "string" ? item.state : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function verifyUploadedClassicShirt(assetId: number): Promise<RobloxClassicShirt> {
   if (!isPositiveSafeInteger(assetId)) throw new Error("The Roblox Classic Shirt asset ID must be a positive safe integer.");
   let response: Response | undefined;
@@ -49,6 +67,19 @@ export async function verifyUploadedClassicShirt(assetId: number): Promise<Roblo
     await new Promise((resolve) => setTimeout(resolve, attempt * 400));
   }
   if (!response?.ok) {
+    if (response?.status === 400) {
+      const processingState = await robloxAssetProcessingState(assetId);
+      if (processingState === "Pending") {
+        throw new Error(
+          "Roblox is still processing or moderating this Classic Shirt. Wait until the asset finishes processing, then submit the same link again.",
+        );
+      }
+      if (processingState === "Blocked") {
+        throw new Error(
+          "Roblox has blocked this Classic Shirt. Use Mark Moderated instead of approving it.",
+        );
+      }
+    }
     throw new Error(`Roblox could not verify the uploaded Classic Shirt (HTTP ${response?.status ?? "unknown"}).`);
   }
   const value = await response.json() as {

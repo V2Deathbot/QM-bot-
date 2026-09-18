@@ -97,6 +97,10 @@ globalThis.fetch = async (input, init) => {
     const id = Number(published[1]);
     return response({ AssetId: id, AssetTypeId: 11, Name: "Customer", Description: "ClassA", IsForSale: true });
   }
+  const thumbnail = /thumbnails\.roblox\.com\/v1\/assets\?assetIds=(\d+)/.exec(url);
+  if (thumbnail) {
+    return response({ data: [{ targetId: Number(thumbnail[1]), state: "Pending", imageUrl: "https://example.invalid/pending.png" }] });
+  }
   const ownership = /inventory\.roblox\.com\/v1\/users\/(\d+)\/items\/Asset\/(\d+)\/is-owned/.exec(url);
   if (ownership) {
     inventoryRequestCount += 1;
@@ -315,7 +319,7 @@ test("retries four temporary HTTP 400 responses while checking a new SEQM upload
   economyResponseStatus = 400;
   await assert.rejects(
     verifyUploadedClassicShirt(123),
-    /uploaded Classic Shirt \(HTTP 400\)/,
+    /still processing or moderating this Classic Shirt/,
   );
   assert.equal(economyRequestCount, 4);
 });
