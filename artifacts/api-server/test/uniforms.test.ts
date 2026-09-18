@@ -44,6 +44,7 @@ let inventoryResponseStatus = 200;
 let inventoryRequestCount = 0;
 let economyResponseStatus = 200;
 let economyRequestCount = 0;
+let unpublishedAssetIds = new Set<number>();
 let thumbnailState = "Pending";
 function pngCrc32(bytes: Buffer): number {
   let crc = 0xffffffff;
@@ -92,10 +93,10 @@ globalThis.fetch = async (input, init) => {
   const published = /economy\.roblox\.com\/v2\/assets\/(\d+)\/details/.exec(url);
   if (published) {
     economyRequestCount += 1;
-    if (economyResponseStatus !== 200) {
-      return new Response("", { status: economyResponseStatus });
-    }
     const id = Number(published[1]);
+    if (economyResponseStatus !== 200 || unpublishedAssetIds.has(id)) {
+      return new Response("", { status: unpublishedAssetIds.has(id) ? 400 : economyResponseStatus });
+    }
     return response({ AssetId: id, AssetTypeId: 11, Name: "Customer", Description: "ClassA", IsForSale: true });
   }
   const thumbnail = /thumbnails\.roblox\.com\/v1\/assets\?assetIds=(\d+)/.exec(url);
@@ -297,6 +298,7 @@ beforeEach(() => {
   rejectLongDiscordNonces = false; unknownMessageNonceFailures = 0; sheetValidationGate = undefined;
   unownedAssetIds = new Set(); inventoryResponseStatus = 200; inventoryRequestCount = 0;
   economyResponseStatus = 200; economyRequestCount = 0; thumbnailState = "Pending";
+  unpublishedAssetIds = new Set();
   resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
 });
 after(() => { globalThis.fetch = originalFetch; resetGoogleSheetsProxyForTests(); });
@@ -330,8 +332,8 @@ test("submits two and five ordered shirt attachments in one publishing handoff",
     await prepareAndSubmit("log", values, id);
     const record = await getUniformDelivery(id);
     assert.equal(record?.publishing?.attachments?.length, count);
-    const handoff = sends.find((entry) => (entry as { id: string }).id === "log") as { payload: { files: unknown[] } };
-    assert.equal(handoff.payload.files.length, count);
+    const handoff = sends.find((entry) => (entry as { id: string }).id === "log") as { payload: { files?: unknown[] } };
+    assert.equal(handoff.payload.files, undefined);
     rows.clear(); sends = []; sentMessages.clear();
     resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
   }
@@ -509,6 +511,83 @@ test("SEQM still forwards a manually approved shirt when Roblox cannot confirm i
   }).payload.nonce, undefined);
   assert.equal(sends.filter((entry) => (entry as { id: string }).id === "customer-channel").length, 0);
   assert.equal(rows.get("Uniform Logs"), undefined);
+
+  let publisherModal: unknown;
+  await handleUniformPublishingButton({
+    customId: "uniform:publish-success:seqm-needs-publisher",
+    guild, guildId: guild.id, user: { id: "seqm-discord" },
+    message: { id: "notice-1" }, showModal: async (modal: unknown) => { publisherModal = modal; },
+  } as never);
+  assert.match(JSON.stringify(publisherModal), /catalog_link/);
+  economyResponseStatus = 200;
+  await handleUniformPublishingModal({
+    customId: "uniform:publish-modal:seqm-needs-publisher",
+    guild, guildId: guild.id, user: { id: "seqm-discord" },
+    fields: { getTextInputValue: () => "https://www.roblox.com/catalog/123" },
+    deferReply: async () => undefined, editReply: async () => undefined,
+  } as never);
+  assert.equal((await getUniformDelivery("seqm-needs-publisher"))?.publishing?.state, "published");
+  assert.equal(sends.filter((entry) => (entry as { id: string }).id === "customer-channel").length, 1);
+});
+
+test("splits SEQM links so published shirts reach the customer and only pending links reach publishers", async () => {
+  const seqmSetup = { ...setup, seniorQuartermasterRoleId: "20000000000000001" };
+  await saveGuildSetup(seqmSetup as never);
+  const commandInteraction = interaction("created" as never, {
+    customer: "Customer", uniform_type: "ClassA", uniform: "one",
+    uniform2: "two", uniform_type2: "DressBlue",
+  }, "seqm-split");
+  await handleUniformCommand(commandInteraction as never, seqmSetup as never);
+  const nonce = componentId(commandInteraction.edits[0], 0).split(":")[2]!;
+  await handleUniformUserSelection({
+    customId: `uniform:customer:${nonce}`, guild, guildId: guild.id,
+    user: { id: "submitter" }, values: ["customer-discord"], update: async () => undefined,
+  } as never);
+  await handleUniformUserSelection({
+    customId: `uniform:seqm:${nonce}`, guild, guildId: guild.id,
+    user: { id: "submitter" }, values: ["seqm-discord"], update: async () => undefined,
+  } as never);
+  await handleUniformSubmitButton({
+    customId: `uniform:submit:${nonce}`, guild, guildId: guild.id,
+    user: { id: "submitter" }, deferUpdate: async () => undefined, editReply: async () => undefined,
+  } as never, async () => false);
+
+  unpublishedAssetIds.add(124);
+  await handleUniformPublishingModal({
+    customId: "uniform:publish-modal:seqm-split",
+    guild, guildId: guild.id, user: { id: "submitter" },
+    fields: { getTextInputValue: (id: string) =>
+      id === "catalog_link_0" ? "https://www.roblox.com/catalog/123" : "https://www.roblox.com/catalog/124" },
+    deferReply: async () => undefined, editReply: async () => undefined,
+  } as never);
+
+  const earlyCustomer = sends.find((entry) =>
+    (entry as { id: string; payload: unknown }).id === "customer-channel" &&
+    JSON.stringify((entry as { payload: unknown }).payload).includes("catalog/123")) as {
+      payload: unknown;
+    };
+  const publisher = sends.filter((entry) => (entry as { id: string }).id === "log").at(-1) as {
+    payload: { files?: unknown[]; embeds: unknown[] };
+  };
+  assert.ok(earlyCustomer);
+  assert.equal(publisher.payload.files, undefined);
+  assert.match(JSON.stringify(publisher.payload.embeds), /catalog\/124/);
+  assert.doesNotMatch(JSON.stringify(publisher.payload.embeds), /catalog\/123/);
+  assert.deepEqual((await getUniformDelivery("seqm-split"))?.publishing?.publisherAssetIndices, [1]);
+
+  await handleUniformPublishingButton({
+    customId: "uniform:publish-moderated:seqm-split",
+    guild, guildId: guild.id, user: { id: "submitter" },
+    message: { id: "notice-3" }, deferUpdate: async () => undefined, editReply: async () => undefined,
+  } as never);
+  assert.deepEqual(rows.get("Uniform Logs"), [[
+    "Publishing Quartermaster", "Publishing Quartermaster", "Publishing Quartermaster",
+    "Customer", "https://www.roblox.com/catalog/123",
+  ]]);
+  assert.deepEqual(rows.get("Moderated Logs"), [[
+    "Publishing Quartermaster", "Publishing Quartermaster", "Customer",
+    "https://www.roblox.com/catalog/124",
+  ]]);
 });
 
 test("rejects invalid Roblox group identifiers before constructing a provider URL", () => {
@@ -561,7 +640,7 @@ test("holds an attachment submission until a verified Classic Shirt link complet
   } };
   assert.equal(handoff.id, "log");
   assert.equal(handoff.payload.content, "<@&1548958021160411216>");
-  assert.equal(handoff.payload.files.length, 1);
+  assert.equal(handoff.payload.files, undefined);
   assert.match(JSON.stringify(handoff.payload.embeds), /ClassA_HG/);
   const awaiting = await getUniformDelivery("attachment-handoff");
   assert.equal(awaiting?.publishing?.state, "awaiting-result");
@@ -816,6 +895,24 @@ test("confirms purchase once, credits frozen names, and upgrades its original au
   assert.deepEqual(soldAudit.allowedMentions, { parse: [] });
   assert.match(soldAudit.embeds[0]!.data.title, /Uniform Sold Successfully$/);
   assert.equal((await getUniformDelivery("purchase-audit"))?.action?.auditState, "sent");
+});
+
+test("recreates a deleted purchase audit after customer confirmation without failing the purchase", async () => {
+  await prepareAndSubmit("log", {
+    qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer", shirtid1: "142",
+  }, "purchase-audit-deleted");
+  auditEditFailure = Object.assign(new Error("Unknown Message"), { status: 404, code: 10008 });
+  await handleUniformCustomerButton({
+    customId: "uniform:purchase:purchase-audit-deleted",
+    guild, guildId: guild.id, channelId: "customer-channel",
+    message: { id: "notice-2" }, user: { id: "customer-discord" },
+    deferUpdate: async () => undefined, editReply: async () => undefined, update: async () => undefined,
+  } as never);
+  const saved = await getUniformDelivery("purchase-audit-deleted");
+  assert.equal(saved?.terminal, "purchased");
+  assert.equal(saved?.action?.auditState, "sent");
+  assert.notEqual(saved?.auditMessageId, "notice-1");
+  assert.equal(sends.filter((entry) => (entry as { id: string }).id === "log").length, 2);
 });
 
 test("keeps a purchase pending until Roblox confirms every shirt is owned", async () => {
