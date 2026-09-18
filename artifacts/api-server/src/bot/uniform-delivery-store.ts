@@ -79,6 +79,17 @@ export interface UniformDeliveryRecord {
     seqmName?: string;
     /** Exact asset approved by the Senior Quartermaster. */
     approvedAsset?: { id: number; url: string };
+    attachments?: Array<{
+      name: string;
+      contentType: "image/png";
+      size: number;
+      url: string;
+    }>;
+    sourceDataBase64s?: string[];
+    approvedAssets?: Array<{ id: number; url: string }>;
+    /** Original zero-based shirt indexes corresponding to approvedAssets. */
+    approvedAssetIndices?: number[];
+    moderatedIndices?: number[];
     /** Durable moderated-result notification outbox for an automatically polled asset. */
     moderationNoticeState?: "pending" | "claimed" | "sent" | "unresolved";
     attachment: {

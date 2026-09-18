@@ -14,7 +14,7 @@ process.env.UNIFORM_DELIVERY_FILE = path.join(directory, "deliveries.json");
 
 const {
   canSubmitUniforms, handleUniformAssistanceModal, handleUniformCommand, handleUniformCustomerButton,
-  handleUniformPublishingButton, handleUniformPublishingModal, handleUniformRelogCommand,
+  handleUniformPublishingButton, handleUniformPublishingModal, handleUniformPublishingModerationSelect, handleUniformRelogCommand,
   handleUniformRelogPublishingButton, handleUniformRelogPublishingModal,
   handleUniformRetryButton, handleUniformSubmitButton, handleUniformUserSelection, parseUniformAssetInput,
   recoverPendingUniformReviews, resetUniformSubmissionStateForTests, saveUniformSettings,
@@ -249,7 +249,7 @@ function interaction(commandName: "log" | "moderated", values: Record<string, st
       const value = values[name];
       if (required && !value) throw new Error(`missing ${name}`);
       return value ? {
-        name: "uniform.png",
+        name: `${name}.png`,
         contentType: "image/png",
         size: value === "malformed" ? malformedScanlinePng.length : classicShirtPng.length,
         url: value === "malformed"
@@ -304,7 +304,7 @@ after(() => { globalThis.fetch = originalFetch; resetGoogleSheetsProxyForTests()
 test("registers /created with only its required customer and upload inputs", () => {
   assert.equal(uniformCommands[0]!.toJSON().name, "created");
   assert.deepEqual(uniformCommands[0]!.toJSON().options?.map((option) => option.name),
-    ["customer", "uniform_type", "channel", "uniform"]);
+     ["customer", "uniform_type", "channel", "uniform", "uniform2", "uniform3", "uniform4", "uniform5"]);
   assert.deepEqual(uniformCommands[1]!.toJSON().options?.slice(0, 3).map((option) => option.name),
     ["uploader", "publisher", "customer"]);
   assert.equal(parseUniformAssetInput("123").url, "https://www.roblox.com/catalog/123");
@@ -318,7 +318,78 @@ test("registers /created with only its required customer and upload inputs", () 
   }
   assert.equal(uniformCommands[0]!.toJSON().options?.[2]?.name, "channel");
   assert.equal(uniformCommands[0]!.toJSON().options?.[3]?.name, "uniform");
+   assert.equal(uniformCommands[0]!.toJSON().options?.slice(3).filter((option) => option.required).length, 1);
   assert.equal(uniformCommands[1]!.toJSON().options?.[4]?.name, "channel");
+});
+
+test("submits two and five ordered shirt attachments in one publishing handoff", async () => {
+  for (const [id, values, count] of [
+    ["multi-two", { customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two" }, 2],
+    ["multi-five", { customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform3: "three", uniform4: "four", uniform5: "five" }, 5],
+  ] as const) {
+    await prepareAndSubmit("log", values, id);
+    const record = await getUniformDelivery(id);
+    assert.equal(record?.publishing?.attachments?.length, count);
+    const handoff = sends.find((entry) => (entry as { id: string }).id === "log") as { payload: { files: unknown[] } };
+    assert.equal(handoff.payload.files.length, count);
+    rows.clear(); sends = []; sentMessages.clear();
+    resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
+  }
+});
+
+test("rejects a gap in ordered optional shirt attachments", async () => {
+  await saveGuildSetup(setup as never);
+  const commandInteraction = interaction("log", {
+    customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform3: "three",
+  }, "multi-gap");
+  await assert.rejects(
+    handleUniformCommand(commandInteraction as never, setup as never),
+    /without gaps/i,
+  );
+});
+
+test("persists selected moderated shirt indexes on a multi-shirt handoff", async () => {
+  await prepareAndSubmit("log", {
+    customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two",
+  }, "multi-select");
+  const before = await getUniformDelivery("multi-select");
+  assert.equal(before?.publishing?.state, "awaiting-result");
+  await handleUniformPublishingModerationSelect({
+    customId: "uniform:publish-moderated-select:multi-select",
+    guild, guildId: guild.id, user: { id: "seqm-discord" }, values: ["1"],
+    message: { id: "notice-1" }, update: async () => undefined,
+  } as never);
+  assert.deepEqual((await getUniformDelivery("multi-select"))?.publishing?.moderatedIndices, [1]);
+});
+
+test("completes a mixed multi-shirt result with one link and deferred moderation copy", async () => {
+  await prepareAndSubmit("log", {
+    customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two",
+  }, "multi-mixed");
+  await handleUniformPublishingModerationSelect({
+    customId: "uniform:publish-moderated-select:multi-mixed",
+    guild, guildId: guild.id, user: { id: "seqm-discord" }, values: ["1"],
+    message: { id: "notice-1" }, update: async () => undefined,
+  } as never);
+  let shownModal: unknown;
+  await handleUniformPublishingButton({
+    customId: "uniform:publish-success:multi-mixed",
+    guild, guildId: guild.id, user: { id: "seqm-discord" }, message: { id: "notice-1" },
+    showModal: async (modal: unknown) => { shownModal = modal; },
+  } as never);
+  assert.match(JSON.stringify(shownModal), /catalog_link_0/);
+  const edits: unknown[] = [];
+  await handleUniformPublishingModal({
+    customId: "uniform:publish-modal:multi-mixed",
+    guild, guildId: guild.id, user: { id: "seqm-discord" },
+    fields: { getTextInputValue: (id: string) => id === "catalog_link_0" ? "https://www.roblox.com/catalog/9001" : "" },
+    deferReply: async () => undefined,
+    editReply: async (payload: unknown) => { edits.push(payload); },
+  } as never);
+  assert.equal(rows.get("Uniform Logs")?.length, 1);
+  assert.equal(rows.get("Moderated Logs")?.length, 1);
+  assert.equal((await getUniformDelivery("multi-mixed"))?.assets.length, 1);
+  assert.match(JSON.stringify(sends.find((entry) => (entry as { id: string }).id === "customer-channel")), /moderated and will be sent at a later date/i);
 });
 
 test("retries four temporary HTTP 400 responses while checking a new SEQM upload", async () => {

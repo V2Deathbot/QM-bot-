@@ -137,6 +137,7 @@ import {
   handleUniformRelogPublishingButton,
   handleUniformRelogPublishingModal,
   handleUniformPublishingButton,
+  handleUniformPublishingModerationSelect,
   handleUniformPublishingModal,
   handleUniformSpreadsheetSettingsModal,
   handleUniformSubmitButton,
@@ -5292,6 +5293,14 @@ async function connectDiscord(): Promise<void> {
       })().catch((error) => replyInteractionError(interaction, error));
     } else if (interaction.isStringSelectMenu()) {
       void (async () => {
+        if (interaction.customId.startsWith("uniform:publish-moderated-select:")) {
+          if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
+            await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
+            return;
+          }
+          await withUniformInteractionActivity(interaction.guildId, () => handleUniformPublishingModerationSelect(interaction));
+          return;
+        }
         if (interaction.customId.startsWith("uniform:relog-select:")) {
           if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
             await interaction.reply({

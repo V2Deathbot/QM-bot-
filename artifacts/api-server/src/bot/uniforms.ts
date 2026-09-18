@@ -140,7 +140,11 @@ export const uniformCommands = [
     )
     .addAttachmentOption((option) =>
       option.setName("uniform").setDescription("Classic Shirt PNG using the Roblox template.").setRequired(true),
-    ),
+    )
+    .addAttachmentOption((option) => option.setName("uniform2").setDescription("Optional Classic Shirt PNG #2.").setRequired(false))
+    .addAttachmentOption((option) => option.setName("uniform3").setDescription("Optional Classic Shirt PNG #3.").setRequired(false))
+    .addAttachmentOption((option) => option.setName("uniform4").setDescription("Optional Classic Shirt PNG #4.").setRequired(false))
+    .addAttachmentOption((option) => option.setName("uniform5").setDescription("Optional Classic Shirt PNG #5.").setRequired(false)),
   new SlashCommandBuilder()
     .setName("moderated")
     .setDescription("Log a moderated uniform upload.")
@@ -322,6 +326,7 @@ interface PendingUniformConfirmation {
   twoStage?: boolean;
   submission: UniformSubmission;
   attachmentBuffer?: Buffer;
+  attachmentBuffers?: Buffer[];
   destinationChannelId: string;
   ticketChannelName: string;
   customerId?: string;
@@ -373,6 +378,8 @@ export interface UniformSubmission {
     size: number;
     url: string;
   };
+  sourceAttachments?: Array<NonNullable<UniformSubmission["sourceAttachment"]>>;
+  sourceBuffers?: Buffer[];
 }
 
 function positiveAssetId(value: string): number {
@@ -674,7 +681,7 @@ async function resolveSubmission(
   interaction: ChatInputCommandInteraction,
   command: UniformCommandName,
   twoStage = false,
-): Promise<{ submission: UniformSubmission; attachmentBuffer?: Buffer }> {
+): Promise<{ submission: UniformSubmission; attachmentBuffer?: Buffer; attachmentBuffers?: Buffer[] }> {
   const inputs = userInputsFor(interaction, command, twoStage);
   const unique = new Map<string, { input: string; labels: string[] }>();
   for (const { key, label } of inputs) {
@@ -739,7 +746,25 @@ async function resolveSubmission(
         },
       };
     }
-    const { attachment, buffer } = await validatedClassicShirtAttachment(interaction);
+    const attachments: Array<NonNullable<UniformSubmission["sourceAttachment"]>> = [];
+    const buffers: Buffer[] = [];
+    for (let index = 1; index <= 5; index += 1) {
+      const optionName = index === 1 ? "uniform" : `uniform${index}`;
+      const attachment = optionAttachment(interaction, optionName, index === 1);
+      if (!attachment) {
+        if (index > 1) {
+          for (let later = index + 1; later <= 5; later += 1) {
+            if (optionAttachment(interaction, `uniform${later}`, false)) {
+              throw new Error("Uniform PNG attachments must be provided in order without gaps.");
+            }
+          }
+        }
+        continue;
+      }
+      const validated = await validatedClassicShirtAttachment(interaction, optionName);
+      attachments.push(validated.attachment);
+      buffers.push(validated.buffer);
+    }
     const publisherName = interaction.client.user?.username?.trim() || "Quartermaster Bot";
     return {
       submission: {
@@ -748,9 +773,12 @@ async function resolveSubmission(
         assets: [],
         uniformType,
         publisherName,
-        sourceAttachment: attachment,
+        sourceAttachment: attachments[0],
+        sourceAttachments: attachments,
+        sourceBuffers: buffers,
       },
-      attachmentBuffer: buffer,
+      attachmentBuffer: buffers[0],
+      attachmentBuffers: buffers,
     };
   }
 
@@ -1094,6 +1122,7 @@ export async function handleUniformCommand(
   const pending: PendingUniformConfirmation = {
     nonce, submissionId, guildId: interaction.guildId!, actorId: interaction.user.id,
     command, submission, attachmentBuffer: resolved.attachmentBuffer,
+    attachmentBuffers: resolved.attachmentBuffers,
     twoStage,
     destinationChannelId: selectedChannel.id,
     ticketChannelName: typeof ticketChannel.name === "string" && ticketChannel.name.trim()
@@ -1515,6 +1544,7 @@ async function sendRelogPublishingHandoff(
   record: UniformDeliveryRecord,
   guild: Guild,
   attachmentBuffer?: Buffer,
+  attachmentBuffers?: Buffer[],
 ): Promise<UniformDeliveryRecord> {
   const operation = record.relogHandoff;
   if (!operation || operation.state !== "handoff-pending") {
@@ -1948,9 +1978,14 @@ export async function handleUniformUserSelection(interaction: UserSelectMenuInte
 }
 
 function customerDeliveryEmbed(record: UniformDeliveryRecord): EmbedBuilder {
+  const moderatedCount = record.publishing?.moderatedIndices?.length ?? 0;
+  const deliveredCount = record.assets.length;
   return presentationEmbed(
-    "Your Uniform Is Ready",
-    "Your uniform has been completed and is ready for collection.",
+    deliveredCount > 0 ? "Your Uniform Is Ready" : "Uniform Update",
+    deliveredCount > 0
+      ? `Your ${deliveredCount} completed shirt${deliveredCount === 1 ? "" : "s"} ${deliveredCount === 1 ? "is" : "are"} ready for collection.` +
+        (moderatedCount > 0 ? ` ${moderatedCount} shirt${moderatedCount === 1 ? "" : "s"} were moderated and will be sent at a later date.` : "")
+      : `${moderatedCount} shirt${moderatedCount === 1 ? "" : "s"} were moderated and will be sent at a later date.`,
     "success",
     undefined,
     [
@@ -2236,14 +2271,35 @@ function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
         ? [{ name: "Approved asset", value: `[${publishing.approvedAsset.id}](${publishing.approvedAsset.url})`, inline: true }]
         : []),
       { name: "Customer ticket", value: `<#${record.destinationChannelId}>`, inline: true },
-      { name: "PNG", value: safePresentationText(publishing.attachment.name), inline: true },
+      { name: "PNGs", value: (publishing.attachments ?? [publishing.attachment])
+        .map((attachment, index) => `Shirt ${index + 1}: ${safePresentationText(attachment.name)}`).join("\n"), inline: false },
+      ...((publishing.moderatedIndices?.length ?? 0) > 0
+        ? [{ name: "Moderated shirts", value: publishing.moderatedIndices!.map((index) => `Shirt ${index + 1}`).join(", "), inline: false }]
+        : []),
     ],
   );
 }
 
 function publishingHandoffComponents(record: UniformDeliveryRecord, disabled = false) {
   const reviewing = record.publishing?.stage !== "publisher";
-  return [new ActionRowBuilder<ButtonBuilder>().addComponents(
+  const count = record.publishing?.attachments?.length ?? 1;
+  const rows: Array<ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<StringSelectMenuBuilder>> = [];
+  if (count > 1) {
+    rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`uniform:publish-moderated-select:${record.submissionId}`)
+        .setPlaceholder("Select shirts denied by Roblox")
+        .setMinValues(0)
+        .setMaxValues(count)
+        .setDisabled(disabled)
+        .addOptions(Array.from({ length: count }, (_value, index) => ({
+          label: `Shirt ${index + 1}`,
+          value: String(index),
+          description: "Mark this shirt as moderated",
+        }))),
+    ));
+  }
+  rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`uniform:publish-success:${record.submissionId}`)
       .setLabel(reviewing ? "Upload" : "Complete Publishing")
@@ -2254,13 +2310,15 @@ function publishingHandoffComponents(record: UniformDeliveryRecord, disabled = f
       .setLabel("Roblox Moderation Denied")
       .setStyle(ButtonStyle.Danger)
       .setDisabled(disabled),
-  )];
+  ));
+  return rows;
 }
 
 async function sendPublishingHandoff(
   record: UniformDeliveryRecord,
   guild: Guild,
   attachmentBuffer?: Buffer,
+  attachmentBuffers?: Buffer[],
 ): Promise<UniformDeliveryRecord> {
   const publishing = record.publishing;
   if (!publishing) throw new Error("This uniform has no publishing handoff.");
@@ -2279,22 +2337,25 @@ async function sendPublishingHandoff(
     item.publishing.state = "handoff-claimed";
   });
   try {
-    const source = attachmentBuffer ??
+    const sources: Array<Buffer | string> = attachmentBuffers ??
+      (publishing.sourceDataBase64s
+        ? publishing.sourceDataBase64s.map((value) => Buffer.from(value, "base64"))
+        : [attachmentBuffer ??
       (publishing.sourceDataBase64
         ? Buffer.from(publishing.sourceDataBase64, "base64")
-        : publishing.attachment.url);
+        : publishing.attachment.url)]);
     const message = await channel.send({
       content: publishing.stage === "publisher"
         ? `<@&${uniformPublisherRoleId}>`
         : `<@&${publishing.seqmRoleId}>`,
       embeds: [publishingHandoffEmbed(current)],
       components: publishingHandoffComponents(current),
-      files: [{
+      files: sources.map((source, index) => ({
         attachment: source,
-        name: `${record.customerName}-${publishing.uniformType}.png`
+        name: `${record.customerName}-${publishing.uniformType}-${index + 1}.png`
           .replace(/[^a-z0-9_.-]+/gi, "-")
           .slice(0, 100),
-      }],
+      })),
       allowedMentions: {
         parse: [],
         roles: [publishing.stage === "publisher" ? uniformPublisherRoleId : publishing.seqmRoleId!],
@@ -2311,6 +2372,7 @@ async function sendPublishingHandoff(
       item.publishing.state = "awaiting-result";
       item.publishing.handoffMessageId = handoffMessageId;
       delete item.publishing.sourceDataBase64;
+      delete item.publishing.sourceDataBase64s;
       item.auditMessageId = handoffMessageId;
       item.logNoticeState = "sent";
     });
@@ -2329,7 +2391,7 @@ async function sendPublishingHandoff(
 }
 
 async function publishingRecordFor(
-  interaction: ButtonInteraction | ModalSubmitInteraction,
+  interaction: ButtonInteraction | ModalSubmitInteraction | StringSelectMenuInteraction,
   submissionId: string,
 ): Promise<UniformDeliveryRecord> {
   const record = await getUniformDelivery(submissionId);
@@ -2392,24 +2454,64 @@ export async function handleUniformPublishingButton(
   if (!submissionId || !action) {
     throw new Error("That publishing action is unavailable.");
   }
-  const record = await publishingRecordFor(interaction, submissionId);
+  let record = await publishingRecordFor(interaction, submissionId);
   if (record.publishing!.state !== "awaiting-result") {
     throw new Error("This publishing handoff has already been completed or is being processed.");
   }
   if (action === "success") {
+    const shirtCount = record.publishing!.attachments?.length ?? 1;
+    const moderated = new Set(record.publishing!.moderatedIndices ?? []);
+    const successful = Array.from({ length: shirtCount }, (_value, index) => index)
+      .filter((index) => !moderated.has(index));
+    if (successful.length === 0) {
+      throw new Error("All shirts are selected as moderated. Use the Roblox Moderation Denied action to complete this result.");
+    }
+    const inputs = shirtCount === 1
+      ? [new TextInputBuilder().setCustomId("catalog_link").setLabel("Published Roblox catalog link").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(500)]
+      : successful.map((index) => new TextInputBuilder()
+        .setCustomId(`catalog_link_${index}`)
+        .setLabel(`Shirt ${index + 1} catalog link`)
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(500));
     await interaction.showModal(
       new ModalBuilder()
         .setCustomId(`uniform:publish-modal:${submissionId}`)
         .setTitle("Complete Classic Shirt Upload")
-        .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("catalog_link")
-            .setLabel("Published Roblox catalog link")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setMaxLength(500),
-        )),
+        .addComponents(...inputs.map((input) => new ActionRowBuilder<TextInputBuilder>().addComponents(input))),
     );
+    return;
+  }
+  const shirtCount = record.publishing!.attachments?.length ?? 1;
+  if (shirtCount > 1) {
+    await interaction.deferUpdate();
+    const actorName = await discordPublisherName(interaction);
+    record = await updateUniformDelivery(submissionId, (item) => {
+      if (!item.publishing || item.publishing.state !== "awaiting-result") {
+        throw new Error("This publishing handoff is no longer awaiting a result.");
+      }
+      item.publishing.moderatedIndices = Array.from({ length: shirtCount }, (_value, index) => index);
+      item.publishing.seqmName ??= actorName;
+      item.rows.forEach((row) => {
+        if (row.length === LOG_UNIFORM_COLUMN_COUNT) row[1] = item.publishing!.seqmName!;
+      });
+    });
+    const delivered = await completePublishedUniform(
+      record,
+      interaction.guild!,
+      undefined,
+      actorName,
+      [],
+    );
+    await interaction.editReply({
+      embeds: [presentationEmbed(
+        "Moderation Denials Recorded",
+        `All ${shirtCount} shirts were logged as moderated. The customer was notified that they will be sent later in <#${delivered.destinationChannelId}>.`,
+        "success",
+      )],
+      components: [],
+      allowedMentions: noMentions,
+    });
     return;
   }
   await interaction.deferUpdate();
@@ -2508,6 +2610,38 @@ export async function handleUniformPublishingButton(
     }).catch(() => undefined);
     throw failure ?? error;
   }
+}
+
+export async function handleUniformPublishingModerationSelect(
+  interaction: StringSelectMenuInteraction,
+): Promise<void> {
+  const [, control, submissionId] = interaction.customId.split(":");
+  if (control !== "publish-moderated-select" || !submissionId) {
+    throw new Error("That moderation selection is unavailable.");
+  }
+  const record = await publishingRecordFor(interaction, submissionId);
+  if (record.publishing!.state !== "awaiting-result") {
+    throw new Error("This moderation selection is no longer available.");
+  }
+  const count = record.publishing!.attachments?.length ?? 1;
+  const moderatedIndices = [...new Set(interaction.values.map(Number))]
+    .filter((index) => Number.isInteger(index) && index >= 0 && index < count)
+    .sort((a, b) => a - b);
+  await updateUniformDelivery(submissionId, (item) => {
+    if (!item.publishing) throw new Error("This publishing handoff is unavailable.");
+    item.publishing.moderatedIndices = moderatedIndices;
+  });
+  await interaction.update({
+    embeds: [publishingHandoffEmbed({
+      ...record,
+      publishing: { ...record.publishing!, moderatedIndices },
+    })],
+    components: publishingHandoffComponents({
+      ...record,
+      publishing: { ...record.publishing!, moderatedIndices },
+    }),
+    allowedMentions: noMentions,
+  });
 }
 
 async function forwardApprovedUniform(
@@ -2662,30 +2796,54 @@ export async function recoverPendingUniformReviews(guild: Guild): Promise<void> 
 async function completePublishedUniform(
   record: UniformDeliveryRecord,
   guild: Guild,
-  asset: { id: number; url: string },
+  asset: { id: number; url: string } | undefined,
   publisherName: string,
+  completedAssets?: Array<{ id: number; url: string }>,
 ): Promise<UniformDeliveryRecord> {
+  const assets = completedAssets ?? (asset ? [asset] : []);
+  const moderatedIndices = new Set(record.publishing?.moderatedIndices ?? []);
+  const successfulIndices = record.rows
+    .map((_row, index) => index)
+    .filter((index) => !moderatedIndices.has(index));
   record = await updateUniformDelivery(record.submissionId, (item) => {
     if (item.publishing?.state !== "awaiting-result") {
       throw new Error("This publishing handoff is no longer awaiting a result.");
     }
     item.publishing.state = "publish-claimed";
     item.publishing.publisherName = publisherName;
-    item.assets = [asset];
-    const row = item.rows[0];
-    if (!row || row.length !== LOG_UNIFORM_COLUMN_COUNT) {
-      throw new Error("The pending uniform spreadsheet row is incomplete.");
-    }
-    row[row.length - 1] = asset.url;
-    row[2] = publisherName;
+    item.assets = assets;
+    item.publishing!.approvedAssets = assets;
+    item.rows.forEach((row, index) => {
+      if (!row || row.length !== LOG_UNIFORM_COLUMN_COUNT) throw new Error("The pending uniform spreadsheet row is incomplete.");
+      if (!moderatedIndices.has(index)) {
+        const assetPosition = successfulIndices.indexOf(index);
+        const completed = assets[assetPosition];
+        if (!completed) throw new Error(`The published link for Shirt ${index + 1} is missing.`);
+        row[row.length - 1] = completed.url;
+        row[2] = publisherName;
+      }
+    });
   });
   try {
-    await appendUniformRows({
-      config: record.spreadsheet,
-      logKind: "log",
-      rows: record.rows,
-      submissionId: record.submissionId,
-    });
+    const successfulRows = record.rows.filter((_row, index) => !moderatedIndices.has(index));
+    const moderatedRows = record.rows.filter((_row, index) => moderatedIndices.has(index))
+      .map((row) => [row[0] ?? "", publisherName, row[3] ?? record.customerName, ""]);
+    if (successfulRows.length > 0) {
+      await appendUniformRows({
+        config: record.spreadsheet,
+        logKind: "log",
+        rows: successfulRows,
+        submissionId: `${record.submissionId}:published`,
+      });
+    }
+    if (moderatedRows.length > 0) {
+      await appendUniformRows({
+        config: record.spreadsheet,
+        logKind: "moderated",
+        rows: moderatedRows,
+        submissionId: `${record.submissionId}:moderated`,
+      });
+    }
     record = await updateUniformDelivery(record.submissionId, (item) => {
       if (!item.publishing || item.publishing.state !== "publish-claimed") {
         throw new Error("The published upload state changed before completion.");
@@ -2722,7 +2880,14 @@ export async function handleUniformPublishingModal(
   if (record.publishing!.state !== "awaiting-result") {
     throw new Error("This publishing handoff has already been completed or is being processed.");
   }
-  const asset = parseUniformAssetInput(interaction.fields.getTextInputValue("catalog_link"));
+  const shirtCount = record.publishing!.attachments?.length ?? 1;
+  const moderated = new Set(record.publishing!.moderatedIndices ?? []);
+  const successfulIndices = Array.from({ length: shirtCount }, (_value, index) => index)
+    .filter((index) => !moderated.has(index));
+  const submittedAssets = successfulIndices.map((index) => parseUniformAssetInput(
+    interaction.fields.getTextInputValue(shirtCount === 1 ? "catalog_link" : `catalog_link_${index}`),
+  ));
+  const asset = submittedAssets[0]!;
   await interaction.deferReply({ ephemeral: true });
   if (record.publishing!.stage !== "publisher") {
     const seqmName = await discordPublisherName(interaction);
@@ -2733,26 +2898,36 @@ export async function handleUniformPublishingModal(
       const row = item.rows[0];
       if (!row || row.length !== LOG_UNIFORM_COLUMN_COUNT) throw new Error("The pending uniform row is incomplete.");
       item.seqmId = interaction.user.id;
-      item.assets = [asset];
-      row[1] = seqmName;
-      row[row.length - 1] = asset.url;
+      item.assets = submittedAssets;
+      successfulIndices.forEach((originalIndex, assetIndex) => {
+        const successfulRow = item.rows[originalIndex];
+        const successfulAsset = submittedAssets[assetIndex];
+        if (!successfulRow || successfulRow.length !== LOG_UNIFORM_COLUMN_COUNT || !successfulAsset) {
+          throw new Error(`The pending row for Shirt ${originalIndex + 1} is incomplete.`);
+        }
+        successfulRow[1] = seqmName;
+        successfulRow[successfulRow.length - 1] = successfulAsset.url;
+      });
       item.publishing.seqmName = seqmName;
       item.publishing.approvedAsset = asset;
+      item.publishing.approvedAssets = submittedAssets;
+      item.publishing.approvedAssetIndices = successfulIndices;
     });
-    let alreadyPublished = false;
-    try {
-      await verifyPublishedClassicShirt(asset.id);
-      alreadyPublished = true;
-    } catch {
-      // A failed public lookup means the SEQM's manually reviewed asset still
-      // follows the normal publisher handoff; it must not block this workflow.
-    }
-    if (alreadyPublished) {
+    const verified = await Promise.all(submittedAssets.map(async (candidate) => {
+      try {
+        await verifyPublishedClassicShirt(candidate.id);
+        return true;
+      } catch {
+        return false;
+      }
+    }));
+    if (verified.every(Boolean)) {
       const delivered = await completePublishedUniform(
         record,
         interaction.guild!,
         asset,
         seqmName,
+        submittedAssets,
       );
       await interaction.editReply({
         embeds: [presentationEmbed(
@@ -2785,12 +2960,30 @@ export async function handleUniformPublishingModal(
     return;
   }
   const approvedAsset = record.publishing!.approvedAsset;
+  const approvedAssets = record.publishing!.approvedAssets ?? (approvedAsset ? [approvedAsset] : []);
+  const approvedIndices = record.publishing!.approvedAssetIndices ??
+    approvedAssets.map((_candidate, index) => index);
+  const approvedByOriginalIndex = new Map(
+    approvedAssets.map((candidate, index) => [approvedIndices[index]!, candidate] as const),
+  );
+  if (approvedAssets.length > 0 && submittedAssets.some((submitted, index) => {
+    const approved = approvedByOriginalIndex.get(successfulIndices[index]!);
+    return !approved || approved.id !== submitted.id;
+  })) {
+    const expected = successfulIndices.map((originalIndex) => {
+      const candidate = approvedByOriginalIndex.get(originalIndex);
+      return `Shirt ${originalIndex + 1}: ${candidate?.id ?? "not approved"}`;
+    }).join(", ");
+    throw new Error(`Publish the exact approved Classic Shirt assets (${expected}).`);
+  }
   if (approvedAsset && approvedAsset.id !== asset.id) {
     throw new Error(`Publish the exact approved Classic Shirt asset (${approvedAsset.id}).`);
   }
-  const published = await verifyPublishedClassicShirt(asset.id);
-  if (published.name !== record.customerName) {
-    throw new Error(`The published Classic Shirt must be named exactly "${record.customerName}".`);
+  for (const candidate of submittedAssets) {
+    const published = await verifyPublishedClassicShirt(candidate.id);
+    if (published.name !== record.customerName) {
+      throw new Error(`The published Classic Shirt must be named exactly "${record.customerName}".`);
+    }
   }
   const publisherName = await discordPublisherName(interaction);
   try {
@@ -2799,6 +2992,7 @@ export async function handleUniformPublishingModal(
       interaction.guild!,
       asset,
       publisherName,
+      submittedAssets,
     );
     await interaction.editReply({
       embeds: [presentationEmbed(
@@ -2887,7 +3081,8 @@ async function sendPendingDelivery(
     try {
       message = await destination.send({
         content: `<@${record.customerId}>`, embeds: [customerDeliveryEmbed(current)],
-        components: customerDeliveryButtons(current), allowedMentions: { parse: [], users: [record.customerId] },
+        components: current.assets.length > 0 ? customerDeliveryButtons(current) : [],
+        allowedMentions: { parse: [], users: [record.customerId] },
         nonce: uniformDiscordNonce("customer", record.submissionId), enforceNonce: true,
       });
     } catch (error) {
@@ -2948,9 +3143,17 @@ export async function handleUniformSubmitButton(
     await requireUniformChannel(interaction.guild!, pending.destinationChannelId, pending.command);
     const spreadsheet = configuredSpreadsheet(settings);
     if (!spreadsheet) throw new Error("Google Sheets is not configured. The submission was not saved.");
-    const rows = uniformSheetRows(pending.submission, {
+    const initialRows = uniformSheetRows(pending.submission, {
       id: pending.submissionId, user: { id: pending.actorId }, guildId: pending.guildId,
     } as Pick<ChatInputCommandInteraction, "id" | "user" | "guildId">, new Date());
+    const rows = pending.submission.sourceAttachments && pending.submission.sourceAttachments.length > 1
+      ? pending.submission.sourceAttachments.map((_attachment, index) => {
+        const row = [...(initialRows[0] ?? [])];
+        if (row.length === LOG_UNIFORM_COLUMN_COUNT) row[row.length - 1] = "";
+        if (index > 0 && row.length > 0) row[0] = row[0] ?? "";
+        return row;
+      })
+      : initialRows;
     record = await saveUniformDelivery({
       submissionId: pending.submissionId, guildId: pending.guildId, command: pending.command,
       actorId: pending.actorId, customerId: pending.customerId, seqmId: pending.seqmId ?? "",
@@ -2974,9 +3177,13 @@ export async function handleUniformSubmitButton(
               ...(pending.twoStage && latest.seniorQuartermasterRoleId
                 ? { seqmRoleId: latest.seniorQuartermasterRoleId }
                 : {}),
-              attachment: pending.submission.sourceAttachment,
+              attachment: pending.submission.sourceAttachment!,
+              ...(pending.submission.sourceAttachments ? { attachments: pending.submission.sourceAttachments } : {}),
               ...(pending.attachmentBuffer
                 ? { sourceDataBase64: pending.attachmentBuffer.toString("base64") }
+                : {}),
+              ...(pending.attachmentBuffers
+                ? { sourceDataBase64s: pending.attachmentBuffers.map((buffer) => buffer.toString("base64")) }
                 : {}),
             },
           }
@@ -2992,7 +3199,7 @@ export async function handleUniformSubmitButton(
   activeUniformSubmissions.add(key);
   try {
     if (record.publishing && record.publishing.state !== "published" && record.publishing.state !== "moderated") {
-      const handoff = await sendPublishingHandoff(record, interaction.guild!, pending.attachmentBuffer);
+      const handoff = await sendPublishingHandoff(record, interaction.guild!, pending.attachmentBuffer, pending.attachmentBuffers);
       await interaction.editReply({
         embeds: [presentationEmbed(
           "Awaiting Roblox Upload",
