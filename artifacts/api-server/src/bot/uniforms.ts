@@ -29,6 +29,7 @@ import {
   ownsRobloxAsset,
   RobloxInventoryPrivateError,
   RobloxOwnershipUnavailableError,
+  RobloxAssetMetadataUnavailableError,
   verifyPublishedClassicShirt,
   verifyUploadedClassicShirt,
   getRobloxAssetProcessingState,
@@ -2682,7 +2683,13 @@ export async function pollPendingUniformModeration(guild: Guild): Promise<void> 
         continue;
       }
       if (processingState !== "Completed") continue;
-      const uploaded = await verifyUploadedClassicShirt(asset.id);
+      let uploaded;
+      try {
+        uploaded = await verifyUploadedClassicShirt(asset.id);
+      } catch (error) {
+        if (error instanceof RobloxAssetMetadataUnavailableError) continue;
+        throw error;
+      }
       if (uploaded.name !== record.customerName ||
           uploaded.description !== record.publishing!.uniformType) {
         await updateUniformDelivery(record.submissionId, (item) => {
@@ -2764,7 +2771,25 @@ export async function handleUniformPublishingModal(
       });
       return;
     }
-    const uploaded = await verifyUploadedClassicShirt(asset.id);
+    let uploaded;
+    try {
+      uploaded = await verifyUploadedClassicShirt(asset.id);
+    } catch (error) {
+      if (!(error instanceof RobloxAssetMetadataUnavailableError)) throw error;
+      record = await updateUniformDelivery(submissionId, (item) => {
+        if (item.publishing?.state !== "awaiting-result") {
+          throw new Error("This Senior Quartermaster review is no longer awaiting a result.");
+        }
+        item.publishing.state = "moderation-pending";
+      });
+      await editPublishingHandoff(record, interaction.guild!, pendingRobloxModerationEmbed(record));
+      await interaction.editReply({
+        embeds: [pendingRobloxModerationEmbed(record)],
+        components: [],
+        allowedMentions: noMentions,
+      });
+      return;
+    }
     if (uploaded.name !== record.customerName) {
       throw new Error(`The uploaded Classic Shirt must be named exactly "${record.customerName}".`);
     }

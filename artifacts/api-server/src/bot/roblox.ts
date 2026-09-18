@@ -32,6 +32,13 @@ export interface RobloxClassicShirt {
   description?: string;
 }
 
+export class RobloxAssetMetadataUnavailableError extends Error {
+  constructor(public readonly status: number | undefined) {
+    super(`Roblox could not verify the uploaded Classic Shirt (HTTP ${status ?? "unknown"}).`);
+    this.name = "RobloxAssetMetadataUnavailableError";
+  }
+}
+
 export async function getRobloxAssetProcessingState(assetId: number): Promise<string | undefined> {
   try {
     const response = await fetch(
@@ -80,7 +87,7 @@ export async function verifyUploadedClassicShirt(assetId: number): Promise<Roblo
         );
       }
     }
-    throw new Error(`Roblox could not verify the uploaded Classic Shirt (HTTP ${response?.status ?? "unknown"}).`);
+    throw new RobloxAssetMetadataUnavailableError(response?.status);
   }
   const value = await response.json() as {
     AssetId?: unknown; AssetTypeId?: unknown; Name?: unknown; Description?: unknown; IsForSale?: unknown;
