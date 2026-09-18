@@ -32,7 +32,7 @@ export interface RobloxClassicShirt {
   description?: string;
 }
 
-async function robloxAssetProcessingState(assetId: number): Promise<string | undefined> {
+export async function getRobloxAssetProcessingState(assetId: number): Promise<string | undefined> {
   try {
     const response = await fetch(
       `https://thumbnails.roblox.com/v1/assets?assetIds=${assetId}` +
@@ -68,7 +68,7 @@ export async function verifyUploadedClassicShirt(assetId: number): Promise<Roblo
   }
   if (!response?.ok) {
     if (response?.status === 400) {
-      const processingState = await robloxAssetProcessingState(assetId);
+      const processingState = await getRobloxAssetProcessingState(assetId);
       if (processingState === "Pending") {
         throw new Error(
           "Roblox is still processing or moderating this Classic Shirt. Wait until the asset finishes processing, then submit the same link again.",

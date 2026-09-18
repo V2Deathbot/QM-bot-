@@ -31,6 +31,7 @@ import {
   RobloxOwnershipUnavailableError,
   verifyPublishedClassicShirt,
   verifyUploadedClassicShirt,
+  getRobloxAssetProcessingState,
   type RobloxUser,
 } from "./roblox";
 import {
@@ -50,6 +51,7 @@ import {
   claimUniformDeliveryAction,
   findUniformDeliveriesForChannel,
   findLegacyNonceRejectedDelivery,
+  findPendingUniformModerationChecks,
   recoverLegacyNonceRejectedDelivery,
   claimUniformDeliveryStage,
   saveUniformDelivery,
@@ -312,6 +314,7 @@ function discordDeliveryFailure(stage: DiscordDeliveryStage, error: unknown): Un
 }
 
 const activeUniformSubmissions = new Set<string>();
+const activeUniformModerationChecks = new Set<string>();
 const uniformConfirmationLifetimeMs = 10 * 60_000;
 interface PendingUniformConfirmation {
   nonce: string;
@@ -2510,6 +2513,202 @@ export async function handleUniformPublishingButton(
   }
 }
 
+function pendingRobloxModerationEmbed(record: UniformDeliveryRecord): EmbedBuilder {
+  return presentationEmbed(
+    "Pending",
+    "Roblox is still processing or moderating this Classic Shirt. The bot will check it automatically every minute.",
+    "warning",
+    undefined,
+    [
+      { name: "Customer", value: safePresentationText(record.customerName), inline: true },
+      { name: "Uniform type", value: safePresentationText(record.publishing!.uniformType), inline: true },
+      { name: "Senior Quartermaster", value: safePresentationText(record.publishing!.seqmName ?? "Unknown"), inline: true },
+      { name: "Pending asset", value: `[${record.publishing!.approvedAsset!.id}](${record.publishing!.approvedAsset!.url})` },
+    ],
+  );
+}
+
+async function forwardApprovedUniform(
+  record: UniformDeliveryRecord,
+  guild: Guild,
+): Promise<UniformDeliveryRecord> {
+  const asset = record.publishing?.approvedAsset;
+  if (!record.publishing || !asset) throw new Error("The pending Roblox asset is unavailable.");
+  await editPublishingHandoff(record, guild, presentationEmbed(
+    "Classic Shirt Approved for Publishing",
+    "Roblox finished processing this Classic Shirt and it passed validation. It was forwarded to the publisher channel.",
+    "success",
+    undefined,
+    [
+      { name: "Senior Quartermaster", value: safePresentationText(record.publishing.seqmName ?? "Unknown"), inline: true },
+      { name: "Approved asset", value: `[${asset.id}](${asset.url})`, inline: true },
+    ],
+  )).catch(() => undefined);
+  const transitioned = await updateUniformDelivery(record.submissionId, (item) => {
+    if (!item.publishing ||
+        (item.publishing.state !== "moderation-pending" &&
+          item.publishing.state !== "awaiting-result")) {
+      throw new Error("This Roblox moderation check is no longer pending.");
+    }
+    item.publishing.stage = "publisher";
+    item.publishing.state = "handoff-pending";
+    item.publishing.publisherName = "Pending";
+    delete item.publishing.handoffMessageId;
+  });
+  return sendPublishingHandoff(transitioned, guild);
+}
+
+async function completeAutomaticRobloxModeration(
+  record: UniformDeliveryRecord,
+  guild: Guild,
+): Promise<UniformDeliveryRecord> {
+  let current = record;
+  if (current.publishing?.state === "moderation-pending") {
+    current = await updateUniformDelivery(record.submissionId, (item) => {
+      if (item.publishing?.state !== "moderation-pending") {
+        throw new Error("This Roblox moderation result is no longer pending.");
+      }
+      item.publishing.state = "moderation-claimed";
+      item.publishing.moderationNoticeState = "pending";
+    });
+  }
+  if (current.publishing?.state !== "moderation-claimed") return current;
+  const original = current.rows[0] ?? [];
+  const moderatedRows = [[
+    typeof original[0] === "string" ? original[0] : "",
+    "",
+    current.customerName,
+    "",
+  ]];
+  if (current.sheetState !== "saved") {
+    await appendUniformRows({
+      config: current.spreadsheet,
+      logKind: "moderated",
+      rows: moderatedRows,
+      submissionId: current.submissionId,
+    });
+    current = await updateUniformDelivery(current.submissionId, (item) => {
+      if (item.publishing?.state !== "moderation-claimed") {
+        throw new Error("The automatic moderation state changed before its sheet result was recorded.");
+      }
+      item.rows = moderatedRows;
+      item.sheetState = "saved";
+    });
+  }
+  if (current.publishing!.moderationNoticeState !== "sent") {
+    current = await updateUniformDelivery(current.submissionId, (item) => {
+      if (!item.publishing || item.publishing.state !== "moderation-claimed") {
+        throw new Error("The automatic moderation notice is no longer available.");
+      }
+      item.publishing.moderationNoticeState = "claimed";
+    });
+    try {
+      const channel = await requireUniformChannel(
+        guild,
+        current.publishing!.moderatedChannelId,
+        "moderated",
+      );
+      await channel.send({
+        content: `<@${current.seqmId}>`,
+        embeds: [presentationEmbed(
+          "Classic Shirt Moderated",
+          "Roblox moderation denied the Classic Shirt you approved. It was recorded in Moderated Logs and was not sent to publishers or the customer.",
+          "error",
+          undefined,
+          [
+            { name: "Customer", value: safePresentationText(current.customerName), inline: true },
+            { name: "Uniform type", value: safePresentationText(current.publishing!.uniformType), inline: true },
+            { name: "Asset", value: current.publishing!.approvedAsset!.url },
+          ],
+        )],
+        allowedMentions: { parse: [], users: [current.seqmId] },
+        nonce: uniformDiscordNonce("moderated", current.submissionId),
+        enforceNonce: true,
+      });
+      current = await updateUniformDelivery(current.submissionId, (item) => {
+        if (item.publishing?.state !== "moderation-claimed") {
+          throw new Error("The automatic moderation state changed before its notice was recorded.");
+        }
+        item.publishing.moderationNoticeState = "sent";
+      });
+    } catch (error) {
+      await updateUniformDelivery(current.submissionId, (item) => {
+        if (item.publishing?.state === "moderation-claimed") {
+          item.publishing.moderationNoticeState = "pending";
+        }
+      }).catch(() => undefined);
+      throw error;
+    }
+  }
+  await editPublishingHandoff(current, guild, presentationEmbed(
+    "Roblox Moderation Denied",
+    "Roblox denied this Classic Shirt. It was recorded in Moderated Logs and the Senior Quartermaster was notified.",
+    "error",
+    undefined,
+    [{ name: "Asset", value: current.publishing!.approvedAsset!.url }],
+  )).catch(() => undefined);
+  return updateUniformDelivery(current.submissionId, (item) => {
+    if (item.publishing?.state !== "moderation-claimed" ||
+        item.publishing.moderationNoticeState !== "sent") {
+      throw new Error("The automatic moderation result is incomplete.");
+    }
+    item.customerDeliveryState = "sent";
+    item.publishing.state = "moderated";
+    item.publishing.completedAt = new Date().toISOString();
+  });
+}
+
+export async function pollPendingUniformModeration(guild: Guild): Promise<void> {
+  const records = await findPendingUniformModerationChecks();
+  for (const record of records) {
+    if (record.guildId !== guild.id || activeUniformModerationChecks.has(record.submissionId)) continue;
+    activeUniformModerationChecks.add(record.submissionId);
+    try {
+      if (record.publishing?.state === "moderation-claimed") {
+        await completeAutomaticRobloxModeration(record, guild);
+        continue;
+      }
+      const asset = record.publishing?.approvedAsset;
+      if (!asset) {
+        await updateUniformDelivery(record.submissionId, (item) => {
+          if (item.publishing?.state === "moderation-pending") item.publishing.state = "unresolved";
+        });
+        continue;
+      }
+      const processingState = await getRobloxAssetProcessingState(asset.id);
+      if (!processingState || processingState === "Pending") continue;
+      if (processingState === "Blocked") {
+        await completeAutomaticRobloxModeration(record, guild);
+        continue;
+      }
+      if (processingState !== "Completed") continue;
+      const uploaded = await verifyUploadedClassicShirt(asset.id);
+      if (uploaded.name !== record.customerName ||
+          uploaded.description !== record.publishing!.uniformType) {
+        await updateUniformDelivery(record.submissionId, (item) => {
+          if (item.publishing?.state === "moderation-pending") item.publishing.state = "unresolved";
+        });
+        await editPublishingHandoff(record, guild, presentationEmbed(
+          "Classic Shirt Validation Failed",
+          "Roblox finished processing the asset, but its name or description does not match this order. It was not sent to publishers.",
+          "error",
+          undefined,
+          [{ name: "Asset", value: asset.url }],
+        )).catch(() => undefined);
+        continue;
+      }
+      await forwardApprovedUniform(record, guild);
+    } catch (error) {
+      logger.error(
+        { submissionId: record.submissionId, errorName: error instanceof Error ? error.name : "Unknown" },
+        "Pending Roblox uniform moderation check failed",
+      );
+    } finally {
+      activeUniformModerationChecks.delete(record.submissionId);
+    }
+  }
+}
+
 export async function handleUniformPublishingModal(
   interaction: ModalSubmitInteraction,
 ): Promise<void> {
@@ -2523,15 +2722,8 @@ export async function handleUniformPublishingModal(
   const asset = parseUniformAssetInput(interaction.fields.getTextInputValue("catalog_link"));
   await interaction.deferReply({ ephemeral: true });
   if (record.publishing!.stage !== "publisher") {
-    const uploaded = await verifyUploadedClassicShirt(asset.id);
-    if (uploaded.name !== record.customerName) {
-      throw new Error(`The uploaded Classic Shirt must be named exactly "${record.customerName}".`);
-    }
-    if (uploaded.description !== record.publishing!.uniformType) {
-      throw new Error(`The uploaded Classic Shirt description must be exactly "${record.publishing!.uniformType}".`);
-    }
     const seqmName = await discordPublisherName(interaction);
-    const reviewRecord = await updateUniformDelivery(submissionId, (item) => {
+    record = await updateUniformDelivery(submissionId, (item) => {
       if (!item.publishing || item.publishing.state !== "awaiting-result") {
         throw new Error("This Senior Quartermaster review is no longer awaiting a result.");
       }
@@ -2544,24 +2736,42 @@ export async function handleUniformPublishingModal(
       item.publishing.seqmName = seqmName;
       item.publishing.approvedAsset = asset;
     });
-    await editPublishingHandoff(reviewRecord, interaction.guild!, presentationEmbed(
-      "Classic Shirt Approved for Publishing",
-      "The Senior Quartermaster uploaded and approved this asset. It was forwarded to the publisher channel.",
-      "success",
-      undefined,
-      [
-        { name: "Senior Quartermaster", value: safePresentationText(seqmName), inline: true },
-        { name: "Approved asset", value: `[${asset.id}](${asset.url})`, inline: true },
-      ],
-    )).catch(() => undefined);
-    record = await updateUniformDelivery(submissionId, (item) => {
-      if (!item.publishing) throw new Error("The publishing handoff is unavailable.");
-      item.publishing.stage = "publisher";
-      item.publishing.state = "handoff-pending";
-      item.publishing.publisherName = "Pending";
-      delete item.publishing.handoffMessageId;
-    });
-    const forwarded = await sendPublishingHandoff(record, interaction.guild!);
+    const processingState = await getRobloxAssetProcessingState(asset.id);
+    if (processingState === "Pending") {
+      record = await updateUniformDelivery(submissionId, (item) => {
+        if (item.publishing?.state !== "awaiting-result") {
+          throw new Error("This Senior Quartermaster review is no longer awaiting a result.");
+        }
+        item.publishing.state = "moderation-pending";
+      });
+      await editPublishingHandoff(record, interaction.guild!, pendingRobloxModerationEmbed(record));
+      await interaction.editReply({
+        embeds: [pendingRobloxModerationEmbed(record)],
+        components: [],
+        allowedMentions: noMentions,
+      });
+      return;
+    }
+    if (processingState === "Blocked") {
+      record = await updateUniformDelivery(submissionId, (item) => {
+        if (item.publishing?.state === "awaiting-result") item.publishing.state = "moderation-pending";
+      });
+      await completeAutomaticRobloxModeration(record, interaction.guild!);
+      await interaction.editReply({
+        embeds: [presentationEmbed("Moderation Denial Recorded", "Roblox denied the shirt. Moderated Logs were updated and you were notified.", "error")],
+        components: [],
+        allowedMentions: noMentions,
+      });
+      return;
+    }
+    const uploaded = await verifyUploadedClassicShirt(asset.id);
+    if (uploaded.name !== record.customerName) {
+      throw new Error(`The uploaded Classic Shirt must be named exactly "${record.customerName}".`);
+    }
+    if (uploaded.description !== record.publishing!.uniformType) {
+      throw new Error(`The uploaded Classic Shirt description must be exactly "${record.publishing!.uniformType}".`);
+    }
+    const forwarded = await forwardApprovedUniform(record, interaction.guild!);
     await interaction.editReply({
       embeds: [presentationEmbed(
         "Forwarded to Publishers",
@@ -2781,6 +2991,7 @@ export async function handleUniformSubmitButton(
               publisherChannelId: pending.twoStage
                 ? settings.publisherChannelId ?? settings.logChannelId
                 : uploadLogChannelId,
+              moderatedChannelId: settings.moderatedChannelId,
               ...(pending.twoStage && latest.seniorQuartermasterRoleId
                 ? { seqmRoleId: latest.seniorQuartermasterRoleId }
                 : {}),

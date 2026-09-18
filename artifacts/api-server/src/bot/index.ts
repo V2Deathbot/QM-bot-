@@ -142,6 +142,7 @@ import {
   handleUniformSubmitButton,
   handleUniformRetryButton,
   handleUniformUserSelection,
+  pollPendingUniformModeration,
   UniformDeliveryRecoveryError,
   UniformNotificationError,
   renderUniformSettings,
@@ -255,6 +256,7 @@ let guildSetupComplete = false;
 let recoveryAttempt: Promise<BotRefreshResult> | null = null;
 let trelloRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let blacklistSyncTimer: ReturnType<typeof setTimeout> | null = null;
+let uniformModerationTimer: ReturnType<typeof setInterval> | null = null;
 let shutdownHooksInstalled = false;
 let runtimeLease: BotRuntimeLease | null = null;
 let recoveryPersistence: Promise<void> = Promise.resolve();
@@ -5117,6 +5119,10 @@ async function replyInteractionError(
 }
 
 async function connectDiscord(): Promise<void> {
+  if (uniformModerationTimer) {
+    clearInterval(uniformModerationTimer);
+    uniformModerationTimer = null;
+  }
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
@@ -5151,6 +5157,13 @@ async function connectDiscord(): Promise<void> {
               );
               await observeExistingAdministrators(guild);
               await runGuildBlacklistSync(guild, "startup");
+              await pollPendingUniformModeration(guild);
+              uniformModerationTimer = setInterval(() => {
+                void pollPendingUniformModeration(guild).catch((error) => {
+                  logger.error({ err: error }, "Uniform moderation polling cycle failed");
+                });
+              }, 60_000);
+              uniformModerationTimer.unref?.();
             } else {
               clearBlacklistSyncTimer();
               setRecoveryStatus(
@@ -5562,6 +5575,8 @@ export async function startBot(): Promise<void> {
       botShutdownRequested = true;
       clearTrelloRetry();
       clearBlacklistSyncTimer();
+      if (uniformModerationTimer) clearInterval(uniformModerationTimer);
+      uniformModerationTimer = null;
       discordClient?.destroy();
       discordClient = null;
       const lease = runtimeLease;
@@ -5585,6 +5600,8 @@ export async function startBot(): Promise<void> {
           runtimeLease = null;
           clearTrelloRetry();
           clearBlacklistSyncTimer();
+            if (uniformModerationTimer) clearInterval(uniformModerationTimer);
+            uniformModerationTimer = null;
           commandsRegistered = false;
           setupCommandRegistered = false;
           guildSetupComplete = false;
@@ -5626,6 +5643,8 @@ export async function startBot(): Promise<void> {
   } catch (error) {
     clearTrelloRetry();
     clearBlacklistSyncTimer();
+    if (uniformModerationTimer) clearInterval(uniformModerationTimer);
+    uniformModerationTimer = null;
     discordClient?.destroy();
     discordClient = null;
     const lease = runtimeLease;

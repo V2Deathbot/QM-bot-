@@ -61,6 +61,7 @@ export interface UniformDeliveryRecord {
       | "handoff-pending"
       | "handoff-claimed"
       | "awaiting-result"
+      | "moderation-pending"
       | "publish-claimed"
       | "published"
       | "moderation-claimed"
@@ -72,11 +73,14 @@ export interface UniformDeliveryRecord {
     stage?: "seqm-review" | "publisher";
     /** Publisher channel frozen when /created was submitted. */
     publisherChannelId?: string;
+    moderatedChannelId?: string;
     seqmRoleId?: string;
     /** Senior Quartermaster display name captured on approval. */
     seqmName?: string;
     /** Exact asset approved by the Senior Quartermaster. */
     approvedAsset?: { id: number; url: string };
+    /** Durable moderated-result notification outbox for an automatically polled asset. */
+    moderationNoticeState?: "pending" | "claimed" | "sent" | "unresolved";
     attachment: {
       name: string;
       contentType: "image/png";
@@ -201,6 +205,17 @@ async function mutate<T>(operation: (store: DeliveryFile) => T | Promise<T>): Pr
 export async function getUniformDelivery(submissionId: string): Promise<UniformDeliveryRecord | undefined> {
   const store = await readBotDocument(storeOptions);
   return store.records.find((record) => record.submissionId === submissionId);
+}
+
+export async function findPendingUniformModerationChecks(): Promise<UniformDeliveryRecord[]> {
+  const store = await readBotDocument(storeOptions);
+  return store.records.filter((record) =>
+    !record.invalidatedByPayoutRunId &&
+    record.command === "log" &&
+    record.publishing?.stage === "seqm-review" &&
+    (record.publishing.state === "moderation-pending" ||
+      record.publishing.state === "moderation-claimed"),
+  );
 }
 
 /** Only durable records, never username matching, are candidates for /relog. */

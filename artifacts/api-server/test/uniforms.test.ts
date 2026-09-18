@@ -17,7 +17,7 @@ const {
   handleUniformPublishingButton, handleUniformPublishingModal, handleUniformRelogCommand,
   handleUniformRelogPublishingButton, handleUniformRelogPublishingModal,
   handleUniformRetryButton, handleUniformSubmitButton, handleUniformUserSelection, parseUniformAssetInput,
-  resetUniformSubmissionStateForTests, saveUniformSettings,
+  pollPendingUniformModeration, resetUniformSubmissionStateForTests, saveUniformSettings,
   saveUniformSpreadsheetSettings, uniformCommands, uniformSheetRows,
   UniformDeliveryRecoveryError, uniformDeliveryRecoveryResponse, validateUniformSettings,
 } = await import("../src/bot/uniforms.ts");
@@ -44,6 +44,7 @@ let inventoryResponseStatus = 200;
 let inventoryRequestCount = 0;
 let economyResponseStatus = 200;
 let economyRequestCount = 0;
+let thumbnailState = "Pending";
 function pngCrc32(bytes: Buffer): number {
   let crc = 0xffffffff;
   for (const byte of bytes) {
@@ -99,7 +100,7 @@ globalThis.fetch = async (input, init) => {
   }
   const thumbnail = /thumbnails\.roblox\.com\/v1\/assets\?assetIds=(\d+)/.exec(url);
   if (thumbnail) {
-    return response({ data: [{ targetId: Number(thumbnail[1]), state: "Pending", imageUrl: "https://example.invalid/pending.png" }] });
+    return response({ data: [{ targetId: Number(thumbnail[1]), state: thumbnailState, imageUrl: "https://example.invalid/pending.png" }] });
   }
   const ownership = /inventory\.roblox\.com\/v1\/users\/(\d+)\/items\/Asset\/(\d+)\/is-owned/.exec(url);
   if (ownership) {
@@ -290,7 +291,7 @@ beforeEach(() => {
   rows.clear(); sends = []; auditMessageEdits = []; sentMessages.clear(); auditEditFailure = undefined; sendFailure = undefined; sheetFailure = undefined;
   rejectLongDiscordNonces = false; sheetValidationGate = undefined;
   unownedAssetIds = new Set(); inventoryResponseStatus = 200; inventoryRequestCount = 0;
-  economyResponseStatus = 200; economyRequestCount = 0;
+  economyResponseStatus = 200; economyRequestCount = 0; thumbnailState = "Pending";
   resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
 });
 after(() => { globalThis.fetch = originalFetch; resetGoogleSheetsProxyForTests(); });
@@ -322,6 +323,64 @@ test("retries four temporary HTTP 400 responses while checking a new SEQM upload
     /still processing or moderating this Classic Shirt/,
   );
   assert.equal(economyRequestCount, 4);
+});
+
+function pendingModerationRecord(submissionId: string) {
+  return {
+    submissionId, guildId: guild.id, command: "log" as const, actorId: "submitter",
+    customerId: "customer-discord", seqmId: "seqm-discord",
+    destinationChannelId: "customer-channel", uploadLogChannelId: "review",
+    spreadsheet: {
+      spreadsheetId: "sheet", logTab: "Uniform Logs", moderatedTab: "Moderated Logs",
+      logRange: "A2:E", moderatedRange: "A2:D",
+    },
+    rows: [["Publishing Quartermaster", "Senior Publisher", "Pending", "Customer", ""]],
+    sheetState: "prepared" as const,
+    assets: [{ id: 123, url: "https://www.roblox.com/catalog/123" }],
+    customerName: "Customer", customerRobloxId: 4,
+    publishing: {
+      state: "moderation-pending" as const, stage: "seqm-review" as const,
+      uniformType: "ClassA", publisherName: "Pending",
+      publisherChannelId: "publisher", moderatedChannelId: "moderated",
+      seqmRoleId: "20000000000000001", seqmName: "Senior Publisher",
+      approvedAsset: { id: 123, url: "https://www.roblox.com/catalog/123" },
+      attachment: {
+        name: "uniform.png", contentType: "image/png" as const,
+        size: classicShirtPng.length, url: "https://cdn.discordapp.com/uniform.png",
+      },
+      handoffMessageId: "review-message",
+    },
+    logNoticeState: "sent" as const, customerDeliveryState: "pending" as const,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+test("polling forwards a completed pending shirt to publishers exactly once", async () => {
+  sentMessages.add("review-message");
+  await saveUniformDelivery(pendingModerationRecord("pending-completed"));
+  thumbnailState = "Completed";
+  await pollPendingUniformModeration(guild as never);
+  await pollPendingUniformModeration(guild as never);
+  const completed = await getUniformDelivery("pending-completed");
+  assert.equal(completed?.publishing?.stage, "publisher");
+  assert.equal(completed?.publishing?.state, "awaiting-result");
+  assert.equal(sends.filter((entry) => (entry as { id: string }).id === "publisher").length, 1);
+  assert.equal(rows.get("Uniform Logs"), undefined);
+});
+
+test("polling logs a blocked pending shirt and notifies its SEQM exactly once", async () => {
+  sentMessages.add("review-message");
+  await saveUniformDelivery(pendingModerationRecord("pending-blocked"));
+  thumbnailState = "Blocked";
+  await pollPendingUniformModeration(guild as never);
+  await pollPendingUniformModeration(guild as never);
+  const blocked = await getUniformDelivery("pending-blocked");
+  assert.equal(blocked?.publishing?.state, "moderated");
+  assert.equal(blocked?.publishing?.moderationNoticeState, "sent");
+  assert.deepEqual(rows.get("Moderated Logs"), [["Publishing Quartermaster", "", "Customer", ""]]);
+  const notices = sends.filter((entry) => (entry as { id: string }).id === "moderated");
+  assert.equal(notices.length, 1);
+  assert.equal((notices[0] as { payload: { content: string } }).payload.content, "<@seqm-discord>");
 });
 
 test("rejects invalid Roblox group identifiers before constructing a provider URL", () => {
