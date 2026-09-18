@@ -91,6 +91,13 @@ export interface UniformDeliveryRecord {
     approvedAssets?: Array<{ id: number; url: string }>;
     /** Original zero-based shirt indexes corresponding to approvedAssets. */
     approvedAssetIndices?: number[];
+    /** Approved shirt indexes that still require publisher action. */
+    publisherAssetIndices?: number[];
+    /** Approved assets Roblox already reports as published, delivered before publisher work. */
+    alreadyPublishedAssets?: Array<{ id: number; url: string }>;
+    alreadyPublishedAssetIndices?: number[];
+    earlyCustomerDeliveryState?: "pending" | "claimed" | "sent" | "unresolved";
+    earlyCustomerMessageId?: string;
     moderatedIndices?: number[];
     /** Durable moderated-result notification outbox for an automatically polled asset. */
     moderationNoticeState?: "pending" | "claimed" | "sent" | "unresolved";

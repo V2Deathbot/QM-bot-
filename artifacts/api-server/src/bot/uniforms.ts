@@ -2277,6 +2277,14 @@ function sentMessageId(value: unknown): string {
 function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
   const publishing = record.publishing!;
   const reviewing = publishing.stage !== "publisher";
+  const approvedAssets = publishing.approvedAssets ??
+    (publishing.approvedAsset ? [publishing.approvedAsset] : []);
+  const approvedIndices = publishing.approvedAssetIndices ??
+    approvedAssets.map((_asset, index) => index);
+  const publisherIndices = new Set(publishing.publisherAssetIndices ?? approvedIndices);
+  const publisherLinks = approvedAssets
+    .map((asset, index) => ({ asset, originalIndex: approvedIndices[index] ?? index }))
+    .filter(({ originalIndex }) => publisherIndices.has(originalIndex));
   return presentationEmbed(
     reviewing ? "Classic Shirt Awaiting Senior Quartermaster Review" : "Classic Shirt Awaiting Roblox Publishing",
     reviewing
@@ -2289,12 +2297,14 @@ function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
       { name: "Roblox descriptions", value: (publishing.uniformTypes ?? [publishing.uniformType])
         .map((type, index) => `Shirt ${index + 1}: ${safePresentationText(type)}`).join("\n"), inline: false },
       { name: reviewing ? "Senior Quartermaster" : "Publisher", value: "*Pending*", inline: true },
-      ...(publishing.approvedAsset
-        ? [{ name: "Approved asset", value: `[${publishing.approvedAsset.id}](${publishing.approvedAsset.url})`, inline: true }]
+      ...(publisherLinks.length > 0
+        ? [{ name: reviewing ? "Approved assets" : "SEQM-approved links to publish", value: publisherLinks
+          .map(({ asset, originalIndex }) => `Shirt ${originalIndex + 1}: [${asset.id}](${asset.url})`)
+          .join("\n"), inline: false }]
         : []),
       { name: "Customer ticket", value: `<#${record.destinationChannelId}>`, inline: true },
-      { name: "PNGs", value: (publishing.attachments ?? [publishing.attachment])
-        .map((attachment, index) => `Shirt ${index + 1}: ${safePresentationText(attachment.name)}`).join("\n"), inline: false },
+      ...(reviewing ? [{ name: "PNGs", value: (publishing.attachments ?? [publishing.attachment])
+        .map((attachment, index) => `Shirt ${index + 1}: ${safePresentationText(attachment.name)}`).join("\n"), inline: false }] : []),
       ...((publishing.moderatedIndices?.length ?? 0) > 0
         ? [{ name: "Moderated shirts", value: publishing.moderatedIndices!.map((index) => `Shirt ${index + 1}`).join(", "), inline: false }]
         : []),
@@ -2304,7 +2314,12 @@ function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
 
 function publishingHandoffComponents(record: UniformDeliveryRecord, disabled = false) {
   const reviewing = record.publishing?.stage !== "publisher";
-  const count = record.publishing?.attachments?.length ?? 1;
+  const originalIndices = reviewing
+    ? Array.from({ length: record.publishing?.attachments?.length ?? 1 }, (_value, index) => index)
+    : record.publishing?.publisherAssetIndices ??
+      record.publishing?.approvedAssetIndices ??
+      Array.from({ length: record.publishing?.approvedAssets?.length ?? 1 }, (_value, index) => index);
+  const count = originalIndices.length;
   const rows: Array<ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<StringSelectMenuBuilder>> = [];
   if (count > 1) {
     rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
@@ -2314,9 +2329,9 @@ function publishingHandoffComponents(record: UniformDeliveryRecord, disabled = f
         .setMinValues(0)
         .setMaxValues(count)
         .setDisabled(disabled)
-        .addOptions(Array.from({ length: count }, (_value, index) => ({
-          label: `Shirt ${index + 1}`,
-          value: String(index),
+        .addOptions(originalIndices.map((originalIndex) => ({
+          label: `Shirt ${originalIndex + 1}`,
+          value: String(originalIndex),
           description: "Mark this shirt as moderated",
         }))),
     ));
@@ -2372,12 +2387,12 @@ async function sendPublishingHandoff(
         : `<@&${publishing.seqmRoleId}>`,
       embeds: [publishingHandoffEmbed(current)],
       components: publishingHandoffComponents(current),
-      files: sources.map((source, index) => ({
+      ...(publishing.stage === "publisher" ? {} : { files: sources.map((source, index) => ({
         attachment: source,
         name: `${record.customerName}-${publishing.uniformTypes?.[index] ?? publishing.uniformType}-${index + 1}.png`
           .replace(/[^a-z0-9_.-]+/gi, "-")
           .slice(0, 100),
-      })),
+      })) }),
       allowedMentions: {
         parse: [],
         roles: [publishing.stage === "publisher" ? uniformPublisherRoleId : publishing.seqmRoleId!],
@@ -2469,7 +2484,13 @@ async function editPublishingHandoff(
 ): Promise<void> {
   const messageId = record.publishing?.handoffMessageId;
   if (!messageId) return;
-  const channel = await requireUniformChannel(guild, record.uploadLogChannelId, "log");
+  const channel = await requireUniformChannel(
+    guild,
+    record.publishing?.stage === "publisher"
+      ? record.publishing.publisherChannelId
+      : record.uploadLogChannelId,
+    "log",
+  );
   const message = await channel.messages?.fetch(messageId);
   if (!message) return;
   await message.edit({
