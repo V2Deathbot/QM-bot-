@@ -94,6 +94,24 @@ const allowedUniformTypes = new Set([
   "Alpha", "Bravo", "DressBlue", "DressWhite",
   "White", "Khaki", "Blue", "Gray", "Overcoat",
 ]);
+const uniformTypeChoices = [
+  { name: "Army · ClassA", value: "ClassA" },
+  { name: "Army · ClassA_MP", value: "ClassA_MP" },
+  { name: "Army · ClassA_HG", value: "ClassA_HG" },
+  { name: "Army · ClassB", value: "ClassB" },
+  { name: "Army · Ike", value: "Ike" },
+  { name: "Army · Bomber", value: "Bomber" },
+  { name: "Army · Flight", value: "Flight" },
+  { name: "Marines · Alpha", value: "Alpha" },
+  { name: "Marines · Bravo", value: "Bravo" },
+  { name: "Marines · DressBlue", value: "DressBlue" },
+  { name: "Marines · DressWhite", value: "DressWhite" },
+  { name: "Navy · White", value: "White" },
+  { name: "Navy · Khaki", value: "Khaki" },
+  { name: "Navy · Blue", value: "Blue" },
+  { name: "Navy · Gray", value: "Gray" },
+  { name: "Navy · Overcoat", value: "Overcoat" },
+] as const;
 const classicShirtWidth = 585;
 const classicShirtHeight = 559;
 const maximumUniformAttachmentBytes = 10 * 1024 * 1024;
@@ -113,26 +131,9 @@ export const uniformCommands = [
     .addStringOption((option) =>
       option
         .setName("uniform_type")
-        .setDescription("Uniform type used as the Roblox shirt description.")
+        .setDescription("Uniform type for Shirt 1.")
         .setRequired(true)
-        .addChoices(
-          { name: "Army · ClassA", value: "ClassA" },
-          { name: "Army · ClassA_MP", value: "ClassA_MP" },
-          { name: "Army · ClassA_HG", value: "ClassA_HG" },
-          { name: "Army · ClassB", value: "ClassB" },
-          { name: "Army · Ike", value: "Ike" },
-          { name: "Army · Bomber", value: "Bomber" },
-          { name: "Army · Flight", value: "Flight" },
-          { name: "Marines · Alpha", value: "Alpha" },
-          { name: "Marines · Bravo", value: "Bravo" },
-          { name: "Marines · DressBlue", value: "DressBlue" },
-          { name: "Marines · DressWhite", value: "DressWhite" },
-          { name: "Navy · White", value: "White" },
-          { name: "Navy · Khaki", value: "Khaki" },
-          { name: "Navy · Blue", value: "Blue" },
-          { name: "Navy · Gray", value: "Gray" },
-          { name: "Navy · Overcoat", value: "Overcoat" },
-        ),
+        .addChoices(...uniformTypeChoices),
     )
     .addChannelOption((option) =>
       option.setName("channel").setDescription("Customer ticket channel.").setRequired(true)
@@ -142,9 +143,13 @@ export const uniformCommands = [
       option.setName("uniform").setDescription("Classic Shirt PNG using the Roblox template.").setRequired(true),
     )
     .addAttachmentOption((option) => option.setName("uniform2").setDescription("Optional Classic Shirt PNG #2.").setRequired(false))
+    .addStringOption((option) => option.setName("uniform_type2").setDescription("Uniform type for Shirt 2.").setRequired(false).addChoices(...uniformTypeChoices))
     .addAttachmentOption((option) => option.setName("uniform3").setDescription("Optional Classic Shirt PNG #3.").setRequired(false))
+    .addStringOption((option) => option.setName("uniform_type3").setDescription("Uniform type for Shirt 3.").setRequired(false).addChoices(...uniformTypeChoices))
     .addAttachmentOption((option) => option.setName("uniform4").setDescription("Optional Classic Shirt PNG #4.").setRequired(false))
-    .addAttachmentOption((option) => option.setName("uniform5").setDescription("Optional Classic Shirt PNG #5.").setRequired(false)),
+    .addStringOption((option) => option.setName("uniform_type4").setDescription("Uniform type for Shirt 4.").setRequired(false).addChoices(...uniformTypeChoices))
+    .addAttachmentOption((option) => option.setName("uniform5").setDescription("Optional Classic Shirt PNG #5.").setRequired(false))
+    .addStringOption((option) => option.setName("uniform_type5").setDescription("Uniform type for Shirt 5.").setRequired(false).addChoices(...uniformTypeChoices)),
   new SlashCommandBuilder()
     .setName("moderated")
     .setDescription("Log a moderated uniform upload.")
@@ -371,6 +376,7 @@ export interface UniformSubmission {
   };
   assets: UniformAsset[];
   uniformType?: string;
+  uniformTypes?: string[];
   publisherName?: string;
   sourceAttachment?: {
     name: string;
@@ -748,10 +754,16 @@ async function resolveSubmission(
     }
     const attachments: Array<NonNullable<UniformSubmission["sourceAttachment"]>> = [];
     const buffers: Buffer[] = [];
+    const uniformTypes: string[] = [];
     for (let index = 1; index <= 5; index += 1) {
       const optionName = index === 1 ? "uniform" : `uniform${index}`;
+      const typeOptionName = index === 1 ? "uniform_type" : `uniform_type${index}`;
       const attachment = optionAttachment(interaction, optionName, index === 1);
+      const shirtType = index === 1 ? uniformType : optionString(interaction, typeOptionName)?.trim();
       if (!attachment) {
+        if (shirtType) {
+          throw new Error(`Shirt ${index} type cannot be selected without Shirt ${index}.`);
+        }
         if (index > 1) {
           for (let later = index + 1; later <= 5; later += 1) {
             if (optionAttachment(interaction, `uniform${later}`, false)) {
@@ -761,9 +773,16 @@ async function resolveSubmission(
         }
         continue;
       }
+      if (!shirtType) {
+        throw new Error(`Select a uniform type for Shirt ${index}.`);
+      }
+      if (!allowedUniformTypes.has(shirtType)) {
+        throw new Error(`Select an approved uniform type for Shirt ${index}.`);
+      }
       const validated = await validatedClassicShirtAttachment(interaction, optionName);
       attachments.push(validated.attachment);
       buffers.push(validated.buffer);
+      uniformTypes.push(shirtType);
     }
     const publisherName = interaction.client.user?.username?.trim() || "Quartermaster Bot";
     return {
@@ -772,6 +791,7 @@ async function resolveSubmission(
         users,
         assets: [],
         uniformType,
+        uniformTypes,
         publisherName,
         sourceAttachment: attachments[0],
         sourceAttachments: attachments,
@@ -1954,7 +1974,8 @@ function confirmationEmbed(pending: PendingUniformConfirmation): EmbedBuilder {
       { name: "Customer", value: pending.customerId ? `<@${pending.customerId}>` : "Not selected", inline: true },
       { name: "Delivery channel", value: `<#${pending.destinationChannelId}>`, inline: true },
       { name: pending.command === "log" ? "Uniform type" : "Assets", value: pending.command === "log"
-        ? safePresentationText(pending.submission.uniformType ?? "Unknown")
+        ? (pending.submission.uniformTypes ?? [pending.submission.uniformType ?? "Unknown"])
+          .map((type, index) => `Shirt ${index + 1}: ${safePresentationText(type)}`).join("\n")
         : pending.submission.assets.map((asset) => `[${asset.id}](${asset.url})`).join(", ") },
     ],
   );
@@ -2265,7 +2286,8 @@ function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
     undefined,
     [
       { name: "Roblox item name", value: safePresentationText(record.customerName), inline: true },
-      { name: "Roblox description", value: safePresentationText(publishing.uniformType), inline: true },
+      { name: "Roblox descriptions", value: (publishing.uniformTypes ?? [publishing.uniformType])
+        .map((type, index) => `Shirt ${index + 1}: ${safePresentationText(type)}`).join("\n"), inline: false },
       { name: reviewing ? "Senior Quartermaster" : "Publisher", value: "*Pending*", inline: true },
       ...(publishing.approvedAsset
         ? [{ name: "Approved asset", value: `[${publishing.approvedAsset.id}](${publishing.approvedAsset.url})`, inline: true }]
@@ -2352,7 +2374,7 @@ async function sendPublishingHandoff(
       components: publishingHandoffComponents(current),
       files: sources.map((source, index) => ({
         attachment: source,
-        name: `${record.customerName}-${publishing.uniformType}-${index + 1}.png`
+        name: `${record.customerName}-${publishing.uniformTypes?.[index] ?? publishing.uniformType}-${index + 1}.png`
           .replace(/[^a-z0-9_.-]+/gi, "-")
           .slice(0, 100),
       })),
@@ -3168,6 +3190,7 @@ export async function handleUniformSubmitButton(
             publishing: {
               state: "handoff-pending" as const,
               uniformType: pending.submission.uniformType,
+              ...(pending.submission.uniformTypes ? { uniformTypes: pending.submission.uniformTypes } : {}),
               publisherName: "Pending",
               stage: pending.twoStage ? "seqm-review" as const : "publisher" as const,
               publisherChannelId: pending.twoStage

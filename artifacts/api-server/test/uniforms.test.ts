@@ -304,7 +304,7 @@ after(() => { globalThis.fetch = originalFetch; resetGoogleSheetsProxyForTests()
 test("registers /created with only its required customer and upload inputs", () => {
   assert.equal(uniformCommands[0]!.toJSON().name, "created");
   assert.deepEqual(uniformCommands[0]!.toJSON().options?.map((option) => option.name),
-     ["customer", "uniform_type", "channel", "uniform", "uniform2", "uniform3", "uniform4", "uniform5"]);
+    ["customer", "uniform_type", "channel", "uniform", "uniform2", "uniform_type2", "uniform3", "uniform_type3", "uniform4", "uniform_type4", "uniform5", "uniform_type5"]);
   assert.deepEqual(uniformCommands[1]!.toJSON().options?.slice(0, 3).map((option) => option.name),
     ["uploader", "publisher", "customer"]);
   assert.equal(parseUniformAssetInput("123").url, "https://www.roblox.com/catalog/123");
@@ -324,8 +324,8 @@ test("registers /created with only its required customer and upload inputs", () 
 
 test("submits two and five ordered shirt attachments in one publishing handoff", async () => {
   for (const [id, values, count] of [
-    ["multi-two", { customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two" }, 2],
-    ["multi-five", { customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform3: "three", uniform4: "four", uniform5: "five" }, 5],
+    ["multi-two", { customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform_type2: "DressBlue" }, 2],
+    ["multi-five", { customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform_type2: "DressBlue", uniform3: "three", uniform_type3: "Khaki", uniform4: "four", uniform_type4: "Flight", uniform5: "five", uniform_type5: "Overcoat" }, 5],
   ] as const) {
     await prepareAndSubmit("log", values, id);
     const record = await getUniformDelivery(id);
@@ -340,7 +340,7 @@ test("submits two and five ordered shirt attachments in one publishing handoff",
 test("rejects a gap in ordered optional shirt attachments", async () => {
   await saveGuildSetup(setup as never);
   const commandInteraction = interaction("log", {
-    customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform3: "three",
+    customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform3: "three", uniform_type3: "DressBlue",
   }, "multi-gap");
   await assert.rejects(
     handleUniformCommand(commandInteraction as never, setup as never),
@@ -348,9 +348,26 @@ test("rejects a gap in ordered optional shirt attachments", async () => {
   );
 });
 
+test("requires one matching uniform type for every optional shirt", async () => {
+  await assert.rejects(
+    handleUniformCommand(interaction("log", {
+      customer: "Customer", seqm: "SEQM", qm: "QM",
+      uniform_type: "ClassA", uniform: "one", uniform2: "two",
+    }, "multi-missing-type") as never, setup as never),
+    /uniform type for Shirt 2/i,
+  );
+  await assert.rejects(
+    handleUniformCommand(interaction("log", {
+      customer: "Customer", seqm: "SEQM", qm: "QM",
+      uniform_type: "ClassA", uniform: "one", uniform_type2: "DressBlue",
+    }, "multi-orphan-type") as never, setup as never),
+    /type cannot be selected without Shirt 2/i,
+  );
+});
+
 test("persists selected moderated shirt indexes on a multi-shirt handoff", async () => {
   await prepareAndSubmit("log", {
-    customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two",
+    customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform_type2: "DressBlue",
   }, "multi-select");
   const before = await getUniformDelivery("multi-select");
   assert.equal(before?.publishing?.state, "awaiting-result");
@@ -364,7 +381,7 @@ test("persists selected moderated shirt indexes on a multi-shirt handoff", async
 
 test("completes a mixed multi-shirt result with one link and deferred moderation copy", async () => {
   await prepareAndSubmit("log", {
-    customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two",
+    customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform_type2: "DressBlue",
   }, "multi-mixed");
   await handleUniformPublishingModerationSelect({
     customId: "uniform:publish-moderated-select:multi-mixed",

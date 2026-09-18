@@ -68,6 +68,8 @@ export interface UniformDeliveryRecord {
       | "moderated"
       | "unresolved";
     uniformType: string;
+    /** Per-shirt Roblox descriptions, ordered with attachments. */
+    uniformTypes?: string[];
     publisherName: string;
     /** Current stage of the two-step creation workflow. */
     stage?: "seqm-review" | "publisher";
