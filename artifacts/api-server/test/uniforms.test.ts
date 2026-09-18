@@ -284,9 +284,10 @@ beforeEach(() => {
 });
 after(() => { globalThis.fetch = originalFetch; resetGoogleSheetsProxyForTests(); });
 
-test("registers username inputs in the requested order", () => {
-  assert.deepEqual(uniformCommands[0]!.toJSON().options?.slice(0, 4).map((option) => option.name),
-    ["customer", "seqm", "qm", "uniform_type"]);
+test("registers /created with only its required customer and upload inputs", () => {
+  assert.equal(uniformCommands[0]!.toJSON().name, "created");
+  assert.deepEqual(uniformCommands[0]!.toJSON().options?.map((option) => option.name),
+    ["customer", "uniform_type", "channel", "uniform"]);
   assert.deepEqual(uniformCommands[1]!.toJSON().options?.slice(0, 3).map((option) => option.name),
     ["uploader", "publisher", "customer"]);
   assert.equal(parseUniformAssetInput("123").url, "https://www.roblox.com/catalog/123");
@@ -298,8 +299,8 @@ test("registers username inputs in the requested order", () => {
     assert.ok(requiredPrefix.every((option) => option.required === true));
     assert.ok(optionalSuffix.every((option) => option.required !== true));
   }
-  assert.equal(uniformCommands[0]!.toJSON().options?.[4]?.name, "channel");
-  assert.equal(uniformCommands[0]!.toJSON().options?.[5]?.name, "uniform");
+  assert.equal(uniformCommands[0]!.toJSON().options?.[2]?.name, "channel");
+  assert.equal(uniformCommands[0]!.toJSON().options?.[3]?.name, "uniform");
   assert.equal(uniformCommands[1]!.toJSON().options?.[4]?.name, "channel");
 });
 

@@ -68,6 +68,15 @@ export interface UniformDeliveryRecord {
       | "unresolved";
     uniformType: string;
     publisherName: string;
+    /** Current stage of the two-step creation workflow. */
+    stage?: "seqm-review" | "publisher";
+    /** Publisher channel frozen when /created was submitted. */
+    publisherChannelId?: string;
+    seqmRoleId?: string;
+    /** Senior Quartermaster display name captured on approval. */
+    seqmName?: string;
+    /** Exact asset approved by the Senior Quartermaster. */
+    approvedAsset?: { id: number; url: string };
     attachment: {
       name: string;
       contentType: "image/png";

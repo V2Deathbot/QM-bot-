@@ -30,6 +30,7 @@ import {
   RobloxInventoryPrivateError,
   RobloxOwnershipUnavailableError,
   verifyPublishedClassicShirt,
+  verifyUploadedClassicShirt,
   type RobloxUser,
 } from "./roblox";
 import {
@@ -101,24 +102,12 @@ const uniformPublisherRoleId = "1548958021160411216";
 
 export const uniformCommands = [
   new SlashCommandBuilder()
-    .setName("log")
-    .setDescription("Submit a Classic Shirt for publishing and customer delivery.")
+    .setName("created")
+    .setDescription("Submit a created Classic Shirt PNG for review and publishing.")
     .addStringOption((option) =>
       option
         .setName("customer")
         .setDescription("Exact Roblox username for the customer.")
-        .setRequired(true),
-    )
-    .addStringOption((option) =>
-      option
-        .setName("seqm")
-        .setDescription("Exact Roblox username for the Senior Quartermaster.")
-        .setRequired(true),
-    )
-    .addStringOption((option) =>
-      option
-        .setName("qm")
-        .setDescription("Exact Roblox username for the Quartermaster.")
         .setRequired(true),
     )
     .addStringOption((option) =>
@@ -197,7 +186,7 @@ export const uniformCommands = [
     ),
 ] as const;
 
-export const uniformCommandNames = new Set(["log", "moderated"]);
+export const uniformCommandNames = new Set(["created", "log", "moderated"]);
 export const uniformRelogCommandName = "relog";
 
 export type UniformCommandName = "log" | "moderated";
@@ -330,6 +319,7 @@ interface PendingUniformConfirmation {
   guildId: string;
   actorId: string;
   command: UniformCommandName;
+  twoStage?: boolean;
   submission: UniformSubmission;
   attachmentBuffer?: Buffer;
   destinationChannelId: string;
@@ -663,13 +653,16 @@ function assetInputsFor(
 function userInputsFor(
   interaction: ChatInputCommandInteraction,
   command: UniformCommandName,
+  twoStage = false,
 ): Array<{ key: keyof UniformSubmission["users"]; label: string }> {
   return command === "log"
-    ? [
-        { key: "customer", label: "Customer" },
-        { key: "qm", label: "Quartermaster" },
-        { key: "seqm", label: "Senior Quartermaster" },
-      ]
+    ? twoStage
+      ? [{ key: "customer", label: "Customer" }]
+      : [
+          { key: "customer", label: "Customer" },
+          { key: "qm", label: "Quartermaster" },
+          { key: "seqm", label: "Senior Quartermaster" },
+        ]
     : [
         { key: "customer", label: "Customer" },
         { key: "uploader", label: "Uploader" },
@@ -680,8 +673,9 @@ function userInputsFor(
 async function resolveSubmission(
   interaction: ChatInputCommandInteraction,
   command: UniformCommandName,
+  twoStage = false,
 ): Promise<{ submission: UniformSubmission; attachmentBuffer?: Buffer }> {
-  const inputs = userInputsFor(interaction, command);
+  const inputs = userInputsFor(interaction, command, twoStage);
   const unique = new Map<string, { input: string; labels: string[] }>();
   for (const { key, label } of inputs) {
     const input = cleanUsername(
@@ -712,6 +706,14 @@ async function resolveSubmission(
   }
 
   if (command === "log") {
+    if (twoStage) {
+      const creator = await currentMember(interaction.guild!, interaction.user.id);
+      const creatorName = creator.displayName?.trim() ||
+        interaction.user.globalName?.trim() ||
+        interaction.user.username;
+      users.qm = { id: 0, name: creatorName, displayName: creatorName };
+      users.seqm = { id: 0, name: "Pending", displayName: "Pending" };
+    }
     const legacyAssetInput = optionString(interaction, "shirtid1");
     const uniformType = (
       optionString(interaction, "uniform_type") ??
@@ -787,9 +789,12 @@ async function discordPublisherName(interaction: ButtonInteraction | ModalSubmit
  */
 function uniformAccessSettings(setup: GuildSetup, command?: UniformCommandName): UniformSettings {
   const settings = uniformSettingsFor(setup);
-  const grant = command && hasCommandPermissionEntry(setup, command)
-    ? commandPermissionFor(setup, command)
-    : undefined;
+  const permissionCommand = command === "log" ? "created" : command;
+  const grant = permissionCommand && hasCommandPermissionEntry(setup, permissionCommand)
+    ? commandPermissionFor(setup, permissionCommand)
+    : command === "log" && hasCommandPermissionEntry(setup, "log")
+      ? commandPermissionFor(setup, "log")
+      : undefined;
   return {
     ...settings,
     authorizedRoleIds: grant?.roleIds ?? [],
@@ -1067,20 +1072,21 @@ export async function handleUniformCommand(
   setup: GuildSetup,
   avatarUrl?: string,
 ): Promise<void> {
-  const command = interaction.commandName as UniformCommandName;
-  if (!uniformCommandNames.has(command)) {
+  if (!uniformCommandNames.has(interaction.commandName)) {
     throw new Error("That is not a uniform logging command.");
   }
+  const twoStage = interaction.commandName === "created";
+  const command: UniformCommandName = twoStage || interaction.commandName === "log" ? "log" : "moderated";
   const settings = uniformAccessSettings(setup, command);
   await requireUniformSubmitter(interaction.guild!, interaction.user.id, settings);
   // Validate both the configured audit destination and the explicitly chosen
   // customer destination before opening the private confirmation.
   await requireUniformChannel(
-    interaction.guild!, command === "log" ? settings.logChannelId : settings.moderatedChannelId, command,
+    interaction.guild!, command === "log" ? settings.seqmReviewChannelId ?? settings.logChannelId : settings.moderatedChannelId, command,
   );
   const selectedChannel = interaction.options.getChannel("channel", true);
   const ticketChannel = await requireUniformChannel(interaction.guild!, selectedChannel.id, command);
-  const resolved = await resolveSubmission(interaction, command);
+  const resolved = await resolveSubmission(interaction, command, twoStage);
   const submission = resolved.submission;
   const submissionId = interaction.id;
   if (!submissionId) throw new Error("The Discord interaction has no submission ID.");
@@ -1088,6 +1094,7 @@ export async function handleUniformCommand(
   const pending: PendingUniformConfirmation = {
     nonce, submissionId, guildId: interaction.guildId!, actorId: interaction.user.id,
     command, submission, attachmentBuffer: resolved.attachmentBuffer,
+    twoStage,
     destinationChannelId: selectedChannel.id,
     ticketChannelName: typeof ticketChannel.name === "string" && ticketChannel.name.trim()
       ? ticketChannel.name.trim()
@@ -1101,13 +1108,12 @@ export async function handleUniformCommand(
     embeds: [presentationEmbed(
       "Confirm Uniform Delivery",
       command === "log"
-        ? "Review the /log submission. Select the customer and Senior Quartermaster Discord accounts, then submit. No Google Sheets rows or Discord messages have been sent yet."
+        ? "Review the /created submission. Select the customer Discord account, then submit. No Google Sheets rows or Discord messages have been sent yet."
         : "Review the /moderated submission. Select the customer Discord account, then submit. No Google Sheets rows or Discord messages have been sent yet.",
       "info",
       avatarUrl,
       [
         { name: "Customer", value: "Not selected", inline: true },
-        ...(command === "log" ? [{ name: "Senior Quartermaster", value: "Not selected", inline: true }] : []),
         { name: "Delivery channel", value: `<#${selectedChannel.id}>`, inline: true },
         { name: command === "log" ? "Uniform type" : "Assets", value: command === "log"
           ? safePresentationText(submission.uniformType ?? "Unknown")
@@ -1885,11 +1891,6 @@ function uniformConfirmationComponents(nonce: string, command: UniformCommandNam
       new UserSelectMenuBuilder().setCustomId(`uniform:customer:${nonce}`).setPlaceholder("Select customer").setMinValues(1).setMaxValues(1),
     ),
   ];
-  if (command === "log") {
-    rows.push(new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
-      new UserSelectMenuBuilder().setCustomId(`uniform:seqm:${nonce}`).setPlaceholder("Select Senior Quartermaster").setMinValues(1).setMaxValues(1),
-    ));
-  }
   rows.push(
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`uniform:submit:${nonce}`).setLabel("Submit").setStyle(ButtonStyle.Success).setDisabled(!ready),
@@ -1915,15 +1916,12 @@ function confirmationEmbed(pending: PendingUniformConfirmation): EmbedBuilder {
   return presentationEmbed(
     "Confirm Uniform Delivery",
     pending.command === "log"
-      ? "Review the /log submission. Select the customer and Senior Quartermaster Discord accounts, then submit. No Google Sheets rows or Discord messages have been sent yet."
+      ? "Review the /created submission. Select the customer Discord account, then submit. No Google Sheets rows or Discord messages have been sent yet."
       : "Review the /moderated submission. Select the customer Discord account, then submit. No Google Sheets rows or Discord messages have been sent yet.",
     "info",
     undefined,
     [
       { name: "Customer", value: pending.customerId ? `<@${pending.customerId}>` : "Not selected", inline: true },
-      ...(pending.command === "log"
-        ? [{ name: "Senior Quartermaster", value: pending.seqmId ? `<@${pending.seqmId}>` : "Not selected", inline: true }]
-        : []),
       { name: "Delivery channel", value: `<#${pending.destinationChannelId}>`, inline: true },
       { name: pending.command === "log" ? "Uniform type" : "Assets", value: pending.command === "log"
         ? safePresentationText(pending.submission.uniformType ?? "Unknown")
@@ -1943,7 +1941,7 @@ export async function handleUniformUserSelection(interaction: UserSelectMenuInte
   await interaction.update({
     embeds: [confirmationEmbed(pending)],
     components: uniformConfirmationComponents(
-      nonce, pending.command, Boolean(pending.customerId && (pending.command === "moderated" || pending.seqmId)),
+      nonce, pending.command, Boolean(pending.customerId),
     ),
     allowedMentions: noMentions,
   });
@@ -2222,15 +2220,21 @@ function sentMessageId(value: unknown): string {
 
 function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
   const publishing = record.publishing!;
+  const reviewing = publishing.stage !== "publisher";
   return presentationEmbed(
-    "Classic Shirt Awaiting Roblox Upload",
-    "Upload the attached PNG through Roblox Creator Dashboard as a group Classic Shirt. Place it on sale, then record the catalog link here. If Roblox rejects it, record the moderation denial instead.",
+    reviewing ? "Classic Shirt Awaiting Senior Quartermaster Review" : "Classic Shirt Awaiting Roblox Publishing",
+    reviewing
+      ? "Review the attached PNG, upload it through Roblox Creator Dashboard as a group Classic Shirt, then enter the uploaded asset link. If Roblox rejects it, record the moderation denial instead."
+      : "Publish the approved Classic Shirt by placing this exact asset on sale, then enter the same Roblox link. If Roblox rejects it, record the moderation denial instead.",
     "info",
     undefined,
     [
       { name: "Roblox item name", value: safePresentationText(record.customerName), inline: true },
       { name: "Roblox description", value: safePresentationText(publishing.uniformType), inline: true },
-      { name: "Publisher", value: "*Pending*", inline: true },
+      { name: reviewing ? "Senior Quartermaster" : "Publisher", value: "*Pending*", inline: true },
+      ...(publishing.approvedAsset
+        ? [{ name: "Approved asset", value: `[${publishing.approvedAsset.id}](${publishing.approvedAsset.url})`, inline: true }]
+        : []),
       { name: "Customer ticket", value: `<#${record.destinationChannelId}>`, inline: true },
       { name: "PNG", value: safePresentationText(publishing.attachment.name), inline: true },
     ],
@@ -2238,10 +2242,11 @@ function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
 }
 
 function publishingHandoffComponents(record: UniformDeliveryRecord, disabled = false) {
+  const reviewing = record.publishing?.stage !== "publisher";
   return [new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`uniform:publish-success:${record.submissionId}`)
-      .setLabel("Complete Published Upload")
+      .setLabel(reviewing ? "Upload" : "Complete Publishing")
       .setStyle(ButtonStyle.Success)
       .setDisabled(disabled),
     new ButtonBuilder()
@@ -2263,7 +2268,10 @@ async function sendPublishingHandoff(
   if (publishing.state !== "handoff-pending") {
     throw new Error("The publishing handoff outcome is unresolved and will not be sent again automatically.");
   }
-  const channel = await requireUniformChannel(guild, record.uploadLogChannelId, "log");
+  const channelId = publishing.stage === "publisher"
+    ? publishing.publisherChannelId
+    : record.uploadLogChannelId;
+  const channel = await requireUniformChannel(guild, channelId, "log");
   let current = await updateUniformDelivery(record.submissionId, (item) => {
     if (item.publishing?.state !== "handoff-pending") {
       throw new Error("This publishing handoff is already claimed.");
@@ -2276,7 +2284,9 @@ async function sendPublishingHandoff(
         ? Buffer.from(publishing.sourceDataBase64, "base64")
         : publishing.attachment.url);
     const message = await channel.send({
-      content: `<@&${uniformPublisherRoleId}>`,
+      content: publishing.stage === "publisher"
+        ? `<@&${uniformPublisherRoleId}>`
+        : `<@&${publishing.seqmRoleId}>`,
       embeds: [publishingHandoffEmbed(current)],
       components: publishingHandoffComponents(current),
       files: [{
@@ -2285,7 +2295,10 @@ async function sendPublishingHandoff(
           .replace(/[^a-z0-9_.-]+/gi, "-")
           .slice(0, 100),
       }],
-      allowedMentions: { parse: [], roles: [uniformPublisherRoleId] },
+      allowedMentions: {
+        parse: [],
+        roles: [publishing.stage === "publisher" ? uniformPublisherRoleId : publishing.seqmRoleId!],
+      },
       nonce: uniformDiscordNonce("notice", record.submissionId),
       enforceNonce: true,
     });
@@ -2328,25 +2341,25 @@ async function publishingRecordFor(
     throw new Error("This publishing control is not attached to its recorded handoff message.");
   }
   const member = await currentMember(interaction.guild!, interaction.user.id);
-  if (memberHasRole(member, [uniformPublisherRoleId])) return record;
+  const requiredRole = record.publishing.stage === "publisher"
+    ? uniformPublisherRoleId
+    : record.publishing.seqmRoleId;
+  if (requiredRole && memberHasRole(member, [requiredRole])) return record;
   if (interaction.guild!.ownerId === member.id ||
       member.permissions.has(PermissionFlagsBits.Administrator) ||
-      interaction.user.id === record.seqmId) {
+      (record.publishing.stage === "publisher" && interaction.user.id === record.seqmId)) {
     return record;
   }
-  if (interaction.user.id === record.actorId) {
-    const setup = await getGuildSetup(record.guildId);
-    if (!setup) throw new Error("This server no longer has a valid bot setup.");
-    await requireUniformSubmitter(
-      interaction.guild!,
-      interaction.user.id,
-      uniformAccessSettings(setup, "log"),
-    );
+  // Legacy one-stage records had no approvedAsset marker and allowed the
+  // original submitter to recover the publishing handoff.
+  if (record.publishing.stage === "publisher" &&
+      !record.publishing.approvedAsset &&
+      interaction.user.id === record.actorId) {
     return record;
   }
-  {
-    throw new Error("Only the publishing role, original submitter, assigned Senior Quartermaster, or an Administrator can complete this upload.");
-  }
+  throw new Error(record.publishing.stage === "publisher"
+    ? "Only the publishing role or an Administrator can complete this publishing step."
+    : "Only the Senior Quartermaster role or an Administrator can complete this review.");
 }
 
 async function editPublishingHandoff(
@@ -2400,7 +2413,9 @@ export async function handleUniformPublishingButton(
     return;
   }
   await interaction.deferUpdate();
-  const publisherName = await discordPublisherName(interaction);
+  const reviewing = record.publishing!.stage !== "publisher";
+  const actorName = await discordPublisherName(interaction);
+  const publisherName = reviewing ? "" : actorName;
   let current = await updateUniformDelivery(submissionId, (item) => {
     if (item.publishing?.state !== "awaiting-result") {
       throw new Error("This publishing handoff is no longer awaiting a result.");
@@ -2408,7 +2423,7 @@ export async function handleUniformPublishingButton(
     item.publishing.state = "moderation-claimed";
     item.publishing.publisherName = publisherName;
     const row = item.rows[0];
-    if (row) row[2] = publisherName;
+    if (row && !reviewing) row[2] = publisherName;
   });
   try {
     const setup = await getGuildSetup(record.guildId);
@@ -2419,9 +2434,9 @@ export async function handleUniformPublishingButton(
     const original = current.rows[0] ?? [];
     const moderatedRows = [[
       typeof original[0] === "string" ? original[0] : "",
-      current.publishing!.publisherName,
+      publisherName,
       current.customerName,
-      "",
+      reviewing ? "" : current.publishing!.approvedAsset?.url ?? "",
     ]];
     await appendUniformRows({
       config: current.spreadsheet,
@@ -2437,7 +2452,7 @@ export async function handleUniformPublishingButton(
       item.sheetState = "saved";
     });
     await moderatedChannel.send({
-      content: `<@${current.seqmId}>`,
+      content: reviewing ? "" : `<@${current.seqmId}>`,
       embeds: [presentationEmbed(
         "Uniform Upload Unsuccessful",
         "Roblox moderation denied this Classic Shirt. It was logged in the moderated worksheet and nothing was sent to the customer.",
@@ -2449,7 +2464,7 @@ export async function handleUniformPublishingButton(
           { name: "Ticket", value: `<#${current.destinationChannelId}>`, inline: true },
         ],
       )],
-      allowedMentions: { parse: [], users: [current.seqmId] },
+      allowedMentions: reviewing ? noMentions : { parse: [], users: [current.seqmId] },
       nonce: uniformDiscordNonce("moderated", current.submissionId),
       enforceNonce: true,
     });
@@ -2466,11 +2481,17 @@ export async function handleUniformPublishingButton(
       "This upload was logged in the moderated worksheet. No customer message was sent.",
       "error",
       undefined,
-      [{ name: "Publisher", value: safePresentationText(publisherName), inline: true }],
+       [{ name: reviewing ? "Senior Quartermaster" : "Publisher", value: safePresentationText(actorName), inline: true }],
     )).catch(() => undefined);
     await interaction.editReply({
-      embeds: [presentationEmbed("Moderation Denial Recorded", "The moderated worksheet and Senior Quartermaster notice were completed.", "success")],
-      components: publishingHandoffComponents(current, true),
+      embeds: [presentationEmbed(
+        "Moderation Denial Recorded",
+        reviewing
+          ? "The moderated worksheet was updated. No publisher or customer message was sent."
+          : "The moderated worksheet was updated and the Senior Quartermaster was notified.",
+        "success",
+      )],
+      components: [],
       allowedMentions: noMentions,
     });
   } catch (error) {
@@ -2500,6 +2521,64 @@ export async function handleUniformPublishingModal(
     throw new Error("This publishing handoff has already been completed or is being processed.");
   }
   const asset = parseUniformAssetInput(interaction.fields.getTextInputValue("catalog_link"));
+  if (record.publishing!.stage !== "publisher") {
+    const uploaded = await verifyUploadedClassicShirt(asset.id);
+    if (uploaded.name !== record.customerName) {
+      throw new Error(`The uploaded Classic Shirt must be named exactly "${record.customerName}".`);
+    }
+    if (uploaded.description !== record.publishing!.uniformType) {
+      throw new Error(`The uploaded Classic Shirt description must be exactly "${record.publishing!.uniformType}".`);
+    }
+    await interaction.deferReply({ ephemeral: true });
+    const seqmName = await discordPublisherName(interaction);
+    const reviewRecord = await updateUniformDelivery(submissionId, (item) => {
+      if (!item.publishing || item.publishing.state !== "awaiting-result") {
+        throw new Error("This Senior Quartermaster review is no longer awaiting a result.");
+      }
+      const row = item.rows[0];
+      if (!row || row.length !== LOG_UNIFORM_COLUMN_COUNT) throw new Error("The pending uniform row is incomplete.");
+      item.seqmId = interaction.user.id;
+      item.assets = [asset];
+      row[1] = seqmName;
+      row[row.length - 1] = asset.url;
+      item.publishing.seqmName = seqmName;
+      item.publishing.approvedAsset = asset;
+    });
+    await editPublishingHandoff(reviewRecord, interaction.guild!, presentationEmbed(
+      "Classic Shirt Approved for Publishing",
+      "The Senior Quartermaster uploaded and approved this asset. It was forwarded to the publisher channel.",
+      "success",
+      undefined,
+      [
+        { name: "Senior Quartermaster", value: safePresentationText(seqmName), inline: true },
+        { name: "Approved asset", value: `[${asset.id}](${asset.url})`, inline: true },
+      ],
+    )).catch(() => undefined);
+    record = await updateUniformDelivery(submissionId, (item) => {
+      if (!item.publishing) throw new Error("The publishing handoff is unavailable.");
+      item.publishing.stage = "publisher";
+      item.publishing.state = "handoff-pending";
+      item.publishing.publisherName = "Pending";
+      delete item.publishing.handoffMessageId;
+    });
+    const forwarded = await sendPublishingHandoff(record, interaction.guild!);
+    await interaction.editReply({
+      embeds: [presentationEmbed(
+        "Forwarded to Publishers",
+        "The approved Classic Shirt was sent to the configured publisher channel.",
+        "success",
+        undefined,
+        [{ name: "Approved asset", value: `[${asset.id}](${asset.url})` }],
+      )],
+      components: [],
+      allowedMentions: noMentions,
+    });
+    return;
+  }
+  const approvedAsset = record.publishing!.approvedAsset;
+  if (approvedAsset && approvedAsset.id !== asset.id) {
+    throw new Error(`Publish the exact approved Classic Shirt asset (${approvedAsset.id}).`);
+  }
   const published = await verifyPublishedClassicShirt(asset.id);
   if (published.name !== record.customerName) {
     throw new Error(`The published Classic Shirt must be named exactly "${record.customerName}".`);
@@ -2652,7 +2731,7 @@ export async function handleUniformSubmitButton(
   const [, , nonce] = interaction.customId.split(":");
   if (!nonce) throw new Error("That uniform submission is unavailable.");
   const pending = pendingUniform(nonce, interaction);
-  if (!pending.customerId || (pending.command === "log" && !pending.seqmId)) {
+  if (!pending.customerId) {
     throw new Error("Select the required Discord user(s) before submitting.");
   }
   await interaction.deferUpdate();
@@ -2674,8 +2753,9 @@ export async function handleUniformSubmitButton(
   }
   if (!record) {
     await fetchedMember(interaction.guild!, pending.customerId);
-    if (pending.command === "log") await fetchedMember(interaction.guild!, pending.seqmId!);
-    const uploadLogChannelId = pending.command === "log" ? settings.logChannelId : settings.moderatedChannelId;
+    const uploadLogChannelId = pending.command === "log"
+      ? settings.seqmReviewChannelId ?? settings.logChannelId
+      : settings.moderatedChannelId;
     await requireUniformChannel(interaction.guild!, uploadLogChannelId, pending.command);
     await requireUniformChannel(interaction.guild!, pending.destinationChannelId, pending.command);
     const spreadsheet = configuredSpreadsheet(settings);
@@ -2697,7 +2777,14 @@ export async function handleUniformSubmitButton(
             publishing: {
               state: "handoff-pending" as const,
               uniformType: pending.submission.uniformType,
-              publisherName: pending.submission.publisherName ?? "Quartermaster Bot",
+              publisherName: "Pending",
+              stage: pending.twoStage ? "seqm-review" as const : "publisher" as const,
+              publisherChannelId: pending.twoStage
+                ? settings.publisherChannelId ?? settings.logChannelId
+                : uploadLogChannelId,
+              ...(pending.twoStage && latest.seniorQuartermasterRoleId
+                ? { seqmRoleId: latest.seniorQuartermasterRoleId }
+                : {}),
               attachment: pending.submission.sourceAttachment,
               ...(pending.attachmentBuffer
                 ? { sourceDataBase64: pending.attachmentBuffer.toString("base64") }
@@ -3244,6 +3331,12 @@ export async function validateUniformSettings(
   if (normalized.logChannelId) {
     await requireUniformChannel(guild, normalized.logChannelId, "log");
   }
+  if (normalized.seqmReviewChannelId) {
+    await requireUniformChannel(guild, normalized.seqmReviewChannelId, "log");
+  }
+  if (normalized.publisherChannelId) {
+    await requireUniformChannel(guild, normalized.publisherChannelId, "log");
+  }
   if (normalized.moderatedChannelId) {
     await requireUniformChannel(guild, normalized.moderatedChannelId, "moderated");
   }
@@ -3285,7 +3378,13 @@ export async function saveUniformSettings(
           ? { spreadsheet: existing.spreadsheet }
           : {}),
     };
-    await validateUniformSettings(guild, normalized);
+    // This screen edits destinations only. Permission grants are preserved
+    // verbatim and are validated by the application-owner permissions flow.
+    await validateUniformSettings(guild, {
+      ...normalized,
+      authorizedRoleIds: [],
+      authorizedMemberIds: [],
+    });
     const base = latest ?? setup;
     return {
       ...base,
@@ -3327,7 +3426,8 @@ export function uniformSettingsEmbed(
     "info",
     avatarUrl,
     [
-      { name: "/log destination", value: settings.logChannelId ? `<#${settings.logChannelId}>` : "Not configured", inline: true },
+      { name: "SEQM review channel", value: settings.seqmReviewChannelId ? `<#${settings.seqmReviewChannelId}>` : "Not configured", inline: true },
+      { name: "Publisher channel", value: settings.publisherChannelId ? `<#${settings.publisherChannelId}>` : "Not configured", inline: true },
       { name: "/moderated destination", value: settings.moderatedChannelId ? `<#${settings.moderatedChannelId}>` : "Not configured", inline: true },
       { name: "Authorized roles", value: mentionList(settings.authorizedRoleIds, "<@&"), inline: false },
       { name: "Authorized members", value: mentionList(settings.authorizedMemberIds, "<@"), inline: false },
@@ -3496,11 +3596,20 @@ export async function handleUniformSettingsComponent(
       .addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder()
-            .setCustomId("log_channel_id")
-            .setLabel("/log channel ID (optional)")
+            .setCustomId("seqm_review_channel_id")
+            .setLabel("SEQM review channel ID")
             .setStyle(TextInputStyle.Short)
-            .setValue(settings.logChannelId ?? "")
-            .setRequired(false)
+            .setValue(settings.seqmReviewChannelId ?? "")
+            .setRequired(true)
+            .setMaxLength(25),
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("publisher_channel_id")
+            .setLabel("Publisher channel ID")
+            .setStyle(TextInputStyle.Short)
+            .setValue(settings.publisherChannelId ?? "")
+            .setRequired(true)
             .setMaxLength(25),
         ),
         new ActionRowBuilder<TextInputBuilder>().addComponents(
@@ -3531,12 +3640,21 @@ export async function handleUniformSettingsModal(
   interaction: ModalSubmitInteraction,
   setup: GuildSetup,
 ): Promise<GuildSetup> {
+  const member = await currentMember(interaction.guild!, interaction.user.id);
+  if (interaction.guild!.ownerId !== member.id &&
+      !member.permissions.has(PermissionFlagsBits.Administrator)) {
+    throw new Error("Only the server owner or a current Administrator can change Uniforms settings.");
+  }
   const existing = uniformSettingsFor(setup);
   const settings: UniformSettings = {
     ...existing,
-    logChannelId: optionalChannelId(
-      uniformModalValue(interaction, "log_channel_id"),
-      "/log channel ID",
+    seqmReviewChannelId: optionalChannelId(
+      uniformModalValue(interaction, "seqm_review_channel_id"),
+      "SEQM review channel ID",
+    ),
+    publisherChannelId: optionalChannelId(
+      uniformModalValue(interaction, "publisher_channel_id"),
+      "Publisher channel ID",
     ),
     moderatedChannelId: optionalChannelId(
       uniformModalValue(interaction, "moderated_channel_id"),
@@ -3557,7 +3675,8 @@ export async function handleUniformSettingsModal(
       "success",
       undefined,
       [
-        { name: "/log", value: updated.uniforms?.logChannelId ? `<#${updated.uniforms.logChannelId}>` : "Not configured", inline: true },
+        { name: "SEQM review", value: updated.uniforms?.seqmReviewChannelId ? `<#${updated.uniforms.seqmReviewChannelId}>` : "Not configured", inline: true },
+        { name: "Publishers", value: updated.uniforms?.publisherChannelId ? `<#${updated.uniforms.publisherChannelId}>` : "Not configured", inline: true },
         { name: "/moderated", value: updated.uniforms?.moderatedChannelId ? `<#${updated.uniforms.moderatedChannelId}>` : "Not configured", inline: true },
       ],
     )],

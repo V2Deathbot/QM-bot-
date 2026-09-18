@@ -821,14 +821,14 @@ test("registers setup plus requested moderation and uniform commands", () => {
     "blacklist",
     "revoke_blacklist",
     "blacklist_lookup",
-    "log",
+    "created",
     "moderated",
     "relog",
   ]);
   const blacklist = definitions.find((command) => command.name === "blacklist");
   const payout = definitions.find((command) => command.name === "payout");
   const revoke = definitions.find((command) => command.name === "revoke_blacklist");
-  const log = definitions.find((command) => command.name === "log");
+  const log = definitions.find((command) => command.name === "created");
   const moderated = definitions.find((command) => command.name === "moderated");
   const relog = definitions.find((command) => command.name === "relog");
   assert.deepEqual(blacklist?.options?.map((option) => option.name), [
@@ -839,7 +839,7 @@ test("registers setup plus requested moderation and uniform commands", () => {
   assert.deepEqual(revoke?.options?.map((option) => option.name), ["username"]);
   assert.deepEqual(payout?.options, []);
   assert.deepEqual(log?.options?.map((option) => option.name), [
-    "customer", "seqm", "qm", "uniform_type", "channel", "uniform",
+    "customer", "uniform_type", "channel", "uniform",
   ]);
   assert.deepEqual(moderated?.options?.map((option) => option.name), [
     "uploader", "publisher", "customer", "shirtid", "channel",
@@ -1037,16 +1037,19 @@ test("navigates to Uploading configuration, seals modal fields, saves, resets, a
   const shown = shownModals.at(-1);
   assert.equal(shownModals.length, modalCount + 1);
   assert.deepEqual(modalTextInputIds(shown!), [
-    "log_channel_id",
+    "seqm_review_channel_id",
+    "publisher_channel_id",
     "moderated_channel_id",
   ]);
 
   await dispatchRaw(modal("setup-owner", shown!.customId, {
-    log_channel_id: "12345678901234567",
+    seqm_review_channel_id: "12345678901234567",
+    publisher_channel_id: "12345678901234567",
     moderated_channel_id: "12345678901234568",
   }));
   let saved = await store.getGuildSetup(guild.id);
-  assert.equal(saved?.uniforms?.logChannelId, "12345678901234567");
+  assert.equal(saved?.uniforms?.seqmReviewChannelId, "12345678901234567");
+  assert.equal(saved?.uniforms?.publisherChannelId, "12345678901234567");
   assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["member"]);
 
   // A modal captured while the user was an administrator cannot be used after
@@ -1055,22 +1058,25 @@ test("navigates to Uploading configuration, seals modal fields, saves, resets, a
   const staleForDemotion = shownModals.at(-1)!;
   members.set("setup-owner", { administrator: false });
   await dispatchRaw(modal("setup-owner", staleForDemotion.customId, {
-    log_channel_id: "",
+    seqm_review_channel_id: "",
+    publisher_channel_id: "",
     moderated_channel_id: "",
   }));
   saved = await store.getGuildSetup(guild.id);
-  assert.equal(saved?.uniforms?.logChannelId, "12345678901234567");
+  assert.equal(saved?.uniforms?.seqmReviewChannelId, "12345678901234567");
   members.set("setup-owner", { administrator: true });
 
   await dispatchRaw(modal("setup-owner", staleForDemotion.customId, {
-    log_channel_id: "",
+    seqm_review_channel_id: "",
+    publisher_channel_id: "",
     moderated_channel_id: "",
   }));
 
   // Serialized modal field IDs are stable, while the modal itself remains
   // nonce-bound to this settings session.
   await dispatchRaw(modal("setup-owner", shown!.customId.replace(/[a-f0-9]{32}$/, "00000000000000000000000000000000"), {
-    log_channel_id: "",
+    seqm_review_channel_id: "",
+    publisher_channel_id: "",
     moderated_channel_id: "",
   }));
   assert.match(replies.at(-1) ?? "", /expired|another administrator/i);

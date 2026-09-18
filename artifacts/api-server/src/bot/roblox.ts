@@ -29,6 +29,28 @@ export interface RobloxClassicShirt {
   id: number;
   name: string;
   isForSale: boolean;
+  description?: string;
+}
+
+export async function verifyUploadedClassicShirt(assetId: number): Promise<RobloxClassicShirt> {
+  if (!isPositiveSafeInteger(assetId)) throw new Error("The Roblox Classic Shirt asset ID must be a positive safe integer.");
+  let response: Response;
+  try {
+    response = await fetch(`https://economy.roblox.com/v2/assets/${assetId}/details`, {
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch {
+    throw new Error("Roblox could not verify the uploaded Classic Shirt.");
+  }
+  if (!response.ok) throw new Error(`Roblox could not verify the uploaded Classic Shirt (HTTP ${response.status}).`);
+  const value = await response.json() as {
+    AssetId?: unknown; AssetTypeId?: unknown; Name?: unknown; Description?: unknown; IsForSale?: unknown;
+  };
+  if (value.AssetId !== assetId || value.AssetTypeId !== 11 || typeof value.Name !== "string" ||
+      typeof value.Description !== "string" || typeof value.IsForSale !== "boolean") {
+    throw new Error("The supplied Roblox link is not an uploaded Classic Shirt.");
+  }
+  return { id: assetId, name: value.Name, description: value.Description, isForSale: value.IsForSale };
 }
 
 interface RobloxUserLookupResponse {

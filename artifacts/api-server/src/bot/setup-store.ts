@@ -34,9 +34,9 @@ export interface GuildSetup {
 }
 
 export const commandPermissionNames = [
-  "settings", "payout", "blacklist", "revoke_blacklist", "log", "moderated", "relog",
+  "settings", "payout", "blacklist", "revoke_blacklist", "created", "moderated", "relog",
 ] as const;
-export type CommandPermissionName = typeof commandPermissionNames[number];
+export type CommandPermissionName = typeof commandPermissionNames[number] | "log";
 export interface CommandPermissionGrant {
   roleIds: string[];
   memberIds: string[];
@@ -44,6 +44,7 @@ export interface CommandPermissionGrant {
 
 export function commandPermissionName(command: string): CommandPermissionName | undefined {
   if (command === "setup" || command === "settings") return "settings";
+  if (command === "log") return "log";
   if ((commandPermissionNames as readonly string[]).includes(command)) {
     return command as CommandPermissionName;
   }
@@ -126,8 +127,12 @@ export interface IdentitySettings {
 }
 
 export interface UniformSettings {
-  /** Channel used by /log. Undefined means that command is not configured. */
+  /** Legacy channel used by /log before the two-stage /created workflow. */
   logChannelId?: string;
+  /** Channel where Senior Quartermasters review and upload created PNGs. */
+  seqmReviewChannelId?: string;
+  /** Channel where publishers receive approved Classic Shirts. */
+  publisherChannelId?: string;
   /** Channel used by /moderated. Undefined means that command is not configured. */
   moderatedChannelId?: string;
   /** Additional submitters allowed to use either uniform command. */
@@ -276,7 +281,7 @@ function isGuildSetup(value: unknown): value is GuildSetup {
   const validCommandPermissions = permissions === undefined || Boolean(
     permissions && typeof permissions === "object" &&
     Object.entries(permissions).every(([name, value]) =>
-      (commandPermissionNames as readonly string[]).includes(name) &&
+      ((commandPermissionNames as readonly string[]).includes(name) || name === "log") &&
       Boolean(value) && typeof value === "object" &&
       validOptionalIds((value as Record<string, unknown>)["roleIds"]) &&
       validOptionalIds((value as Record<string, unknown>)["memberIds"]),
