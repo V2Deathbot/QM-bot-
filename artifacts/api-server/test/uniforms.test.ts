@@ -45,6 +45,7 @@ let inventoryRequestCount = 0;
 let economyResponseStatus = 200;
 let economyRequestCount = 0;
 let unpublishedAssetIds = new Set<number>();
+let economyAssetName = "Customer";
 let thumbnailState = "Pending";
 function pngCrc32(bytes: Buffer): number {
   let crc = 0xffffffff;
@@ -97,7 +98,7 @@ globalThis.fetch = async (input, init) => {
     if (economyResponseStatus !== 200 || unpublishedAssetIds.has(id)) {
       return new Response("", { status: unpublishedAssetIds.has(id) ? 400 : economyResponseStatus });
     }
-    return response({ AssetId: id, AssetTypeId: 11, Name: "Customer", Description: "ClassA", IsForSale: true });
+    return response({ AssetId: id, AssetTypeId: 11, Name: economyAssetName, Description: "ClassA", IsForSale: true });
   }
   const thumbnail = /thumbnails\.roblox\.com\/v1\/assets\?assetIds=(\d+)/.exec(url);
   if (thumbnail) {
@@ -299,6 +300,7 @@ beforeEach(() => {
   unownedAssetIds = new Set(); inventoryResponseStatus = 200; inventoryRequestCount = 0;
   economyResponseStatus = 200; economyRequestCount = 0; thumbnailState = "Pending";
   unpublishedAssetIds = new Set();
+  economyAssetName = "Customer";
   resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
 });
 after(() => { globalThis.fetch = originalFetch; resetGoogleSheetsProxyForTests(); });
@@ -520,6 +522,7 @@ test("SEQM still forwards a manually approved shirt when Roblox cannot confirm i
   } as never);
   assert.match(JSON.stringify(publisherModal), /catalog_link/);
   economyResponseStatus = 200;
+  economyAssetName = "Any valid uniform name";
   await handleUniformPublishingModal({
     customId: "uniform:publish-modal:seqm-needs-publisher",
     guild, guildId: guild.id, user: { id: "seqm-discord" },
@@ -1129,6 +1132,7 @@ test("keeps the original delivery intact until a replacement PNG is published", 
   } as never);
   assert.match(JSON.stringify(shownModal), /catalog_link/);
 
+  economyAssetName = "Replacement uniform";
   await handleUniformRelogPublishingModal({
     customId: `uniform:relog-publish-modal:relog-attachment:${nonce}`,
     guild, guildId: guild.id, user: { id: "seqm-discord" },

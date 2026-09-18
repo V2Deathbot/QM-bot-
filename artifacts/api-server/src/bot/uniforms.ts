@@ -1493,7 +1493,7 @@ function relogPublishingEmbed(record: UniformDeliveryRecord): EmbedBuilder {
     "info",
     undefined,
     [
-      { name: "Roblox item name", value: safePresentationText(record.customerName), inline: true },
+      { name: "Customer", value: safePresentationText(record.customerName), inline: true },
       { name: "Roblox description", value: safePresentationText(handoff.uniformType), inline: true },
       { name: "Customer ticket", value: `<#${record.destinationChannelId}>`, inline: true },
       { name: "Original asset", value: record.assets[handoff.rowIndex]?.url ?? "Unavailable" },
@@ -1782,10 +1782,7 @@ export async function handleUniformRelogPublishingModal(
     throw new Error("This replacement handoff is already completed or being processed.");
   }
   const asset = parseUniformAssetInput(interaction.fields.getTextInputValue("catalog_link"));
-  const published = await verifyPublishedClassicShirt(asset.id);
-  if (published.name !== record.customerName) {
-    throw new Error(`The replacement Classic Shirt must be named exactly "${record.customerName}".`);
-  }
+  await verifyPublishedClassicShirt(asset.id);
   await interaction.deferReply({ ephemeral: true });
   const publisherName = await discordPublisherName(interaction);
   const rowIndex = record.relogHandoff!.rowIndex;
@@ -2293,7 +2290,7 @@ function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
     "info",
     undefined,
     [
-      { name: "Roblox item name", value: safePresentationText(record.customerName), inline: true },
+      { name: "Customer", value: safePresentationText(record.customerName), inline: true },
       { name: "Roblox descriptions", value: (publishing.uniformTypes ?? [publishing.uniformType])
         .map((type, index) => `Shirt ${index + 1}: ${safePresentationText(type)}`).join("\n"), inline: false },
       { name: reviewing ? "Senior Quartermaster" : "Publisher", value: "*Pending*", inline: true },
@@ -3191,10 +3188,7 @@ export async function handleUniformPublishingModal(
     throw new Error(`Publish the exact approved Classic Shirt asset (${approvedAsset.id}).`);
   }
   for (const candidate of submittedAssets) {
-    const published = await verifyPublishedClassicShirt(candidate.id);
-    if (published.name !== record.customerName) {
-      throw new Error(`The published Classic Shirt must be named exactly "${record.customerName}".`);
-    }
+    await verifyPublishedClassicShirt(candidate.id);
   }
   const publisherName = await discordPublisherName(interaction);
   try {
