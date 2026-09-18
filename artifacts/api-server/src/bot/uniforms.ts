@@ -29,10 +29,7 @@ import {
   ownsRobloxAsset,
   RobloxInventoryPrivateError,
   RobloxOwnershipUnavailableError,
-  RobloxAssetMetadataUnavailableError,
   verifyPublishedClassicShirt,
-  verifyUploadedClassicShirt,
-  getRobloxAssetProcessingState,
   type RobloxUser,
 } from "./roblox";
 import {
@@ -315,7 +312,6 @@ function discordDeliveryFailure(stage: DiscordDeliveryStage, error: unknown): Un
 }
 
 const activeUniformSubmissions = new Set<string>();
-const activeUniformModerationChecks = new Set<string>();
 const uniformConfirmationLifetimeMs = 10 * 60_000;
 interface PendingUniformConfirmation {
   nonce: string;
@@ -2514,21 +2510,6 @@ export async function handleUniformPublishingButton(
   }
 }
 
-function pendingRobloxModerationEmbed(record: UniformDeliveryRecord): EmbedBuilder {
-  return presentationEmbed(
-    "Pending",
-    "Roblox is still processing or moderating this Classic Shirt. The bot will check it automatically every minute.",
-    "warning",
-    undefined,
-    [
-      { name: "Customer", value: safePresentationText(record.customerName), inline: true },
-      { name: "Uniform type", value: safePresentationText(record.publishing!.uniformType), inline: true },
-      { name: "Senior Quartermaster", value: safePresentationText(record.publishing!.seqmName ?? "Unknown"), inline: true },
-      { name: "Pending asset", value: `[${record.publishing!.approvedAsset!.id}](${record.publishing!.approvedAsset!.url})` },
-    ],
-  );
-}
-
 async function forwardApprovedUniform(
   record: UniformDeliveryRecord,
   guild: Guild,
@@ -2659,59 +2640,21 @@ async function completeAutomaticRobloxModeration(
   });
 }
 
-export async function pollPendingUniformModeration(guild: Guild): Promise<void> {
+export async function recoverPendingUniformReviews(guild: Guild): Promise<void> {
   const records = await findPendingUniformModerationChecks();
   for (const record of records) {
-    if (record.guildId !== guild.id || activeUniformModerationChecks.has(record.submissionId)) continue;
-    activeUniformModerationChecks.add(record.submissionId);
+    if (record.guildId !== guild.id) continue;
     try {
       if (record.publishing?.state === "moderation-claimed") {
         await completeAutomaticRobloxModeration(record, guild);
-        continue;
-      }
-      const asset = record.publishing?.approvedAsset;
-      if (!asset) {
-        await updateUniformDelivery(record.submissionId, (item) => {
-          if (item.publishing?.state === "moderation-pending") item.publishing.state = "unresolved";
-        });
-        continue;
-      }
-      const processingState = await getRobloxAssetProcessingState(asset.id);
-      if (!processingState || processingState === "Pending") continue;
-      if (processingState === "Blocked") {
-        await completeAutomaticRobloxModeration(record, guild);
-        continue;
-      }
-      if (processingState !== "Completed") continue;
-      let uploaded;
-      try {
-        uploaded = await verifyUploadedClassicShirt(asset.id);
-      } catch (error) {
-        if (error instanceof RobloxAssetMetadataUnavailableError) continue;
-        throw error;
-      }
-      if (uploaded.name !== record.customerName ||
-          uploaded.description !== record.publishing!.uniformType) {
-        await updateUniformDelivery(record.submissionId, (item) => {
-          if (item.publishing?.state === "moderation-pending") item.publishing.state = "unresolved";
-        });
-        await editPublishingHandoff(record, guild, presentationEmbed(
-          "Classic Shirt Validation Failed",
-          "Roblox finished processing the asset, but its name or description does not match this order. It was not sent to publishers.",
-          "error",
-          undefined,
-          [{ name: "Asset", value: asset.url }],
-        )).catch(() => undefined);
         continue;
       }
       await forwardApprovedUniform(record, guild);
     } catch (error) {
       logger.error(
         { submissionId: record.submissionId, errorName: error instanceof Error ? error.name : "Unknown" },
-        "Pending Roblox uniform moderation check failed",
+        "Pending uniform review recovery failed",
       );
-    } finally {
-      activeUniformModerationChecks.delete(record.submissionId);
     }
   }
 }
@@ -2743,59 +2686,6 @@ export async function handleUniformPublishingModal(
       item.publishing.seqmName = seqmName;
       item.publishing.approvedAsset = asset;
     });
-    const processingState = await getRobloxAssetProcessingState(asset.id);
-    if (processingState === "Pending") {
-      record = await updateUniformDelivery(submissionId, (item) => {
-        if (item.publishing?.state !== "awaiting-result") {
-          throw new Error("This Senior Quartermaster review is no longer awaiting a result.");
-        }
-        item.publishing.state = "moderation-pending";
-      });
-      await editPublishingHandoff(record, interaction.guild!, pendingRobloxModerationEmbed(record));
-      await interaction.editReply({
-        embeds: [pendingRobloxModerationEmbed(record)],
-        components: [],
-        allowedMentions: noMentions,
-      });
-      return;
-    }
-    if (processingState === "Blocked") {
-      record = await updateUniformDelivery(submissionId, (item) => {
-        if (item.publishing?.state === "awaiting-result") item.publishing.state = "moderation-pending";
-      });
-      await completeAutomaticRobloxModeration(record, interaction.guild!);
-      await interaction.editReply({
-        embeds: [presentationEmbed("Moderation Denial Recorded", "Roblox denied the shirt. Moderated Logs were updated and you were notified.", "error")],
-        components: [],
-        allowedMentions: noMentions,
-      });
-      return;
-    }
-    let uploaded;
-    try {
-      uploaded = await verifyUploadedClassicShirt(asset.id);
-    } catch (error) {
-      if (!(error instanceof RobloxAssetMetadataUnavailableError)) throw error;
-      record = await updateUniformDelivery(submissionId, (item) => {
-        if (item.publishing?.state !== "awaiting-result") {
-          throw new Error("This Senior Quartermaster review is no longer awaiting a result.");
-        }
-        item.publishing.state = "moderation-pending";
-      });
-      await editPublishingHandoff(record, interaction.guild!, pendingRobloxModerationEmbed(record));
-      await interaction.editReply({
-        embeds: [pendingRobloxModerationEmbed(record)],
-        components: [],
-        allowedMentions: noMentions,
-      });
-      return;
-    }
-    if (uploaded.name !== record.customerName) {
-      throw new Error(`The uploaded Classic Shirt must be named exactly "${record.customerName}".`);
-    }
-    if (uploaded.description !== record.publishing!.uniformType) {
-      throw new Error(`The uploaded Classic Shirt description must be exactly "${record.publishing!.uniformType}".`);
-    }
     const forwarded = await forwardApprovedUniform(record, interaction.guild!);
     await interaction.editReply({
       embeds: [presentationEmbed(

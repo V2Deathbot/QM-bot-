@@ -17,7 +17,7 @@ const {
   handleUniformPublishingButton, handleUniformPublishingModal, handleUniformRelogCommand,
   handleUniformRelogPublishingButton, handleUniformRelogPublishingModal,
   handleUniformRetryButton, handleUniformSubmitButton, handleUniformUserSelection, parseUniformAssetInput,
-  pollPendingUniformModeration, resetUniformSubmissionStateForTests, saveUniformSettings,
+  recoverPendingUniformReviews, resetUniformSubmissionStateForTests, saveUniformSettings,
   saveUniformSpreadsheetSettings, uniformCommands, uniformSheetRows,
   UniformDeliveryRecoveryError, uniformDeliveryRecoveryResponse, validateUniformSettings,
 } = await import("../src/bot/uniforms.ts");
@@ -26,7 +26,7 @@ const { setGoogleSheetsProxyForTests, resetGoogleSheetsProxyForTests } =
   await import("../src/bot/google-sheets.ts");
 const {
   claimUniformDeliveryAction, claimUniformDeliveryStage, getUniformDelivery, recoverLegacyNonceRejectedDelivery, resetUniformDeliveryStoreForTests,
-  saveUniformDelivery, uniformDiscordNonce, updateUniformDelivery,
+  saveUniformDelivery, uniformDiscordNonce,
 } = await import("../src/bot/uniform-delivery-store.ts");
 const { getGuildSetup, saveGuildSetup, defaultUniformSettings } =
   await import("../src/bot/setup-store.ts");
@@ -355,49 +355,19 @@ function pendingModerationRecord(submissionId: string) {
   };
 }
 
-test("polling forwards a completed pending shirt to publishers exactly once", async () => {
+test("startup releases a previously pending manually reviewed shirt exactly once without Roblox", async () => {
   sentMessages.add("review-message");
   await saveUniformDelivery(pendingModerationRecord("pending-completed"));
-  thumbnailState = "Completed";
-  await pollPendingUniformModeration(guild as never);
-  await pollPendingUniformModeration(guild as never);
+  economyResponseStatus = 400;
+  thumbnailState = "Blocked";
+  await recoverPendingUniformReviews(guild as never);
+  await recoverPendingUniformReviews(guild as never);
   const completed = await getUniformDelivery("pending-completed");
   assert.equal(completed?.publishing?.stage, "publisher");
   assert.equal(completed?.publishing?.state, "awaiting-result");
   assert.equal(sends.filter((entry) => (entry as { id: string }).id === "publisher").length, 1);
+  assert.equal(economyRequestCount, 0);
   assert.equal(rows.get("Uniform Logs"), undefined);
-});
-
-test("polling keeps a rendered shirt pending while Roblox metadata still returns HTTP 400", async () => {
-  sentMessages.add("review-message");
-  await saveUniformDelivery(pendingModerationRecord("pending-metadata"));
-  thumbnailState = "Completed";
-  economyResponseStatus = 400;
-  await pollPendingUniformModeration(guild as never);
-  const pending = await getUniformDelivery("pending-metadata");
-  assert.equal(pending?.publishing?.stage, "seqm-review");
-  assert.equal(pending?.publishing?.state, "moderation-pending");
-  assert.equal(sends.length, 0);
-  assert.equal(rows.get("Uniform Logs"), undefined);
-  assert.equal(rows.get("Moderated Logs"), undefined);
-  await updateUniformDelivery("pending-metadata", (record) => {
-    if (record.publishing?.state === "moderation-pending") record.publishing.state = "unresolved";
-  });
-});
-
-test("polling logs a blocked pending shirt and notifies its SEQM exactly once", async () => {
-  sentMessages.add("review-message");
-  await saveUniformDelivery(pendingModerationRecord("pending-blocked"));
-  thumbnailState = "Blocked";
-  await pollPendingUniformModeration(guild as never);
-  await pollPendingUniformModeration(guild as never);
-  const blocked = await getUniformDelivery("pending-blocked");
-  assert.equal(blocked?.publishing?.state, "moderated");
-  assert.equal(blocked?.publishing?.moderationNoticeState, "sent");
-  assert.deepEqual(rows.get("Moderated Logs"), [["Publishing Quartermaster", "", "Customer", ""]]);
-  const notices = sends.filter((entry) => (entry as { id: string }).id === "moderated");
-  assert.equal(notices.length, 1);
-  assert.equal((notices[0] as { payload: { content: string } }).payload.content, "<@seqm-discord>");
 });
 
 test("rejects invalid Roblox group identifiers before constructing a provider URL", () => {
