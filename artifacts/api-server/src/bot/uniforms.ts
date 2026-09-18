@@ -2226,7 +2226,7 @@ function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
     [
       { name: "Roblox item name", value: safePresentationText(record.customerName), inline: true },
       { name: "Roblox description", value: safePresentationText(publishing.uniformType), inline: true },
-      { name: "Publisher", value: safePresentationText(publishing.publisherName), inline: true },
+      { name: "Publisher", value: "*Pending*", inline: true },
       { name: "Customer ticket", value: `<#${record.destinationChannelId}>`, inline: true },
       { name: "PNG", value: safePresentationText(publishing.attachment.name), inline: true },
     ],
@@ -2358,7 +2358,7 @@ async function editPublishingHandoff(
   await message.edit({
     content: "",
     embeds: [embed],
-    components: publishingHandoffComponents(record, true),
+    components: [],
     allowedMentions: noMentions,
   });
 }
@@ -2461,6 +2461,8 @@ export async function handleUniformPublishingButton(
       "Roblox Moderation Denied",
       "This upload was logged in the moderated worksheet. No customer message was sent.",
       "error",
+      undefined,
+      [{ name: "Publisher", value: safePresentationText(publisherName), inline: true }],
     )).catch(() => undefined);
     await interaction.editReply({
       embeds: [presentationEmbed("Moderation Denial Recorded", "The moderated worksheet and Senior Quartermaster notice were completed.", "success")],
