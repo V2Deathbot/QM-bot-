@@ -736,6 +736,49 @@ test("routes a rejected attachment only to the moderated sheet and Senior Quarte
   assert.match(JSON.stringify(edits), /Moderation Denial Recorded/);
 });
 
+test("requires SEQM to enter the Roblox link before recording a moderated shirt", async () => {
+  const seqmSetup = { ...setup, seniorQuartermasterRoleId: "20000000000000001" };
+  await saveGuildSetup(seqmSetup as never);
+  const commandInteraction = interaction("created" as never, {
+    customer: "Customer", uniform_type: "DressBlue", uniform: "yes",
+  }, "seqm-moderated-link");
+  await handleUniformCommand(commandInteraction as never, seqmSetup as never);
+  const nonce = componentId(commandInteraction.edits[0], 0).split(":")[2]!;
+  await handleUniformUserSelection({
+    customId: `uniform:customer:${nonce}`, guild, guildId: guild.id,
+    user: { id: "submitter" }, values: ["customer-discord"], update: async () => undefined,
+  } as never);
+  await handleUniformUserSelection({
+    customId: `uniform:seqm:${nonce}`, guild, guildId: guild.id,
+    user: { id: "submitter" }, values: ["seqm-discord"], update: async () => undefined,
+  } as never);
+  await handleUniformSubmitButton({
+    customId: `uniform:submit:${nonce}`, guild, guildId: guild.id,
+    user: { id: "submitter" }, deferUpdate: async () => undefined, editReply: async () => undefined,
+  } as never, async () => false);
+
+  let shownModal: unknown;
+  await handleUniformPublishingButton({
+    customId: "uniform:publish-moderated:seqm-moderated-link",
+    guild, guildId: guild.id, user: { id: "submitter" },
+    message: { id: "notice-1" },
+    showModal: async (modal: unknown) => { shownModal = modal; },
+  } as never);
+  assert.match(JSON.stringify(shownModal), /moderated Roblox link/i);
+  assert.equal(rows.get("Moderated Logs"), undefined);
+
+  await handleUniformPublishingModal({
+    customId: "uniform:publish-modal:seqm-moderated-link",
+    guild, guildId: guild.id, user: { id: "submitter" },
+    fields: { getTextInputValue: () => "https://www.roblox.com/catalog/321" },
+    deferReply: async () => undefined, editReply: async () => undefined,
+  } as never);
+  assert.deepEqual(rows.get("Moderated Logs"), [[
+    "Publishing Quartermaster", "Publishing Quartermaster", "Customer",
+    "https://www.roblox.com/catalog/321",
+  ]]);
+});
+
 test("writes before notice and conservatively preserves an unresolved notice", async () => {
   const value = { qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer", shirtid1: "42" };
   await saveGuildSetup(setup as never);

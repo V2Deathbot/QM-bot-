@@ -2535,14 +2535,18 @@ export async function handleUniformPublishingButton(
     const activeIndices = activePublishingIndices(record);
     const moderated = new Set(record.publishing!.moderatedIndices ?? []);
     const successful = activeIndices.filter((index) => !moderated.has(index));
-    if (successful.length === 0) {
+    const reviewing = record.publishing!.stage !== "publisher";
+    if (successful.length === 0 && !reviewing) {
       throw new Error("All shirts are selected as moderated. Use the Roblox Moderation Denied action to complete this result.");
     }
-    const inputs = activeIndices.length === 1
-      ? [new TextInputBuilder().setCustomId("catalog_link").setLabel("Published Roblox catalog link").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(500)]
-      : successful.map((index) => new TextInputBuilder()
-        .setCustomId(`catalog_link_${index}`)
-        .setLabel(`Shirt ${index + 1} catalog link`)
+    const requestedIndices = reviewing ? activeIndices : successful;
+    const inputs = requestedIndices.map((index) => new TextInputBuilder()
+        .setCustomId(activeIndices.length === 1 ? "catalog_link" : `catalog_link_${index}`)
+        .setLabel(moderated.has(index)
+          ? `Shirt ${index + 1} moderated Roblox link`
+          : activeIndices.length === 1
+            ? "Published Roblox catalog link"
+            : `Shirt ${index + 1} catalog link`)
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
         .setMaxLength(500));
@@ -2555,6 +2559,28 @@ export async function handleUniformPublishingButton(
     return;
   }
   const activeIndices = activePublishingIndices(record);
+  const reviewing = record.publishing!.stage !== "publisher";
+  if (reviewing) {
+    record = await updateUniformDelivery(submissionId, (item) => {
+      if (!item.publishing || item.publishing.state !== "awaiting-result") {
+        throw new Error("This Senior Quartermaster review is no longer awaiting a result.");
+      }
+      item.publishing.moderatedIndices = activeIndices;
+    });
+    const inputs = activeIndices.map((index) => new TextInputBuilder()
+      .setCustomId(activeIndices.length === 1 ? "catalog_link" : `catalog_link_${index}`)
+      .setLabel(`Shirt ${index + 1} moderated Roblox link`)
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(500));
+    await interaction.showModal(
+      new ModalBuilder()
+        .setCustomId(`uniform:publish-modal:${submissionId}`)
+        .setTitle("Record Roblox Moderation")
+        .addComponents(...inputs.map((input) => new ActionRowBuilder<TextInputBuilder>().addComponents(input))),
+    );
+    return;
+  }
   const originalShirtCount = record.publishing!.attachments?.length ?? 1;
   if (originalShirtCount > 1) {
     await interaction.deferUpdate();
@@ -2588,7 +2614,6 @@ export async function handleUniformPublishingButton(
     return;
   }
   await interaction.deferUpdate();
-  const reviewing = record.publishing!.stage !== "publisher";
   const actorName = await discordPublisherName(interaction);
   const publisherName = reviewing ? "" : actorName;
   let current = await updateUniformDelivery(submissionId, (item) => {
@@ -3034,12 +3059,16 @@ export async function handleUniformPublishingModal(
   const activeIndices = activePublishingIndices(record);
   const moderated = new Set(record.publishing!.moderatedIndices ?? []);
   const successfulIndices = activeIndices.filter((index) => !moderated.has(index));
-  const submittedAssets = successfulIndices.map((index) => parseUniformAssetInput(
+  const reviewing = record.publishing!.stage !== "publisher";
+  const enteredIndices = reviewing ? activeIndices : successfulIndices;
+  const enteredAssets = enteredIndices.map((index) => parseUniformAssetInput(
     interaction.fields.getTextInputValue(activeIndices.length === 1 ? "catalog_link" : `catalog_link_${index}`),
   ));
-  const asset = submittedAssets[0]!;
+  const enteredAssetsByIndex = new Map(enteredIndices.map((index, position) => [index, enteredAssets[position]!]));
+  const submittedAssets = successfulIndices.map((index) => enteredAssetsByIndex.get(index)!);
+  const asset = submittedAssets[0];
   await interaction.deferReply({ ephemeral: true });
-  if (record.publishing!.stage !== "publisher") {
+  if (reviewing) {
     const seqmName = await discordPublisherName(interaction);
     record = await updateUniformDelivery(submissionId, (item) => {
       if (!item.publishing || item.publishing.state !== "awaiting-result") {
@@ -3049,14 +3078,14 @@ export async function handleUniformPublishingModal(
       if (!row || row.length !== LOG_UNIFORM_COLUMN_COUNT) throw new Error("The pending uniform row is incomplete.");
       item.seqmId = interaction.user.id;
       item.assets = submittedAssets;
-      successfulIndices.forEach((originalIndex, assetIndex) => {
-        const successfulRow = item.rows[originalIndex];
-        const successfulAsset = submittedAssets[assetIndex];
-        if (!successfulRow || successfulRow.length !== LOG_UNIFORM_COLUMN_COUNT || !successfulAsset) {
+      enteredIndices.forEach((originalIndex) => {
+        const enteredRow = item.rows[originalIndex];
+        const enteredAsset = enteredAssetsByIndex.get(originalIndex);
+        if (!enteredRow || enteredRow.length !== LOG_UNIFORM_COLUMN_COUNT || !enteredAsset) {
           throw new Error(`The pending row for Shirt ${originalIndex + 1} is incomplete.`);
         }
-        successfulRow[1] = seqmName;
-        successfulRow[successfulRow.length - 1] = successfulAsset.url;
+        enteredRow[1] = seqmName;
+        enteredRow[enteredRow.length - 1] = enteredAsset.url;
       });
       item.publishing.seqmName = seqmName;
       item.publishing.approvedAsset = asset;
@@ -3081,14 +3110,24 @@ export async function handleUniformPublishingModal(
       );
       await interaction.editReply({
         embeds: [presentationEmbed(
-          "Uniform Already Published and Delivered",
-          `The shirt was already on sale, so it bypassed publishers and was delivered to <#${delivered.destinationChannelId}>.`,
+          submittedAssets.length > 0
+            ? "Uniform Already Published and Delivered"
+            : "Moderation Denial Recorded",
+          submittedAssets.length > 0
+            ? `The shirt was already on sale, so it bypassed publishers and was delivered to <#${delivered.destinationChannelId}>.`
+            : "The moderated worksheet was updated with the submitted Roblox link. No publisher or customer message was sent.",
           "success",
           undefined,
-          [
+          submittedAssets.length > 0 ? [
             { name: "Publisher", value: safePresentationText(seqmName), inline: true },
-            { name: "Catalog link", value: asset.url },
-          ],
+            { name: "Catalog link", value: asset!.url },
+          ] : [{
+            name: "Moderated links",
+            value: enteredIndices.map((index) => {
+              const candidate = enteredAssetsByIndex.get(index)!;
+              return `Shirt ${index + 1}: [${candidate.id}](${candidate.url})`;
+            }).join("\n"),
+          }],
         )],
         components: [],
         allowedMentions: noMentions,
