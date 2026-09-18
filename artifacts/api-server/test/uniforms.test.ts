@@ -21,7 +21,7 @@ const {
   saveUniformSpreadsheetSettings, uniformCommands, uniformSheetRows,
   UniformDeliveryRecoveryError, uniformDeliveryRecoveryResponse, validateUniformSettings,
 } = await import("../src/bot/uniforms.ts");
-const { getRobloxGroupUrl } = await import("../src/bot/roblox.ts");
+const { getRobloxGroupUrl, verifyUploadedClassicShirt } = await import("../src/bot/roblox.ts");
 const { setGoogleSheetsProxyForTests, resetGoogleSheetsProxyForTests } =
   await import("../src/bot/google-sheets.ts");
 const {
@@ -42,6 +42,8 @@ const users = new Map([
 let unownedAssetIds = new Set<number>();
 let inventoryResponseStatus = 200;
 let inventoryRequestCount = 0;
+let economyResponseStatus = 200;
+let economyRequestCount = 0;
 function pngCrc32(bytes: Buffer): number {
   let crc = 0xffffffff;
   for (const byte of bytes) {
@@ -88,8 +90,12 @@ globalThis.fetch = async (input, init) => {
   }
   const published = /economy\.roblox\.com\/v2\/assets\/(\d+)\/details/.exec(url);
   if (published) {
+    economyRequestCount += 1;
+    if (economyResponseStatus !== 200) {
+      return new Response("", { status: economyResponseStatus });
+    }
     const id = Number(published[1]);
-    return response({ AssetId: id, AssetTypeId: 11, Name: "Customer", IsForSale: true });
+    return response({ AssetId: id, AssetTypeId: 11, Name: "Customer", Description: "ClassA", IsForSale: true });
   }
   const ownership = /inventory\.roblox\.com\/v1\/users\/(\d+)\/items\/Asset\/(\d+)\/is-owned/.exec(url);
   if (ownership) {
@@ -280,6 +286,7 @@ beforeEach(() => {
   rows.clear(); sends = []; auditMessageEdits = []; sentMessages.clear(); auditEditFailure = undefined; sendFailure = undefined; sheetFailure = undefined;
   rejectLongDiscordNonces = false; sheetValidationGate = undefined;
   unownedAssetIds = new Set(); inventoryResponseStatus = 200; inventoryRequestCount = 0;
+  economyResponseStatus = 200; economyRequestCount = 0;
   resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
 });
 after(() => { globalThis.fetch = originalFetch; resetGoogleSheetsProxyForTests(); });
@@ -302,6 +309,15 @@ test("registers /created with only its required customer and upload inputs", () 
   assert.equal(uniformCommands[0]!.toJSON().options?.[2]?.name, "channel");
   assert.equal(uniformCommands[0]!.toJSON().options?.[3]?.name, "uniform");
   assert.equal(uniformCommands[1]!.toJSON().options?.[4]?.name, "channel");
+});
+
+test("retries four temporary HTTP 400 responses while checking a new SEQM upload", async () => {
+  economyResponseStatus = 400;
+  await assert.rejects(
+    verifyUploadedClassicShirt(123),
+    /uploaded Classic Shirt \(HTTP 400\)/,
+  );
+  assert.equal(economyRequestCount, 4);
 });
 
 test("rejects invalid Roblox group identifiers before constructing a provider URL", () => {

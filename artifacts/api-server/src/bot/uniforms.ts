@@ -2521,6 +2521,7 @@ export async function handleUniformPublishingModal(
     throw new Error("This publishing handoff has already been completed or is being processed.");
   }
   const asset = parseUniformAssetInput(interaction.fields.getTextInputValue("catalog_link"));
+  await interaction.deferReply({ ephemeral: true });
   if (record.publishing!.stage !== "publisher") {
     const uploaded = await verifyUploadedClassicShirt(asset.id);
     if (uploaded.name !== record.customerName) {
@@ -2529,7 +2530,6 @@ export async function handleUniformPublishingModal(
     if (uploaded.description !== record.publishing!.uniformType) {
       throw new Error(`The uploaded Classic Shirt description must be exactly "${record.publishing!.uniformType}".`);
     }
-    await interaction.deferReply({ ephemeral: true });
     const seqmName = await discordPublisherName(interaction);
     const reviewRecord = await updateUniformDelivery(submissionId, (item) => {
       if (!item.publishing || item.publishing.state !== "awaiting-result") {
@@ -2583,7 +2583,6 @@ export async function handleUniformPublishingModal(
   if (published.name !== record.customerName) {
     throw new Error(`The published Classic Shirt must be named exactly "${record.customerName}".`);
   }
-  await interaction.deferReply({ ephemeral: true });
   const publisherName = await discordPublisherName(interaction);
   record = await updateUniformDelivery(submissionId, (item) => {
     if (item.publishing?.state !== "awaiting-result") {

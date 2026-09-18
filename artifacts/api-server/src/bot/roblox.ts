@@ -34,15 +34,23 @@ export interface RobloxClassicShirt {
 
 export async function verifyUploadedClassicShirt(assetId: number): Promise<RobloxClassicShirt> {
   if (!isPositiveSafeInteger(assetId)) throw new Error("The Roblox Classic Shirt asset ID must be a positive safe integer.");
-  let response: Response;
-  try {
-    response = await fetch(`https://economy.roblox.com/v2/assets/${assetId}/details`, {
-      signal: AbortSignal.timeout(5_000),
-    });
-  } catch {
-    throw new Error("Roblox could not verify the uploaded Classic Shirt.");
+  let response: Response | undefined;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    try {
+      response = await fetch(`https://economy.roblox.com/v2/assets/${assetId}/details`, {
+        signal: AbortSignal.timeout(5_000),
+      });
+    } catch {
+      throw new Error("Roblox could not verify the uploaded Classic Shirt.");
+    }
+    if (response.status !== 400 || attempt === 4) break;
+    // Newly created Roblox assets can briefly return 400 before their Economy
+    // details become available. Allow four total checks before surfacing it.
+    await new Promise((resolve) => setTimeout(resolve, attempt * 400));
   }
-  if (!response.ok) throw new Error(`Roblox could not verify the uploaded Classic Shirt (HTTP ${response.status}).`);
+  if (!response?.ok) {
+    throw new Error(`Roblox could not verify the uploaded Classic Shirt (HTTP ${response?.status ?? "unknown"}).`);
+  }
   const value = await response.json() as {
     AssetId?: unknown; AssetTypeId?: unknown; Name?: unknown; Description?: unknown; IsForSale?: unknown;
   };
