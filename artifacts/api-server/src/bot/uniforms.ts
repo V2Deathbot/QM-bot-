@@ -26,7 +26,6 @@ import { inflateSync } from "node:zlib";
 import { purchaseFooter } from "./purchase-footers";
 import {
   findRobloxUser,
-  findRobloxUserById,
   ownsRobloxAsset,
   RobloxInventoryPrivateError,
   RobloxOwnershipUnavailableError,
@@ -78,7 +77,6 @@ import {
   validateSpreadsheetConfiguration,
   type UniformSheetRow,
 } from "./google-sheets";
-import { getSecurityState } from "./security-store";
 
 /**
  * Uniform logging deliberately has no provider side effects.  In particular,
@@ -774,20 +772,8 @@ function memberHasRole(member: GuildMember, roleIds: string[]): boolean {
   return Boolean(cache?.has && roleIds.some((id) => cache.has!(id)));
 }
 
-async function linkedPublisherName(guildId: string, discordUserId: string): Promise<string> {
-  const linkedIds = [...new Set(
-    (await getSecurityState(guildId)).identityLedger
-      .filter((entry) => entry.discordUserId === discordUserId)
-      .map((entry) => entry.robloxUserId),
-  )];
-  if (linkedIds.length !== 1) {
-    throw new Error(
-      linkedIds.length
-        ? "Your Discord account has multiple Roblox identities recorded. An Administrator must resolve the identity binding before you can publish uniforms."
-        : "Your Discord account has no linked Roblox identity. Link and verify your Roblox account before publishing uniforms.",
-    );
-  }
-  return (await findRobloxUserById(linkedIds[0]!)).name;
+function discordPublisherName(interaction: ButtonInteraction | ModalSubmitInteraction): string {
+  return interaction.user.username?.trim() || interaction.user.id;
 }
 
 /**
@@ -1651,7 +1637,7 @@ export async function handleUniformRelogPublishingButton(
     return;
   }
   await interaction.deferUpdate();
-  const publisherName = await linkedPublisherName(record.guildId, interaction.user.id);
+  const publisherName = discordPublisherName(interaction);
   record = await updateUniformDelivery(submissionId, (item) => {
     if (item.relogHandoff?.nonce !== nonce || item.relogHandoff.state !== "awaiting-result") {
       throw new Error("This replacement handoff is no longer awaiting a result.");
@@ -1741,7 +1727,7 @@ export async function handleUniformRelogPublishingModal(
     throw new Error(`The replacement Classic Shirt must be named exactly "${record.customerName}".`);
   }
   await interaction.deferReply({ ephemeral: true });
-  const publisherName = await linkedPublisherName(record.guildId, interaction.user.id);
+  const publisherName = discordPublisherName(interaction);
   const rowIndex = record.relogHandoff!.rowIndex;
   record = await updateUniformDelivery(submissionId, (item) => {
     if (item.relogHandoff?.nonce !== nonce || item.relogHandoff.state !== "awaiting-result") {
@@ -2410,7 +2396,7 @@ export async function handleUniformPublishingButton(
     return;
   }
   await interaction.deferUpdate();
-  const publisherName = await linkedPublisherName(record.guildId, interaction.user.id);
+  const publisherName = discordPublisherName(interaction);
   let current = await updateUniformDelivery(submissionId, (item) => {
     if (item.publishing?.state !== "awaiting-result") {
       throw new Error("This publishing handoff is no longer awaiting a result.");
@@ -2513,7 +2499,7 @@ export async function handleUniformPublishingModal(
     throw new Error(`The published Classic Shirt must be named exactly "${record.customerName}".`);
   }
   await interaction.deferReply({ ephemeral: true });
-  const publisherName = await linkedPublisherName(record.guildId, interaction.user.id);
+  const publisherName = discordPublisherName(interaction);
   record = await updateUniformDelivery(submissionId, (item) => {
     if (item.publishing?.state !== "awaiting-result") {
       throw new Error("This publishing handoff is no longer awaiting a result.");

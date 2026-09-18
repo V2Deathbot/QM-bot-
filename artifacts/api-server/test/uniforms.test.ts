@@ -11,7 +11,6 @@ const directory = await mkdtemp(path.join(os.tmpdir(), "uniform-command-tests-")
 process.env.BOT_SETUP_FILE = path.join(directory, "setup.json");
 process.env.UNIFORM_SUBMISSION_LEDGER_FILE = path.join(directory, "ledger.json");
 process.env.UNIFORM_DELIVERY_FILE = path.join(directory, "deliveries.json");
-process.env.BOT_SECURITY_FILE = path.join(directory, "security.json");
 
 const {
   canSubmitUniforms, handleUniformAssistanceModal, handleUniformCommand, handleUniformCustomerButton,
@@ -31,7 +30,6 @@ const {
 } = await import("../src/bot/uniform-delivery-store.ts");
 const { getGuildSetup, saveGuildSetup, defaultUniformSettings } =
   await import("../src/bot/setup-store.ts");
-const { mutateSecurityState } = await import("../src/bot/security-store.ts");
 
 const originalFetch = globalThis.fetch;
 const users = new Map([
@@ -92,11 +90,6 @@ globalThis.fetch = async (input, init) => {
   if (published) {
     const id = Number(published[1]);
     return response({ AssetId: id, AssetTypeId: 11, Name: "Customer", IsForSale: true });
-  }
-  const userById = /users\.roblox\.com\/v1\/users\/(\d+)$/.exec(url);
-  if (userById) {
-    const user = [...users.values()].find((candidate) => candidate.id === Number(userById[1]));
-    return user ? response(user) : new Response("", { status: 404 });
   }
   const ownership = /inventory\.roblox\.com\/v1\/users\/(\d+)\/items\/Asset\/(\d+)\/is-owned/.exec(url);
   if (ownership) {
@@ -279,17 +272,11 @@ async function prepareAndSubmit(command: "log" | "moderated", values: Record<str
   } as never, async () => false);
   return commandInteraction;
 }
-beforeEach(async () => {
+beforeEach(() => {
   rows.clear(); sends = []; auditMessageEdits = []; sentMessages.clear(); auditEditFailure = undefined; sendFailure = undefined; sheetFailure = undefined;
   rejectLongDiscordNonces = false; sheetValidationGate = undefined;
   unownedAssetIds = new Set(); inventoryResponseStatus = 200; inventoryRequestCount = 0;
   resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
-  await mutateSecurityState("guild", (state) => {
-    state.identityLedger = [
-      { discordUserId: "submitter", robloxUserId: 3, observedAt: new Date().toISOString(), source: "verified" },
-      { discordUserId: "seqm-discord", robloxUserId: 3, observedAt: new Date().toISOString(), source: "verified" },
-    ];
-  });
 });
 after(() => { globalThis.fetch = originalFetch; resetGoogleSheetsProxyForTests(); });
 
@@ -396,7 +383,7 @@ test("holds an attachment submission until a verified Classic Shirt link complet
     editReply: async (payload: unknown) => { completionEdits.push(payload); },
   } as never);
   assert.deepEqual(rows.get("Uniform Logs"), [[
-    "QM", "SEQM", "Publisher", "Customer", "https://www.roblox.com/catalog/9001",
+    "QM", "SEQM", "submitter", "Customer", "https://www.roblox.com/catalog/9001",
   ]]);
   assert.equal(sends.length, 2);
   assert.equal((sends[1] as { id: string }).id, "customer-channel");
@@ -436,7 +423,7 @@ test("routes a rejected attachment only to the moderated sheet and Senior Quarte
     editReply: async (payload: unknown) => { edits.push(payload); },
   } as never);
   assert.equal(rows.get("Uniform Logs"), undefined);
-  assert.deepEqual(rows.get("Moderated Logs"), [["QM", "Publisher", "Customer", ""]]);
+  assert.deepEqual(rows.get("Moderated Logs"), [["QM", "submitter", "Customer", ""]]);
   assert.equal(sends.length, 2);
   assert.equal((sends[1] as { id: string }).id, "moderated");
   assert.equal((sends[1] as { payload: { content: string } }).payload.content, "<@seqm-discord>");
@@ -825,7 +812,7 @@ test("logs a rejected replacement without changing its successful row or custome
   assert.equal(rejected?.rows[0]?.at(-1), "https://www.roblox.com/catalog/42");
   assert.equal(rejected?.customerMessageId, original?.customerMessageId);
   assert.equal(rows.get("Uniform Logs")?.[0]?.at(-1), "https://www.roblox.com/catalog/42");
-  assert.deepEqual(rows.get("Moderated Logs"), [["QM", "Publisher", "Customer", ""]]);
+  assert.deepEqual(rows.get("Moderated Logs"), [["QM", "seqm-discord", "Customer", ""]]);
   assert.ok(sends.every((message, index) =>
     index < 2 || (message as { id: string }).id !== "relog-rejected-ticket"));
 });
