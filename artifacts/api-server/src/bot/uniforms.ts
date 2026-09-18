@@ -2841,11 +2841,26 @@ async function sendPendingDelivery(
     current = await claimUniformDeliveryStage(record.submissionId, "logNotice");
     let notice: unknown;
     try {
-      notice = await logChannel.send({
+      const noticePayload = {
         content: "",
         embeds: [uploadAuditEmbed(current)],
         allowedMentions: noMentions, nonce: uniformDiscordNonce("notice", record.submissionId), enforceNonce: true,
-      });
+      };
+      try {
+        notice = await logChannel.send(noticePayload);
+      } catch (error) {
+        const { code } = discordFailureDetails(error);
+        if (code !== 10008) throw error;
+        // Discord can retain an enforced nonce after its message is deleted.
+        // A retry with that nonce then fails definitively with Unknown Message,
+        // so omit only the stale nonce and recreate the missing notice once.
+        const { nonce: _nonce, enforceNonce: _enforceNonce, ...freshNoticePayload } = noticePayload;
+        logger.warn(
+          { stage: "upload-log notice", discordCode: code },
+          "Recreating a deleted Discord upload-log notice without its stale nonce",
+        );
+        notice = await logChannel.send(freshNoticePayload);
+      }
     } catch (error) {
       const failure = discordDeliveryFailure("upload-log notice", error);
       await updateUniformDelivery(record.submissionId, (item) => {

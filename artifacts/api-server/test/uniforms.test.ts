@@ -126,6 +126,7 @@ const sentMessages = new Set<string>();
 let auditEditFailure: Error | undefined;
 let sendFailure: Error | undefined;
 let rejectLongDiscordNonces = false;
+let unknownMessageNonceFailures = 0;
 let sheetFailure: Error | undefined;
 let sheetValidationGate: Promise<void> | undefined;
 let interactionCount = 0;
@@ -198,6 +199,10 @@ const guild = {
       send: async (payload: unknown) => {
         if (sendFailure) throw sendFailure;
         const nonce = (payload as { nonce?: unknown }).nonce;
+        if (unknownMessageNonceFailures > 0 && typeof nonce === "string") {
+          unknownMessageNonceFailures -= 1;
+          throw Object.assign(new Error("Unknown Message"), { status: 404, code: 10008 });
+        }
         if (rejectLongDiscordNonces && typeof nonce === "string" && nonce.length > 25) {
           throw Object.assign(new Error("Invalid Form Body"), { status: 400, code: 50035 });
         }
@@ -289,7 +294,7 @@ async function prepareAndSubmit(command: "log" | "moderated", values: Record<str
 }
 beforeEach(() => {
   rows.clear(); sends = []; auditMessageEdits = []; sentMessages.clear(); auditEditFailure = undefined; sendFailure = undefined; sheetFailure = undefined;
-  rejectLongDiscordNonces = false; sheetValidationGate = undefined;
+  rejectLongDiscordNonces = false; unknownMessageNonceFailures = 0; sheetValidationGate = undefined;
   unownedAssetIds = new Set(); inventoryResponseStatus = 200; inventoryRequestCount = 0;
   economyResponseStatus = 200; economyRequestCount = 0; thumbnailState = "Pending";
   resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
@@ -992,6 +997,21 @@ test("keeps definitive Discord 400 and 403 delivery failures pending with Retry 
     assert.equal(reply.components.length, 1);
     sendFailure = undefined;
   }
+});
+
+test("recreates an upload-log notice when Discord retains a nonce for a deleted message", async () => {
+  const id = "deleted-upload-log-notice";
+  unknownMessageNonceFailures = 1;
+  await prepareAndSubmit("log", {
+    qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer", shirtid1: "13",
+  }, id);
+  const saved = await getUniformDelivery(id);
+  assert.equal(saved?.logNoticeState, "sent");
+  assert.equal(saved?.customerDeliveryState, "sent");
+  assert.equal(sends.length, 2);
+  assert.equal((sends[0] as { id: string }).id, "log");
+  assert.equal((sends[0] as { payload: { nonce?: string } }).payload.nonce, undefined);
+  assert.equal((sends[1] as { id: string }).id, "customer-channel");
 });
 
 test("retries a saved definitive Discord failure by submission ID without rewriting Sheets rows", async () => {

@@ -10,3 +10,4 @@
 - [Configured payout authority](owner-only-security-authority.md) — The actual server owner selects the member who may run payouts and change security limits.
 - [Application-owner permission grants](application-owner-permission-grants.md) — Commands default to Administrator-only; only the application owner delegates per-command access.
 - [Manual Roblox shirt review](manual-roblox-shirt-review.md) — SEQMs manually verify uploaded shirts; the bot must not wait for or enforce Roblox moderation metadata.
+- [Discord deleted-message nonces](discord-deleted-message-nonces.md) — code 10008 on an enforced nonce can mean Discord retained the nonce after its message was deleted.
