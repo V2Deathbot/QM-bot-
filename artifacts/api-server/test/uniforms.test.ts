@@ -308,7 +308,7 @@ after(() => { globalThis.fetch = originalFetch; resetGoogleSheetsProxyForTests()
 test("registers /created with only its required customer and upload inputs", () => {
   assert.equal(uniformCommands[0]!.toJSON().name, "created");
   assert.deepEqual(uniformCommands[0]!.toJSON().options?.map((option) => option.name),
-    ["customer", "uniform_type", "channel", "uniform", "uniform2", "uniform_type2", "uniform3", "uniform_type3", "uniform4", "uniform_type4", "uniform5", "uniform_type5"]);
+    ["customer", "uniform_type", "channel", "uniform", "uniform2", "uniform_type2", "uniform3", "uniform_type3", "uniform4", "uniform_type4", "uniform5", "uniform_type5", "proof1", "proof2", "proof3", "proof4", "proof5"]);
   assert.deepEqual(uniformCommands[1]!.toJSON().options?.slice(0, 3).map((option) => option.name),
     ["uploader", "publisher", "customer"]);
   assert.equal(parseUniformAssetInput("123").url, "https://www.roblox.com/catalog/123");
@@ -570,6 +570,7 @@ test("splits SEQM links so published shirts reach the customer and only pending 
   const commandInteraction = interaction("created" as never, {
       customer: "Customer", uniform_type: "ClassA", uniform: "one",
      uniform2: "two", uniform_type2: "ClassB",
+     proof1: "https://example.com/proof/one", proof2: "https://example.com/proof/two",
   }, "seqm-split");
   await handleUniformCommand(commandInteraction as never, seqmSetup as never);
   const nonce = componentId(commandInteraction.edits[0], 0).split(":")[2]!;
@@ -585,6 +586,9 @@ test("splits SEQM links so published shirts reach the customer and only pending 
     customId: `uniform:submit:${nonce}`, guild, guildId: guild.id,
     user: { id: "submitter" }, deferUpdate: async () => undefined, editReply: async () => undefined,
   } as never, async () => false);
+  const seqmReview = sends[0] as { payload: { embeds: unknown[] } };
+  assert.match(JSON.stringify(seqmReview.payload.embeds), /example\.com\/proof\/one/);
+  assert.match(JSON.stringify(seqmReview.payload.embeds), /example\.com\/proof\/two/);
 
   unpublishedAssetIds.add(124);
   await handleUniformPublishingModal({
@@ -607,6 +611,9 @@ test("splits SEQM links so published shirts reach the customer and only pending 
   assert.equal(publisher.payload.files, undefined);
   assert.match(JSON.stringify(publisher.payload.embeds), /catalog\/124/);
   assert.doesNotMatch(JSON.stringify(publisher.payload.embeds), /catalog\/123/);
+  assert.doesNotMatch(JSON.stringify(publisher.payload.embeds), /example\.com\/proof/);
+  assert.doesNotMatch(JSON.stringify(earlyCustomer.payload), /example\.com\/proof/);
+  assert.equal((await getUniformDelivery("seqm-split"))?.publishing?.proofLinks, undefined);
   assert.deepEqual((await getUniformDelivery("seqm-split"))?.publishing?.publisherAssetIndices, [1]);
 
   await handleUniformPublishingButton({

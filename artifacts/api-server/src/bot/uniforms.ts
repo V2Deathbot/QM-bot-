@@ -165,7 +165,12 @@ export const uniformCommands = [
     .addAttachmentOption((option) => option.setName("uniform4").setDescription("Optional Classic Shirt PNG #4.").setRequired(false))
     .addStringOption((option) => option.setName("uniform_type4").setDescription("Uniform type for Shirt 4.").setRequired(false).addChoices(...uniformTypeChoices))
     .addAttachmentOption((option) => option.setName("uniform5").setDescription("Optional Classic Shirt PNG #5.").setRequired(false))
-    .addStringOption((option) => option.setName("uniform_type5").setDescription("Uniform type for Shirt 5.").setRequired(false).addChoices(...uniformTypeChoices)),
+    .addStringOption((option) => option.setName("uniform_type5").setDescription("Uniform type for Shirt 5.").setRequired(false).addChoices(...uniformTypeChoices))
+    .addStringOption((option) => option.setName("proof1").setDescription("Optional proof link #1 for SEQM review only.").setRequired(false).setMaxLength(500))
+    .addStringOption((option) => option.setName("proof2").setDescription("Optional proof link #2 for SEQM review only.").setRequired(false).setMaxLength(500))
+    .addStringOption((option) => option.setName("proof3").setDescription("Optional proof link #3 for SEQM review only.").setRequired(false).setMaxLength(500))
+    .addStringOption((option) => option.setName("proof4").setDescription("Optional proof link #4 for SEQM review only.").setRequired(false).setMaxLength(500))
+    .addStringOption((option) => option.setName("proof5").setDescription("Optional proof link #5 for SEQM review only.").setRequired(false).setMaxLength(500)),
   new SlashCommandBuilder()
     .setName("moderated")
     .setDescription("Log a moderated uniform upload.")
@@ -397,6 +402,7 @@ export interface UniformSubmission {
   uniformType?: string;
   uniformTypes?: string[];
   uniformBranch?: UniformBranch;
+  proofLinks?: string[];
   publisherName?: string;
   sourceAttachment?: {
     name: string;
@@ -476,6 +482,28 @@ function cleanUsername(value: string, label: string): string {
     throw new Error(`${label} must be a valid Roblox username.`);
   }
   return username;
+}
+
+function proofLinksFor(interaction: ChatInputCommandInteraction): string[] {
+  const links: string[] = [];
+  for (let index = 1; index <= 5; index += 1) {
+    const value = optionString(interaction, `proof${index}`)?.trim();
+    if (!value) continue;
+    if (value.length > 500 || /[\u0000-\u001f\u007f<>]/.test(value)) {
+      throw new Error(`Proof ${index} must be a valid HTTPS link.`);
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      throw new Error(`Proof ${index} must be a valid HTTPS link.`);
+    }
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || !parsed.hostname) {
+      throw new Error(`Proof ${index} must be a valid HTTPS link.`);
+    }
+    links.push(parsed.toString());
+  }
+  return links;
 }
 
 function optionString(
@@ -806,6 +834,7 @@ async function resolveSubmission(
       uniformTypes.push(shirtType);
     }
     const publisherName = interaction.client.user?.username?.trim() || "Quartermaster Bot";
+    const proofLinks = twoStage ? proofLinksFor(interaction) : [];
     const branches = new Set(uniformTypes.map(uniformBranchForType));
     if (branches.size !== 1) {
       throw new Error("All shirts in one /created submission must use the same branch (Army, Marines, or Navy).");
@@ -819,6 +848,7 @@ async function resolveSubmission(
         uniformType,
         uniformTypes,
         uniformBranch,
+        ...(proofLinks.length ? { proofLinks } : {}),
         publisherName,
         sourceAttachment: attachments[0],
         sourceAttachments: attachments,
@@ -2479,6 +2509,11 @@ function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
           .join("\n"), inline: false }]
         : []),
       { name: "Customer ticket", value: `<#${record.destinationChannelId}>`, inline: true },
+      ...(reviewing ? (publishing.proofLinks ?? []).map((link, index) => ({
+        name: `Proof ${index + 1}`,
+        value: `[Open proof](${link})`,
+        inline: true,
+      })) : []),
       ...(reviewing ? [{ name: "PNGs", value: (publishing.attachments ?? [publishing.attachment])
         .map((attachment, index) => `Shirt ${index + 1}: ${safePresentationText(attachment.name)}`).join("\n"), inline: false }] : []),
       ...((publishing.moderatedIndices?.length ?? 0) > 0
@@ -2949,6 +2984,7 @@ async function forwardApprovedUniform(
     item.publishing.stage = "publisher";
     item.publishing.state = "handoff-pending";
     item.publishing.publisherName = "Pending";
+    delete item.publishing.proofLinks;
     delete item.publishing.handoffMessageId;
   });
   return sendPublishingHandoff(transitioned, guild);
@@ -3554,6 +3590,7 @@ export async function handleUniformSubmitButton(
               uniformType: pending.submission.uniformType,
               ...(pending.submission.uniformTypes ? { uniformTypes: pending.submission.uniformTypes } : {}),
               ...(pending.submission.uniformBranch ? { uniformBranch: pending.submission.uniformBranch } : {}),
+              ...(pending.submission.proofLinks ? { proofLinks: pending.submission.proofLinks } : {}),
               publisherName: "Pending",
               stage: pending.twoStage ? "seqm-review" as const : "publisher" as const,
               publisherChannelId: pending.twoStage

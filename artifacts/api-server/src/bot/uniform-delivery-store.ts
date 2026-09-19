@@ -71,6 +71,8 @@ export interface UniformDeliveryRecord {
     uniformBranch?: "Army" | "Marines" | "Navy";
     /** Per-shirt Roblox descriptions, ordered with attachments. */
     uniformTypes?: string[];
+    /** Optional QM evidence links shown only during the SEQM review stage. */
+    proofLinks?: string[];
     publisherName: string;
     /** Current stage of the two-step creation workflow. */
     stage?: "seqm-review" | "publisher";

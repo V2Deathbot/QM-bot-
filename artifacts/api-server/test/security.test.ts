@@ -855,7 +855,7 @@ test("registers setup plus requested moderation and uniform commands", () => {
   assert.deepEqual(revoke?.options?.map((option) => option.name), ["username"]);
   assert.deepEqual(payout?.options, []);
   assert.deepEqual(log?.options?.map((option) => option.name), [
-    "customer", "uniform_type", "channel", "uniform", "uniform2", "uniform_type2", "uniform3", "uniform_type3", "uniform4", "uniform_type4", "uniform5", "uniform_type5",
+    "customer", "uniform_type", "channel", "uniform", "uniform2", "uniform_type2", "uniform3", "uniform_type3", "uniform4", "uniform_type4", "uniform5", "uniform_type5", "proof1", "proof2", "proof3", "proof4", "proof5",
   ]);
   assert.equal(log?.options?.filter((option) => option.required).map((option) => option.name).at(-1), "uniform");
   assert.deepEqual(moderated?.options?.map((option) => option.name), [
