@@ -1,7 +1,14 @@
 import { type ReactNode, useEffect } from 'react';
 import { Link, useLocation } from 'wouter';
 import { TerminalSquare, Shield, FileText, Activity, type LucideIcon } from 'lucide-react';
-import { CONTACT_EMAIL, OPERATOR_NAME, EFFECTIVE_DATE } from '@/lib/constants';
+import {
+  CONTACT_EMAIL,
+  CREATOR_DISCORD,
+  CREATOR_NAME,
+  EFFECTIVE_DATE,
+  OPERATOR_NAME,
+  OWNER_NAME,
+} from '@/lib/constants';
 
 function NavLink({ href, children, icon: Icon }: { href: string, children: ReactNode, icon: LucideIcon }) {
   const [location] = useLocation();
@@ -111,7 +118,14 @@ export function Layout({ children }: { children: ReactNode }) {
               <h3 className="font-semibold text-sm tracking-wider uppercase text-foreground mb-4 font-mono">Information</h3>
               <ul className="space-y-3">
                 <li className="text-sm text-muted-foreground">
+                  Owned by {OWNER_NAME}
+                </li>
+                <li className="text-sm text-muted-foreground">
                   Operated by {OPERATOR_NAME}
+                </li>
+                <li className="text-sm text-muted-foreground">
+                  Created and managed by {CREATOR_NAME}
+                  <span className="block font-mono text-xs mt-1">Discord: {CREATOR_DISCORD}</span>
                 </li>
                 <li className="text-sm text-muted-foreground">
                   Effective: {EFFECTIVE_DATE}
@@ -130,7 +144,7 @@ export function Layout({ children }: { children: ReactNode }) {
           </div>
           
           <div className="mt-12 pt-8 border-t border-border flex flex-col sm:flex-row justify-between items-center gap-4 text-xs text-muted-foreground">
-            <p>© {new Date().getFullYear()} {OPERATOR_NAME}. All rights reserved.</p>
+            <p>© {new Date().getFullYear()} {OWNER_NAME}. All rights reserved.</p>
             <p>Systems operational.</p>
           </div>
         </div>

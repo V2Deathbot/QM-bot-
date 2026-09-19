@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { OPERATOR_NAME, EFFECTIVE_DATE, CONTACT_EMAIL } from "@/lib/constants";
+import { OPERATOR_NAME, EFFECTIVE_DATE, CONTACT_EMAIL, CREATOR_NAME, OWNER_NAME } from "@/lib/constants";
 
 export default function Terms() {
   return (
@@ -28,7 +28,7 @@ export default function Terms() {
         className="prose prose-slate dark:prose-invert max-w-none prose-headings:font-semibold prose-h2:text-2xl prose-h2:mt-12 prose-h2:mb-4 prose-p:text-muted-foreground prose-li:text-muted-foreground"
       >
         <p>
-          These Terms of Service ("Terms") govern your access to and use of the Quartermaster Discord Bot and its associated services, interfaces, and APIs (collectively, the "Service"). The Service is operated by {OPERATOR_NAME} ("we," "us," or "our").
+          These Terms of Service ("Terms") govern your access to and use of the Quartermaster Discord Bot and its associated services, interfaces, and APIs (collectively, the "Service"). The Service is owned by {OWNER_NAME}, created and managed by {CREATOR_NAME}, and operated by {OPERATOR_NAME} (collectively, "we," "us," or "our").
         </p>
         <p>
           By inviting the Service to a Discord server, interacting with it, or authorizing it to perform actions on your behalf, you agree to be bound by these Terms. If you do not agree to these Terms, you may not use the Service.

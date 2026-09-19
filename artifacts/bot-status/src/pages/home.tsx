@@ -1,8 +1,9 @@
 import { getHealthCheckQueryKey, useHealthCheck, getGetPublicBotStatusQueryKey, useGetPublicBotStatus } from "@workspace/api-client-react";
-import { Server, Activity, ShieldAlert, TerminalSquare, RefreshCw, Clock, CheckCircle2, AlertTriangle, XCircle, ChevronRight, BarChart } from "lucide-react";
+import { Server, Activity, ShieldAlert, RefreshCw, Clock, CheckCircle2, AlertTriangle, XCircle, BarChart, Building2, Wrench, UserRoundCog } from "lucide-react";
 import { SiDiscord } from "react-icons/si";
 import { useEffect, useState, useRef } from "react";
 import { motion } from "framer-motion";
+import { CREATOR_DISCORD, CREATOR_NAME, OPERATOR_NAME, OWNER_NAME } from "@/lib/constants";
 
 export default function Home() {
   const [currentTime, setCurrentTime] = useState(new Date());
@@ -230,10 +231,47 @@ export default function Home() {
         </motion.div>
       </div>
 
-      <motion.div
+      <motion.section
         initial={{ opacity: 0, y: 10 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.4, delay: 0.3 }}
+        className="border border-border bg-card"
+        aria-labelledby="service-stewardship"
+      >
+        <div className="px-6 py-5 border-b border-border">
+          <p className="font-mono text-xs uppercase tracking-widest text-muted-foreground">Service Stewardship</p>
+          <h2 id="service-stewardship" className="text-xl font-semibold tracking-tight mt-1">Quartermaster leadership</h2>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-3">
+          <div className="p-6 flex gap-4 border-b md:border-b-0 md:border-r border-border">
+            <Building2 className="w-5 h-5 text-primary shrink-0 mt-0.5" />
+            <div>
+              <p className="font-mono text-xs uppercase tracking-widest text-muted-foreground mb-2">Owned by</p>
+              <p className="font-medium">{OWNER_NAME}</p>
+            </div>
+          </div>
+          <div className="p-6 flex gap-4 border-b md:border-b-0 md:border-r border-border">
+            <Wrench className="w-5 h-5 text-primary shrink-0 mt-0.5" />
+            <div>
+              <p className="font-mono text-xs uppercase tracking-widest text-muted-foreground mb-2">Operated by</p>
+              <p className="font-medium">{OPERATOR_NAME}</p>
+            </div>
+          </div>
+          <div className="p-6 flex gap-4">
+            <UserRoundCog className="w-5 h-5 text-primary shrink-0 mt-0.5" />
+            <div>
+              <p className="font-mono text-xs uppercase tracking-widest text-muted-foreground mb-2">Created &amp; managed by</p>
+              <p className="font-medium">{CREATOR_NAME}</p>
+              <p className="font-mono text-xs text-muted-foreground mt-1">Discord: {CREATOR_DISCORD}</p>
+            </div>
+          </div>
+        </div>
+      </motion.section>
+
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.4, delay: 0.4 }}
         className="mt-4 p-4 border border-border bg-secondary/20 text-sm text-muted-foreground flex items-start gap-3 rounded-sm"
       >
         <BarChart className="w-5 h-5 text-muted-foreground shrink-0 mt-0.5" />

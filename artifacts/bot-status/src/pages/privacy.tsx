@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { OPERATOR_NAME, EFFECTIVE_DATE, CONTACT_EMAIL } from "@/lib/constants";
+import { OPERATOR_NAME, EFFECTIVE_DATE, CONTACT_EMAIL, OWNER_NAME } from "@/lib/constants";
 
 export default function Privacy() {
   return (
@@ -28,7 +28,7 @@ export default function Privacy() {
         className="prose prose-slate dark:prose-invert max-w-none prose-headings:font-semibold prose-h2:text-2xl prose-h2:mt-12 prose-h2:mb-4 prose-p:text-muted-foreground prose-li:text-muted-foreground"
       >
         <p>
-          This Privacy Policy explains how {OPERATOR_NAME} ("we," "us," or "our") collects, uses, and discloses information when you interact with the Quartermaster Discord Bot and its associated infrastructure (the "Service").
+          This Privacy Policy explains how {OWNER_NAME}, through {OPERATOR_NAME} ("we," "us," or "our"), collects, uses, and discloses information when you interact with the Quartermaster Discord Bot and its associated infrastructure (the "Service").
         </p>
 
         <h2>1. Information We Collect</h2>
