@@ -590,6 +590,8 @@ test("splits SEQM links so published shirts reach the customer and only pending 
     user: { id: "submitter" }, deferUpdate: async () => undefined, editReply: async () => undefined,
   } as never, async () => false);
   const seqmReview = sends[0] as { payload: { embeds: unknown[] } };
+  assert.match(JSON.stringify(seqmReview.payload.embeds), /Quartermaster/);
+  assert.match(JSON.stringify(seqmReview.payload.embeds), /Publishing Quartermaster/);
   assert.match(JSON.stringify(seqmReview.payload.embeds), /example\.com\/proof\/one/);
   assert.match(JSON.stringify(seqmReview.payload.embeds), /example\.com\/proof\/two/);
 

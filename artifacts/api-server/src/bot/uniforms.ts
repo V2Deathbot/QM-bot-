@@ -2515,6 +2515,13 @@ function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
     undefined,
     [
       { name: "Customer", value: safePresentationText(record.customerName), inline: true },
+      ...(reviewing && publishing.quartermasterName
+        ? [{
+            name: "Quartermaster",
+            value: safePresentationText(publishing.quartermasterName),
+            inline: true,
+          }]
+        : []),
       { name: "Roblox descriptions", value: (publishing.uniformTypes ?? [publishing.uniformType])
         .map((type, index) => `Shirt ${index + 1}: ${safePresentationText(uniformTypeDisplay(type))}`).join("\n"), inline: false },
       { name: reviewing ? "Senior Quartermaster" : "Publisher", value: "*Pending*", inline: true },
@@ -3570,6 +3577,7 @@ export async function handleUniformSubmitButton(
     throw new Error("The durable uniform submission record does not match this confirmation.");
   }
   if (!record) {
+    const quartermasterName = await discordPublisherName(interaction);
     await fetchedMember(interaction.guild!, pending.customerId);
     const uploadLogChannelId = pending.command === "log"
       ? seqmChannelForBranch(settings, pending.submission.uniformBranch ?? uniformBranchForType(pending.submission.uniformType ?? "ClassA"))
@@ -3606,6 +3614,7 @@ export async function handleUniformSubmitButton(
               ...(pending.submission.uniformTypes ? { uniformTypes: pending.submission.uniformTypes } : {}),
               ...(pending.submission.uniformBranch ? { uniformBranch: pending.submission.uniformBranch } : {}),
               ...(pending.submission.proofLinks ? { proofLinks: pending.submission.proofLinks } : {}),
+              quartermasterName,
               publisherName: "Pending",
               stage: pending.twoStage ? "seqm-review" as const : "publisher" as const,
               publisherChannelId: pending.twoStage

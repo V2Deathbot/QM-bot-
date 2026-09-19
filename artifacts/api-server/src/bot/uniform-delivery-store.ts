@@ -73,6 +73,8 @@ export interface UniformDeliveryRecord {
     uniformTypes?: string[];
     /** Optional QM evidence links shown only during the SEQM review stage. */
     proofLinks?: string[];
+    /** Discord display name of the Quartermaster who submitted the command. */
+    quartermasterName?: string;
     publisherName: string;
     /** Current stage of the two-step creation workflow. */
     stage?: "seqm-review" | "publisher";
