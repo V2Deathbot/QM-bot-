@@ -34,9 +34,9 @@ export interface GuildSetup {
 }
 
 export const commandPermissionNames = [
-  "settings", "payout", "blacklist", "revoke_blacklist", "created", "moderated", "relog",
+  "settings", "payout", "blacklist", "revoke_blacklist", "create", "moderated", "relog",
 ] as const;
-export type CommandPermissionName = typeof commandPermissionNames[number] | "log";
+export type CommandPermissionName = typeof commandPermissionNames[number] | "created" | "log";
 export interface CommandPermissionGrant {
   roleIds: string[];
   memberIds: string[];
@@ -45,6 +45,7 @@ export interface CommandPermissionGrant {
 export function commandPermissionName(command: string): CommandPermissionName | undefined {
   if (command === "setup" || command === "settings") return "settings";
   if (command === "log") return "log";
+  if (command === "created") return "created";
   if ((commandPermissionNames as readonly string[]).includes(command)) {
     return command as CommandPermissionName;
   }
@@ -127,7 +128,7 @@ export interface IdentitySettings {
 }
 
 export interface UniformSettings {
-  /** Legacy channel used by /log before the two-stage /created workflow. */
+  /** Legacy channel used by /log before the two-stage /create workflow. */
   logChannelId?: string;
   /** Channel where Senior Quartermasters review and upload created PNGs. */
   seqmReviewChannelId?: string;
@@ -135,6 +136,7 @@ export interface UniformSettings {
   armySeqmChannelId?: string;
   marinesSeqmChannelId?: string;
   navySeqmChannelId?: string;
+  veteranSeqmChannelId?: string;
   /** Channel where publishers receive approved Classic Shirts. */
   publisherChannelId?: string;
   /** Channel used by /moderated. Undefined means that command is not configured. */

@@ -93,6 +93,8 @@ const allowedUniformTypes = new Set([
   "ClassA", "ClassA_MP", "ClassA_HG", "ClassB", "Ike", "Bomber", "Flight",
   "Alpha", "Bravo", "DressBlue", "DressWhite",
   "White", "Khaki", "Blue", "Gray", "Overcoat",
+  "Veteran_Blues", "Veteran_Whites", "Veteran_Bravos",
+  "Veteran_Alphas", "Veteran_ClassA", "Veteran_ClassB",
 ]);
 const uniformTypeChoices = [
   { name: "Army · ClassA", value: "ClassA" },
@@ -111,22 +113,33 @@ const uniformTypeChoices = [
   { name: "Navy · Blue", value: "Blue" },
   { name: "Navy · Gray", value: "Gray" },
   { name: "Navy · Overcoat", value: "Overcoat" },
+  { name: "Veteran · Blues", value: "Veteran_Blues" },
+  { name: "Veteran · Whites", value: "Veteran_Whites" },
+  { name: "Veteran · Bravos", value: "Veteran_Bravos" },
+  { name: "Veteran · Alphas", value: "Veteran_Alphas" },
+  { name: "Veteran · ClassA", value: "Veteran_ClassA" },
+  { name: "Veteran · ClassB", value: "Veteran_ClassB" },
 ] as const;
-export type UniformBranch = "Army" | "Marines" | "Navy";
+export type UniformBranch = "Army" | "Marines" | "Navy" | "Veteran";
 const uniformBranchByType: Record<string, UniformBranch> = Object.fromEntries(
   uniformTypeChoices.map((choice) => [choice.value, choice.name.split(" · ")[0] as UniformBranch]),
 );
 export function uniformBranchForType(type: string): UniformBranch {
   const branch = uniformBranchByType[type];
-  if (!branch) throw new Error(`Select an approved Army, Marines, or Navy uniform type.`);
+  if (!branch) throw new Error(`Select an approved Army, Marines, Navy, or Veteran uniform type.`);
   return branch;
+}
+function uniformTypeDisplay(type: string): string {
+  return uniformTypeChoices.find((choice) => choice.value === type)?.name.split(" · ")[1] ?? type;
 }
 function seqmChannelForBranch(settings: UniformSettings, branch: UniformBranch): string | undefined {
   return branch === "Army"
     ? settings.armySeqmChannelId ?? settings.seqmReviewChannelId ?? settings.logChannelId
     : branch === "Marines"
       ? settings.marinesSeqmChannelId ?? settings.seqmReviewChannelId ?? settings.logChannelId
-      : settings.navySeqmChannelId ?? settings.seqmReviewChannelId ?? settings.logChannelId;
+      : branch === "Navy"
+        ? settings.navySeqmChannelId ?? settings.seqmReviewChannelId ?? settings.logChannelId
+        : settings.veteranSeqmChannelId ?? settings.seqmReviewChannelId ?? settings.logChannelId;
 }
 const classicShirtWidth = 585;
 const classicShirtHeight = 559;
@@ -136,8 +149,8 @@ const uniformPublisherRoleId = "1548958021160411216";
 
 export const uniformCommands = [
   new SlashCommandBuilder()
-    .setName("created")
-    .setDescription("Submit a created Classic Shirt PNG for review and publishing.")
+    .setName("create")
+    .setDescription("Submit a Classic Shirt PNG for review and publishing.")
     .addStringOption((option) =>
       option
         .setName("customer")
@@ -217,7 +230,7 @@ export const uniformCommands = [
     ),
 ] as const;
 
-export const uniformCommandNames = new Set(["created", "log", "moderated"]);
+export const uniformCommandNames = new Set(["create", "log", "moderated"]);
 export const uniformRelogCommandName = "relog";
 
 export type UniformCommandName = "log" | "moderated";
@@ -781,7 +794,7 @@ async function resolveSubmission(
       (legacyAssetInput ? "ClassA" : "")
     ).trim();
     if (!allowedUniformTypes.has(uniformType)) {
-      throw new Error("Select one of the approved Army, Marines, or Navy uniform types.");
+      throw new Error("Select one of the approved Army, Marines, Navy, or Veteran uniform types.");
     }
     // Preserve handler compatibility with confirmations created before the
     // attachment-first command contract was registered. New Discord commands
@@ -837,7 +850,7 @@ async function resolveSubmission(
     const proofLinks = twoStage ? proofLinksFor(interaction) : [];
     const branches = new Set(uniformTypes.map(uniformBranchForType));
     if (branches.size !== 1) {
-      throw new Error("All shirts in one /created submission must use the same branch (Army, Marines, or Navy).");
+      throw new Error("All shirts in one /create submission must use the same branch (Army, Marines, Navy, or Veteran).");
     }
     const uniformBranch = [...branches][0]!;
     return {
@@ -894,9 +907,11 @@ async function discordPublisherName(interaction: ButtonInteraction | ModalSubmit
  */
 function uniformAccessSettings(setup: GuildSetup, command?: UniformCommandName): UniformSettings {
   const settings = uniformSettingsFor(setup);
-  const permissionCommand = command === "log" ? "created" : command;
+  const permissionCommand = command === "log" ? "create" : command;
   const grant = permissionCommand && hasCommandPermissionEntry(setup, permissionCommand)
     ? commandPermissionFor(setup, permissionCommand)
+    : command === "log" && hasCommandPermissionEntry(setup, "created")
+      ? commandPermissionFor(setup, "created")
     : command === "log" && hasCommandPermissionEntry(setup, "log")
       ? commandPermissionFor(setup, "log")
       : undefined;
@@ -1180,7 +1195,7 @@ export async function handleUniformCommand(
   if (!uniformCommandNames.has(interaction.commandName)) {
     throw new Error("That is not a uniform logging command.");
   }
-  const twoStage = interaction.commandName === "created";
+  const twoStage = interaction.commandName === "create";
   const command: UniformCommandName = twoStage || interaction.commandName === "log" ? "log" : "moderated";
   const settings = uniformAccessSettings(setup, command);
   await requireUniformSubmitter(interaction.guild!, interaction.user.id, settings);
@@ -1219,7 +1234,7 @@ export async function handleUniformCommand(
     embeds: [presentationEmbed(
       "Confirm Uniform Delivery",
       command === "log"
-        ? "Review the /created submission. Select the customer Discord account, then submit. No Google Sheets rows or Discord messages have been sent yet."
+        ? "Review the /create submission. Select the customer Discord account, then submit. No Google Sheets rows or Discord messages have been sent yet."
         : "Review the /moderated submission. Select the customer Discord account, then submit. No Google Sheets rows or Discord messages have been sent yet.",
       "info",
       avatarUrl,
@@ -1561,7 +1576,7 @@ function relogPublishingEmbed(record: UniformDeliveryRecord): EmbedBuilder {
     undefined,
     [
       { name: "Customer", value: safePresentationText(record.customerName), inline: true },
-      { name: "Roblox description", value: safePresentationText(handoff.uniformType), inline: true },
+      { name: "Roblox description", value: safePresentationText(uniformTypeDisplay(handoff.uniformType)), inline: true },
       { name: "Customer ticket", value: `<#${record.destinationChannelId}>`, inline: true },
       { name: "Original asset", value: record.assets[handoff.rowIndex]?.url ?? "Unavailable" },
       ...(handoff.stage === "publisher" && handoff.publishedAsset
@@ -2172,7 +2187,7 @@ function confirmationEmbed(pending: PendingUniformConfirmation): EmbedBuilder {
   return presentationEmbed(
     "Confirm Uniform Delivery",
     pending.command === "log"
-      ? "Review the /created submission. Select the customer Discord account, then submit. No Google Sheets rows or Discord messages have been sent yet."
+      ? "Review the /create submission. Select the customer Discord account, then submit. No Google Sheets rows or Discord messages have been sent yet."
       : "Review the /moderated submission. Select the customer Discord account, then submit. No Google Sheets rows or Discord messages have been sent yet.",
     "info",
     undefined,
@@ -2501,7 +2516,7 @@ function publishingHandoffEmbed(record: UniformDeliveryRecord): EmbedBuilder {
     [
       { name: "Customer", value: safePresentationText(record.customerName), inline: true },
       { name: "Roblox descriptions", value: (publishing.uniformTypes ?? [publishing.uniformType])
-        .map((type, index) => `Shirt ${index + 1}: ${safePresentationText(type)}`).join("\n"), inline: false },
+        .map((type, index) => `Shirt ${index + 1}: ${safePresentationText(uniformTypeDisplay(type))}`).join("\n"), inline: false },
       { name: reviewing ? "Senior Quartermaster" : "Publisher", value: "*Pending*", inline: true },
       ...(publisherLinks.length > 0
         ? [{ name: reviewing ? "Approved assets" : "SEQM-approved links to publish", value: publisherLinks
@@ -4212,6 +4227,7 @@ export async function validateUniformSettings(
     normalized.armySeqmChannelId,
     normalized.marinesSeqmChannelId,
     normalized.navySeqmChannelId,
+    normalized.veteranSeqmChannelId,
   ]) {
     if (channelId) await requireUniformChannel(guild, channelId, "log");
   }
@@ -4310,6 +4326,7 @@ export function uniformSettingsEmbed(
       { name: "Army SEQM", value: settings.armySeqmChannelId ? `<#${settings.armySeqmChannelId}>` : "Not configured", inline: true },
       { name: "Marines SEQM", value: settings.marinesSeqmChannelId ? `<#${settings.marinesSeqmChannelId}>` : "Not configured", inline: true },
       { name: "Navy SEQM", value: settings.navySeqmChannelId ? `<#${settings.navySeqmChannelId}>` : "Not configured", inline: true },
+      { name: "Veteran SEQM", value: settings.veteranSeqmChannelId ? `<#${settings.veteranSeqmChannelId}>` : "Not configured", inline: true },
       { name: "Publisher channel", value: settings.publisherChannelId ? `<#${settings.publisherChannelId}>` : "Not configured", inline: true },
       { name: "/moderated destination", value: settings.moderatedChannelId ? `<#${settings.moderatedChannelId}>` : "Not configured", inline: true },
       { name: "Authorized roles", value: mentionList(settings.authorizedRoleIds, "<@&"), inline: false },
@@ -4363,6 +4380,12 @@ export async function renderUniformSettings(
           .setLabel("Recover Delivery")
           .setStyle(ButtonStyle.Danger)
           .setDisabled(!recoverable),
+      ),
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("setup:uniforms-veteran-config")
+          .setLabel("Veteran SEQM Configuration")
+          .setStyle(ButtonStyle.Primary),
       ),
     ],
   });
@@ -4468,6 +4491,26 @@ export async function handleUniformSettingsComponent(
     );
     return;
   }
+  if (id === "setup:uniforms-veteran-config") {
+    const settings = uniformSettingsFor(setup);
+    await interaction.showModal(
+      new ModalBuilder()
+        .setCustomId("setup-modal:uniforms-veteran")
+        .setTitle("Veteran SEQM Configuration")
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId("veteran_seqm_channel_id")
+              .setLabel("Veteran SEQM channel ID")
+              .setStyle(TextInputStyle.Short)
+              .setValue(settings.veteranSeqmChannelId ?? "")
+              .setRequired(true)
+              .setMaxLength(25),
+          ),
+        ),
+    );
+    return;
+  }
   if (id !== "setup:uniforms-config") {
     throw new Error("That Uniforms settings control is no longer available.");
   }
@@ -4531,6 +4574,38 @@ export async function handleUniformSettingsModal(
     throw new Error("Only the server owner or a current Administrator can change Uniforms settings.");
   }
   const existing = uniformSettingsFor(setup);
+  if (interaction.customId.startsWith("setup-modal:uniforms-veteran")) {
+    const updated = await saveUniformSettings(
+      interaction.guild!,
+      setup,
+      interaction.user.id,
+      {
+        ...existing,
+        veteranSeqmChannelId: optionalChannelId(
+          uniformModalValue(interaction, "veteran_seqm_channel_id"),
+          "Veteran SEQM channel ID",
+        ),
+      },
+    );
+    await interaction.reply({
+      content: "",
+      embeds: [presentationEmbed(
+        "Veteran SEQM Destination Saved",
+        "Veteran uniform submissions will be routed to the configured review channel.",
+        "success",
+        undefined,
+        [{
+          name: "Veteran SEQM",
+          value: updated.uniforms?.veteranSeqmChannelId
+            ? `<#${updated.uniforms.veteranSeqmChannelId}>`
+            : "Not configured",
+          inline: true,
+        }],
+      )],
+      allowedMentions: noMentions,
+    });
+    return updated;
+  }
   const settings: UniformSettings = {
     ...existing,
     armySeqmChannelId: optionalChannelId(uniformModalValue(interaction, "army_seqm_channel_id"), "Army SEQM channel ID"),

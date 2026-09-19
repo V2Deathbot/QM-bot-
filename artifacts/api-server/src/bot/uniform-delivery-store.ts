@@ -68,7 +68,7 @@ export interface UniformDeliveryRecord {
       | "moderated"
       | "unresolved";
     uniformType: string;
-    uniformBranch?: "Army" | "Marines" | "Navy";
+    uniformBranch?: "Army" | "Marines" | "Navy" | "Veteran";
     /** Per-shirt Roblox descriptions, ordered with attachments. */
     uniformTypes?: string[];
     /** Optional QM evidence links shown only during the SEQM review stage. */
@@ -76,7 +76,7 @@ export interface UniformDeliveryRecord {
     publisherName: string;
     /** Current stage of the two-step creation workflow. */
     stage?: "seqm-review" | "publisher";
-    /** Publisher channel frozen when /created was submitted. */
+    /** Publisher channel frozen when /create was submitted. */
     publisherChannelId?: string;
     moderatedChannelId?: string;
     seqmRoleId?: string;
@@ -153,7 +153,7 @@ export interface UniformDeliveryRecord {
     publisherName?: string;
     rowIndex: number;
     uniformType: string;
-    uniformBranch?: "Army" | "Marines" | "Navy";
+    uniformBranch?: "Army" | "Marines" | "Navy" | "Veteran";
     publisherChannelId?: string;
     stage?: "seqm" | "publisher";
     seqmChannelId?: string;

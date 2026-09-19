@@ -305,8 +305,8 @@ beforeEach(() => {
 });
 after(() => { globalThis.fetch = originalFetch; resetGoogleSheetsProxyForTests(); });
 
-test("registers /created with only its required customer and upload inputs", () => {
-  assert.equal(uniformCommands[0]!.toJSON().name, "created");
+test("registers /create with only its required customer and upload inputs", () => {
+  assert.equal(uniformCommands[0]!.toJSON().name, "create");
   assert.deepEqual(uniformCommands[0]!.toJSON().options?.map((option) => option.name),
     ["customer", "uniform_type", "channel", "uniform", "uniform2", "uniform_type2", "uniform3", "uniform_type3", "uniform4", "uniform_type4", "uniform5", "uniform_type5", "proof1", "proof2", "proof3", "proof4", "proof5"]);
   assert.deepEqual(uniformCommands[1]!.toJSON().options?.slice(0, 3).map((option) => option.name),
@@ -346,6 +346,7 @@ test("routes each uniform branch to its configured SEQM channel", async () => {
     ["Army", "ClassA", "army-seqm"],
     ["Marines", "Alpha", "marines-seqm"],
     ["Navy", "White", "navy-seqm"],
+    ["Veteran", "Veteran_ClassA", "veteran-seqm"],
   ] as const;
   for (const [branch, uniformType, channelId] of branchCases) {
     const branchSetup = {
@@ -355,6 +356,7 @@ test("routes each uniform branch to its configured SEQM channel", async () => {
         armySeqmChannelId: "army-seqm",
         marinesSeqmChannelId: "marines-seqm",
         navySeqmChannelId: "navy-seqm",
+        veteranSeqmChannelId: "veteran-seqm",
       },
     };
     setup.uniforms = branchSetup.uniforms;
@@ -369,6 +371,7 @@ test("routes each uniform branch to its configured SEQM channel", async () => {
   delete setup.uniforms.armySeqmChannelId;
   delete setup.uniforms.marinesSeqmChannelId;
   delete setup.uniforms.navySeqmChannelId;
+  delete setup.uniforms.veteranSeqmChannelId;
   await saveGuildSetup(setup as never);
 });
 
@@ -567,7 +570,7 @@ test("SEQM still forwards a manually approved shirt when Roblox cannot confirm i
 test("splits SEQM links so published shirts reach the customer and only pending links reach publishers", async () => {
   const seqmSetup = { ...setup, seniorQuartermasterRoleId: "20000000000000001" };
   await saveGuildSetup(seqmSetup as never);
-  const commandInteraction = interaction("created" as never, {
+  const commandInteraction = interaction("create" as never, {
       customer: "Customer", uniform_type: "ClassA", uniform: "one",
      uniform2: "two", uniform_type2: "ClassB",
      proof1: "https://example.com/proof/one", proof2: "https://example.com/proof/two",
@@ -780,7 +783,7 @@ test("routes a rejected attachment only to the moderated sheet and Senior Quarte
 test("requires SEQM to enter the Roblox link before recording a moderated shirt", async () => {
   const seqmSetup = { ...setup, seniorQuartermasterRoleId: "20000000000000001" };
   await saveGuildSetup(seqmSetup as never);
-  const commandInteraction = interaction("created" as never, {
+  const commandInteraction = interaction("create" as never, {
     customer: "Customer", uniform_type: "DressBlue", uniform: "yes",
   }, "seqm-moderated-link");
   await handleUniformCommand(commandInteraction as never, seqmSetup as never);
@@ -875,7 +878,7 @@ test("rejects invalid usernames, malformed legacy assets, and unapproved uniform
   await assert.rejects(
     handleUniformCommand(interaction("log", {
       qm: "QM", seqm: "SEQM", customer: "Customer", uniform_type: "Unapproved", uniform: "yes",
-    }) as never, setup as never), /approved Army, Marines, or Navy/i,
+    }) as never, setup as never), /approved Army, Marines, Navy, or Veteran/i,
   );
   assert.equal(sends.length, 0);
 });

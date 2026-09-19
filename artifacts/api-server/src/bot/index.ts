@@ -1851,6 +1851,7 @@ function settingsCategoryForAction(id: string): SettingsCategory | undefined {
   if (
     id === "setup:uniforms" ||
     id === "setup:uniforms-config" ||
+    id === "setup:uniforms-veteran-config" ||
     id === "setup:uniforms-reset" ||
     id === "setup:uniforms-spreadsheet-config" ||
     id === "setup:uniforms-spreadsheet-reset" ||
@@ -2471,6 +2472,7 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
   }
   if (
     id === "setup:uniforms-config" ||
+    id === "setup:uniforms-veteran-config" ||
     id === "setup:uniforms-reset" ||
     id === "setup:uniforms-spreadsheet-config" ||
     id === "setup:uniforms-spreadsheet-reset" ||
@@ -2914,7 +2916,7 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
     await createMaintenanceConfirmation(interaction, true, reason);
     return;
   }
-  if (id === "setup-modal:uniforms") {
+  if (id === "setup-modal:uniforms" || id === "setup-modal:uniforms-veteran") {
     await handleUniformSettingsModal(interaction, setup);
     return;
   }
