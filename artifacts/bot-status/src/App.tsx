@@ -5,6 +5,9 @@ import { Toaster } from '@/components/ui/toaster';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import NotFound from '@/pages/not-found';
 import Home from '@/pages/home';
+import Terms from '@/pages/terms';
+import Privacy from '@/pages/privacy';
+import { Layout } from '@/components/layout';
 import {
   Route,
   Switch,
@@ -17,10 +20,14 @@ const queryClient = new QueryClient();
 function Router() {
   return (
     <RoutedErrorBoundary>
-      <Switch>
-        <Route path="/" component={Home} />
-        <Route component={NotFound} />
-      </Switch>
+      <Layout>
+        <Switch>
+          <Route path="/" component={Home} />
+          <Route path="/terms" component={Terms} />
+          <Route path="/privacy" component={Privacy} />
+          <Route component={NotFound} />
+        </Switch>
+      </Layout>
     </RoutedErrorBoundary>
   );
 }
