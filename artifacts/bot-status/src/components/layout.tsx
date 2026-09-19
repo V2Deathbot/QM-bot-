@@ -26,8 +26,8 @@ export function Layout({ children }: { children: ReactNode }) {
   const [location] = useLocation();
 
   useEffect(() => {
-    let title = "Quartermaster Bot Status";
-    let desc = "Real-time operational status for the Quartermaster bot infrastructure.";
+    let title = "Quartermaster Bot";
+    let desc = "The official website for Quartermaster, a Discord bot supporting moderation, administration, uniforms, payouts, and operational workflows for The US Military 1940s.";
     
     if (location === "/terms") {
       title = "Terms of Service | Quartermaster";
