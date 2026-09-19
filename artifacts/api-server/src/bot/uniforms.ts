@@ -112,6 +112,22 @@ const uniformTypeChoices = [
   { name: "Navy · Gray", value: "Gray" },
   { name: "Navy · Overcoat", value: "Overcoat" },
 ] as const;
+export type UniformBranch = "Army" | "Marines" | "Navy";
+const uniformBranchByType: Record<string, UniformBranch> = Object.fromEntries(
+  uniformTypeChoices.map((choice) => [choice.value, choice.name.split(" · ")[0] as UniformBranch]),
+);
+export function uniformBranchForType(type: string): UniformBranch {
+  const branch = uniformBranchByType[type];
+  if (!branch) throw new Error(`Select an approved Army, Marines, or Navy uniform type.`);
+  return branch;
+}
+function seqmChannelForBranch(settings: UniformSettings, branch: UniformBranch): string | undefined {
+  return branch === "Army"
+    ? settings.armySeqmChannelId ?? settings.seqmReviewChannelId ?? settings.logChannelId
+    : branch === "Marines"
+      ? settings.marinesSeqmChannelId ?? settings.seqmReviewChannelId ?? settings.logChannelId
+      : settings.navySeqmChannelId ?? settings.seqmReviewChannelId ?? settings.logChannelId;
+}
 const classicShirtWidth = 585;
 const classicShirtHeight = 559;
 const maximumUniformAttachmentBytes = 10 * 1024 * 1024;
@@ -190,6 +206,7 @@ export const uniformCommands = [
       option.setName("channel").setDescription("Original customer delivery channel.").setRequired(true)
         .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
     )
+    .addStringOption((option) => option.setName("uniform_type").setDescription("Uniform type for the replacement PNG.").setRequired(true).addChoices(...uniformTypeChoices))
     .addAttachmentOption((option) =>
       option.setName("uniform").setDescription("Replacement Classic Shirt PNG using the Roblox template.").setRequired(true),
     ),
@@ -348,6 +365,8 @@ interface PendingRelogConfirmation {
   newAsset?: UniformAsset;
   replacementAttachment?: NonNullable<UniformSubmission["sourceAttachment"]>;
   attachmentBuffer?: Buffer;
+  uniformType: string;
+  uniformBranch: UniformBranch;
   choices: Array<{ submissionId: string; rowIndex: number }>;
   expiresAt: number;
 }
@@ -377,6 +396,7 @@ export interface UniformSubmission {
   assets: UniformAsset[];
   uniformType?: string;
   uniformTypes?: string[];
+  uniformBranch?: UniformBranch;
   publisherName?: string;
   sourceAttachment?: {
     name: string;
@@ -745,6 +765,7 @@ async function resolveSubmission(
           users,
           assets: [parseUniformAssetInput(legacyAssetInput)],
           uniformType,
+          uniformBranch: uniformBranchForType(uniformType),
           publisherName:
             optionString(interaction, "publisher")?.trim() ||
             interaction.client.user?.username?.trim() ||
@@ -785,6 +806,11 @@ async function resolveSubmission(
       uniformTypes.push(shirtType);
     }
     const publisherName = interaction.client.user?.username?.trim() || "Quartermaster Bot";
+    const branches = new Set(uniformTypes.map(uniformBranchForType));
+    if (branches.size !== 1) {
+      throw new Error("All shirts in one /created submission must use the same branch (Army, Marines, or Navy).");
+    }
+    const uniformBranch = [...branches][0]!;
     return {
       submission: {
         command,
@@ -792,6 +818,7 @@ async function resolveSubmission(
         assets: [],
         uniformType,
         uniformTypes,
+        uniformBranch,
         publisherName,
         sourceAttachment: attachments[0],
         sourceAttachments: attachments,
@@ -1129,8 +1156,13 @@ export async function handleUniformCommand(
   await requireUniformSubmitter(interaction.guild!, interaction.user.id, settings);
   // Validate both the configured audit destination and the explicitly chosen
   // customer destination before opening the private confirmation.
+  const previewBranch = command === "log"
+    ? uniformBranchForType((optionString(interaction, "uniform_type") ?? "ClassA").trim())
+    : undefined;
   await requireUniformChannel(
-    interaction.guild!, command === "log" ? settings.seqmReviewChannelId ?? settings.logChannelId : settings.moderatedChannelId, command,
+    interaction.guild!, command === "log"
+      ? seqmChannelForBranch(settings, previewBranch!)
+      : settings.moderatedChannelId, command,
   );
   const selectedChannel = interaction.options.getChannel("channel", true);
   const ticketChannel = await requireUniformChannel(interaction.guild!, selectedChannel.id, command);
@@ -1487,9 +1519,14 @@ function relogPublishingComponents(record: UniformDeliveryRecord, disabled = fal
 
 function relogPublishingEmbed(record: UniformDeliveryRecord): EmbedBuilder {
   const handoff = record.relogHandoff!;
+  const reviewing = handoff.stage !== "publisher";
   return presentationEmbed(
-    "Replacement Classic Shirt Awaiting Roblox Upload",
-    "Upload the attached replacement PNG through Roblox Creator Dashboard. The existing spreadsheet row and customer message remain unchanged until a published catalog link is completed.",
+    reviewing
+      ? "Replacement Classic Shirt Awaiting Senior Quartermaster Review"
+      : "Replacement Classic Shirt Awaiting Roblox Publishing",
+    reviewing
+      ? "Review the attached replacement PNG, upload it through Roblox Creator Dashboard, then enter its Roblox link. The original row and customer message remain unchanged until publication is confirmed."
+      : "Publish the exact SEQM-approved replacement link, then complete this handoff. The original row and customer message remain unchanged until publication is confirmed.",
     "info",
     undefined,
     [
@@ -1497,6 +1534,9 @@ function relogPublishingEmbed(record: UniformDeliveryRecord): EmbedBuilder {
       { name: "Roblox description", value: safePresentationText(handoff.uniformType), inline: true },
       { name: "Customer ticket", value: `<#${record.destinationChannelId}>`, inline: true },
       { name: "Original asset", value: record.assets[handoff.rowIndex]?.url ?? "Unavailable" },
+      ...(handoff.stage === "publisher" && handoff.publishedAsset
+        ? [{ name: "SEQM-approved link", value: `[${handoff.publishedAsset.id}](${handoff.publishedAsset.url})` }]
+        : []),
     ],
   );
 }
@@ -1522,6 +1562,8 @@ async function startRelogPublishingHandoff(
   attachment: NonNullable<UniformSubmission["sourceAttachment"]>,
   attachmentBuffer: Buffer | undefined,
   guild: Guild,
+  uniformType: string,
+  uniformBranch: UniformBranch,
 ): Promise<UniformDeliveryRecord> {
   if (record.relogHandoff && record.relogHandoff.state !== "published" &&
       record.relogHandoff.state !== "moderated") {
@@ -1540,6 +1582,14 @@ async function startRelogPublishingHandoff(
     throw new Error("The recorded delivery no longer matches its original spreadsheet rows. No replacement was started.");
   }
   const nonce = randomBytes(8).toString("hex");
+  const setup = await getGuildSetup(record.guildId);
+  if (!setup) throw new Error("This server no longer has a valid bot setup.");
+  const settings = uniformAccessSettings(setup, "log");
+  const seqmChannelId = seqmChannelForBranch(settings, uniformBranch);
+  if (!seqmChannelId) throw new Error(`The ${uniformBranch} SEQM review channel is not configured.`);
+  const publisherChannelId = settings.publisherChannelId ?? settings.logChannelId;
+  await requireUniformChannel(guild, seqmChannelId, "log");
+  await requireUniformChannel(guild, publisherChannelId, "log");
   let current = await updateUniformDelivery(record.submissionId, (item) => {
     if (item.relogHandoff && item.relogHandoff.state !== "published" &&
         item.relogHandoff.state !== "moderated") {
@@ -1549,7 +1599,14 @@ async function startRelogPublishingHandoff(
       state: "handoff-pending",
       actorId,
       rowIndex,
-      uniformType: item.publishing?.uniformType ?? "Replacement",
+      uniformType,
+      uniformBranch,
+      seqmChannelId,
+      ...(setup.seniorQuartermasterRoleId
+        ? { seqmRoleId: setup.seniorQuartermasterRoleId }
+        : {}),
+      publisherChannelId,
+      stage: "seqm",
       attachment,
       nonce,
       ...(attachmentBuffer
@@ -1577,23 +1634,45 @@ async function sendRelogPublishingHandoff(
     }
     item.relogHandoff.state = "handoff-claimed";
   });
-  const channel = await requireUniformChannel(guild, current.uploadLogChannelId, current.command);
+  const channel = await requireUniformChannel(
+    guild,
+    operation.stage === "publisher"
+      ? operation.publisherChannelId
+      : operation.seqmChannelId ?? current.uploadLogChannelId,
+    current.command,
+  );
   try {
     const durableBytes = current.relogHandoff!.sourceDataBase64
       ? Buffer.from(current.relogHandoff!.sourceDataBase64, "base64")
       : undefined;
     const message = await channel.send({
-      content: `<@&${uniformPublisherRoleId}>`,
+      content: operation.stage === "publisher"
+        ? `<@&${uniformPublisherRoleId}>`
+        : operation.seqmRoleId
+          ? `<@&${operation.seqmRoleId}>`
+          : "",
       embeds: [relogPublishingEmbed(current)],
       components: relogPublishingComponents(current),
-      files: [{
-        attachment: attachmentBuffer ?? durableBytes ?? current.relogHandoff!.attachment.url,
-        name: `${current.customerName}-${current.relogHandoff!.uniformType}-replacement.png`
-          .replace(/[^a-z0-9_.-]+/gi, "-")
-          .slice(0, 100),
-      }],
-      allowedMentions: { parse: [], roles: [uniformPublisherRoleId] },
-      nonce: uniformDiscordNonce("relog", `${current.submissionId}:${operation.nonce}`),
+      ...(operation.stage !== "publisher" ? {
+        files: [{
+          attachment: attachmentBuffer ?? durableBytes ?? current.relogHandoff!.attachment.url,
+          name: `${current.customerName}-${current.relogHandoff!.uniformType}-replacement.png`
+            .replace(/[^a-z0-9_.-]+/gi, "-")
+            .slice(0, 100),
+        }],
+      } : {}),
+      allowedMentions: {
+        parse: [],
+        roles: operation.stage === "publisher"
+          ? [uniformPublisherRoleId]
+          : operation.seqmRoleId
+            ? [operation.seqmRoleId]
+            : [],
+      },
+      nonce: uniformDiscordNonce(
+        "relog",
+        `${current.submissionId}:${operation.nonce}:${operation.stage ?? "seqm"}`,
+      ),
       enforceNonce: true,
     });
     const handoffMessageId = sentMessageId(message);
@@ -1655,7 +1734,14 @@ async function editRelogPublishingHandoff(
 ): Promise<void> {
   const messageId = record.relogHandoff?.handoffMessageId;
   if (!messageId) return;
-  const channel = await requireUniformChannel(guild, record.uploadLogChannelId, record.command);
+  const handoff = record.relogHandoff;
+  const channel = await requireUniformChannel(
+    guild,
+    handoff?.stage === "publisher"
+      ? handoff.publisherChannelId
+      : handoff?.seqmChannelId ?? record.uploadLogChannelId,
+    record.command,
+  );
   const message = await channel.messages?.fetch(messageId);
   if (!message) return;
   await message.edit({
@@ -1696,6 +1782,22 @@ export async function handleUniformRelogPublishingButton(
     );
     return;
   }
+  if (record.relogHandoff!.stage !== "publisher") {
+    await interaction.showModal(
+      new ModalBuilder()
+        .setCustomId(`uniform:relog-moderated-modal:${submissionId}:${nonce}`)
+        .setTitle("Record Replacement Moderation")
+        .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("catalog_link")
+            .setLabel("Moderated Roblox catalog link")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(500),
+        )),
+    );
+    return;
+  }
   await interaction.deferUpdate();
   const publisherName = await discordPublisherName(interaction);
   record = await updateUniformDelivery(submissionId, (item) => {
@@ -1715,7 +1817,7 @@ export async function handleUniformRelogPublishingButton(
       typeof sourceRow[0] === "string" ? sourceRow[0] : "",
       publisherName,
       record.customerName,
-      "",
+      record.relogHandoff!.publishedAsset?.url ?? "",
     ]];
     await appendUniformRows({
       config: record.spreadsheet,
@@ -1774,7 +1876,7 @@ export async function handleUniformRelogPublishingModal(
   interaction: ModalSubmitInteraction,
 ): Promise<void> {
   const [, control, submissionId, nonce] = interaction.customId.split(":");
-  if (control !== "relog-publish-modal" || !submissionId || !nonce) {
+  if (!["relog-publish-modal", "relog-moderated-modal"].includes(control) || !submissionId || !nonce) {
     throw new Error("That replacement completion is unavailable.");
   }
   let record = await relogPublishingRecordFor(interaction, submissionId, nonce);
@@ -1782,8 +1884,78 @@ export async function handleUniformRelogPublishingModal(
     throw new Error("This replacement handoff is already completed or being processed.");
   }
   const asset = parseUniformAssetInput(interaction.fields.getTextInputValue("catalog_link"));
-  await verifyPublishedClassicShirt(asset.id);
+  if (control === "relog-moderated-modal") {
+    await interaction.deferReply({ ephemeral: true });
+    const publisherName = await discordPublisherName(interaction);
+    const row = record.rows[record.relogHandoff!.rowIndex] ?? [];
+    await appendUniformRows({
+      config: record.spreadsheet,
+      logKind: "moderated",
+      rows: [[row[0] ?? "", publisherName, record.customerName, asset.url]],
+      submissionId: `relog-moderated:${record.submissionId}:${nonce}`,
+    });
+    record = await updateUniformDelivery(submissionId, (item) => {
+      if (item.relogHandoff?.nonce !== nonce || item.relogHandoff.state !== "awaiting-result") {
+        throw new Error("This replacement handoff is no longer awaiting a result.");
+      }
+      item.relogHandoff.state = "moderated";
+      item.relogHandoff.publishedAsset = asset;
+      item.relogHandoff.completedAt = new Date().toISOString();
+    });
+    await interaction.editReply({
+      embeds: [presentationEmbed(
+        "Replacement Moderation Recorded",
+        "The replacement link was logged in the moderated worksheet. The original successful row and customer message remain unchanged.",
+        "success",
+      )],
+      components: [],
+      allowedMentions: noMentions,
+    });
+    return;
+  }
+  let alreadyPublished = true;
+  try {
+    await verifyPublishedClassicShirt(asset.id);
+  } catch {
+    alreadyPublished = false;
+  }
   await interaction.deferReply({ ephemeral: true });
+  if (record.relogHandoff!.stage === "publisher" &&
+      record.relogHandoff!.publishedAsset?.id !== asset.id) {
+    throw new Error(
+      `Publish the exact SEQM-approved replacement asset (${record.relogHandoff!.publishedAsset?.id ?? "unavailable"}).`,
+    );
+  }
+  if (!alreadyPublished) {
+    await editRelogPublishingHandoff(record, interaction.guild!, presentationEmbed(
+      "Replacement Approved for Publishing",
+      "The Senior Quartermaster approved this replacement link and it was forwarded to the publisher channel.",
+      "success",
+      undefined,
+      [{ name: "Approved link", value: `[${asset.id}](${asset.url})` }],
+    )).catch(() => undefined);
+    record = await updateUniformDelivery(submissionId, (item) => {
+      if (item.relogHandoff?.nonce !== nonce || item.relogHandoff.state !== "awaiting-result") {
+        throw new Error("This replacement handoff is no longer awaiting a result.");
+      }
+      item.relogHandoff.stage = "publisher";
+      item.relogHandoff.state = "handoff-pending";
+      item.relogHandoff.publishedAsset = asset;
+    });
+    record = await sendRelogPublishingHandoff(record, interaction.guild!);
+    await interaction.editReply({
+      embeds: [presentationEmbed(
+        "Replacement Forwarded to Publisher",
+        "Roblox has not confirmed this replacement as published. The approved link was forwarded to the shared publisher channel; the original row and customer message remain unchanged.",
+        "info",
+        undefined,
+        [{ name: "Approved link", value: `[${asset.id}](${asset.url})` }],
+      )],
+      components: [],
+      allowedMentions: noMentions,
+    });
+    return;
+  }
   const publisherName = await discordPublisherName(interaction);
   const rowIndex = record.relogHandoff!.rowIndex;
   record = await updateUniformDelivery(submissionId, (item) => {
@@ -1828,6 +2000,8 @@ export async function handleUniformRelogCommand(
 ): Promise<void> {
   const selected = interaction.options.getChannel("channel", true);
   await requireUniformChannel(interaction.guild!, selected.id, "log");
+  const uniformType = optionString(interaction, "uniform_type", true)!.trim();
+  const uniformBranch = uniformBranchForType(uniformType);
   const legacyLink = optionString(interaction, "newlink");
   const newAsset = legacyLink ? parseUniformAssetInput(legacyLink) : undefined;
   const replacement = legacyLink ? undefined : await validatedClassicShirtAttachment(interaction);
@@ -1856,6 +2030,8 @@ export async function handleUniformRelogCommand(
         replacement.attachment,
         replacement.buffer,
         interaction.guild!,
+        uniformType,
+        uniformBranch,
       );
       await interaction.editReply(relogHandoffStartedPayload(result));
       return;
@@ -1881,6 +2057,8 @@ export async function handleUniformRelogCommand(
   const pending: PendingRelogConfirmation = {
     nonce, guildId: interaction.guildId!, actorId: interaction.user.id,
     channelId: selected.id,
+    uniformType,
+    uniformBranch,
     ...(newAsset ? { newAsset } : {}),
     ...(replacement
       ? { replacementAttachment: replacement.attachment, attachmentBuffer: replacement.buffer }
@@ -1915,6 +2093,7 @@ export async function handleUniformRelogSelection(
       const result = await startRelogPublishingHandoff(
         record, rowIndex, interaction.user.id, pending.replacementAttachment,
         pending.attachmentBuffer, interaction.guild!,
+         pending.uniformType, pending.uniformBranch,
       );
       await interaction.editReply(relogHandoffStartedPayload(result));
     } else {
@@ -3342,7 +3521,7 @@ export async function handleUniformSubmitButton(
   if (!record) {
     await fetchedMember(interaction.guild!, pending.customerId);
     const uploadLogChannelId = pending.command === "log"
-      ? settings.seqmReviewChannelId ?? settings.logChannelId
+      ? seqmChannelForBranch(settings, pending.submission.uniformBranch ?? uniformBranchForType(pending.submission.uniformType ?? "ClassA"))
       : settings.moderatedChannelId;
     await requireUniformChannel(interaction.guild!, uploadLogChannelId, pending.command);
     await requireUniformChannel(interaction.guild!, pending.destinationChannelId, pending.command);
@@ -3374,6 +3553,7 @@ export async function handleUniformSubmitButton(
               state: "handoff-pending" as const,
               uniformType: pending.submission.uniformType,
               ...(pending.submission.uniformTypes ? { uniformTypes: pending.submission.uniformTypes } : {}),
+              ...(pending.submission.uniformBranch ? { uniformBranch: pending.submission.uniformBranch } : {}),
               publisherName: "Pending",
               stage: pending.twoStage ? "seqm-review" as const : "publisher" as const,
               publisherChannelId: pending.twoStage
@@ -3991,6 +4171,13 @@ export async function validateUniformSettings(
   if (normalized.seqmReviewChannelId) {
     await requireUniformChannel(guild, normalized.seqmReviewChannelId, "log");
   }
+  for (const channelId of [
+    normalized.armySeqmChannelId,
+    normalized.marinesSeqmChannelId,
+    normalized.navySeqmChannelId,
+  ]) {
+    if (channelId) await requireUniformChannel(guild, channelId, "log");
+  }
   if (normalized.publisherChannelId) {
     await requireUniformChannel(guild, normalized.publisherChannelId, "log");
   }
@@ -4083,7 +4270,9 @@ export function uniformSettingsEmbed(
     "info",
     avatarUrl,
     [
-      { name: "SEQM review channel", value: settings.seqmReviewChannelId ? `<#${settings.seqmReviewChannelId}>` : "Not configured", inline: true },
+      { name: "Army SEQM", value: settings.armySeqmChannelId ? `<#${settings.armySeqmChannelId}>` : "Not configured", inline: true },
+      { name: "Marines SEQM", value: settings.marinesSeqmChannelId ? `<#${settings.marinesSeqmChannelId}>` : "Not configured", inline: true },
+      { name: "Navy SEQM", value: settings.navySeqmChannelId ? `<#${settings.navySeqmChannelId}>` : "Not configured", inline: true },
       { name: "Publisher channel", value: settings.publisherChannelId ? `<#${settings.publisherChannelId}>` : "Not configured", inline: true },
       { name: "/moderated destination", value: settings.moderatedChannelId ? `<#${settings.moderatedChannelId}>` : "Not configured", inline: true },
       { name: "Authorized roles", value: mentionList(settings.authorizedRoleIds, "<@&"), inline: false },
@@ -4251,14 +4440,16 @@ export async function handleUniformSettingsComponent(
       .setCustomId("setup-modal:uniforms")
       .setTitle("Uniform Uploading Configuration")
       .addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("seqm_review_channel_id")
-            .setLabel("SEQM review channel ID")
-            .setStyle(TextInputStyle.Short)
-            .setValue(settings.seqmReviewChannelId ?? "")
-            .setRequired(true)
-            .setMaxLength(25),
+        ...(["army", "marines", "navy"] as const).map((branch) =>
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId(`${branch}_seqm_channel_id`)
+              .setLabel(`${branch[0]!.toUpperCase()}${branch.slice(1)} SEQM channel ID`)
+              .setStyle(TextInputStyle.Short)
+              .setValue(settings[`${branch}SeqmChannelId` as keyof UniformSettings] as string ?? "")
+              .setRequired(true)
+              .setMaxLength(25),
+          ),
         ),
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder()
@@ -4305,10 +4496,9 @@ export async function handleUniformSettingsModal(
   const existing = uniformSettingsFor(setup);
   const settings: UniformSettings = {
     ...existing,
-    seqmReviewChannelId: optionalChannelId(
-      uniformModalValue(interaction, "seqm_review_channel_id"),
-      "SEQM review channel ID",
-    ),
+    armySeqmChannelId: optionalChannelId(uniformModalValue(interaction, "army_seqm_channel_id"), "Army SEQM channel ID"),
+    marinesSeqmChannelId: optionalChannelId(uniformModalValue(interaction, "marines_seqm_channel_id"), "Marines SEQM channel ID"),
+    navySeqmChannelId: optionalChannelId(uniformModalValue(interaction, "navy_seqm_channel_id"), "Navy SEQM channel ID"),
     publisherChannelId: optionalChannelId(
       uniformModalValue(interaction, "publisher_channel_id"),
       "Publisher channel ID",

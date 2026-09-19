@@ -328,8 +328,8 @@ test("registers /created with only its required customer and upload inputs", () 
 
 test("submits two and five ordered shirt attachments in one publishing handoff", async () => {
   for (const [id, values, count] of [
-    ["multi-two", { customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform_type2: "DressBlue" }, 2],
-    ["multi-five", { customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform_type2: "DressBlue", uniform3: "three", uniform_type3: "Khaki", uniform4: "four", uniform_type4: "Flight", uniform5: "five", uniform_type5: "Overcoat" }, 5],
+    ["multi-two", { customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform_type2: "ClassB" }, 2],
+    ["multi-five", { customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform_type2: "ClassB", uniform3: "three", uniform_type3: "ClassA_MP", uniform4: "four", uniform_type4: "Flight", uniform5: "five", uniform_type5: "ClassA_HG" }, 5],
   ] as const) {
     await prepareAndSubmit("log", values, id);
     const record = await getUniformDelivery(id);
@@ -339,6 +339,37 @@ test("submits two and five ordered shirt attachments in one publishing handoff",
     rows.clear(); sends = []; sentMessages.clear();
     resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
   }
+});
+
+test("routes each uniform branch to its configured SEQM channel", async () => {
+  const branchCases = [
+    ["Army", "ClassA", "army-seqm"],
+    ["Marines", "Alpha", "marines-seqm"],
+    ["Navy", "White", "navy-seqm"],
+  ] as const;
+  for (const [branch, uniformType, channelId] of branchCases) {
+    const branchSetup = {
+      ...setup,
+      uniforms: {
+        ...setup.uniforms,
+        armySeqmChannelId: "army-seqm",
+        marinesSeqmChannelId: "marines-seqm",
+        navySeqmChannelId: "navy-seqm",
+      },
+    };
+    setup.uniforms = branchSetup.uniforms;
+    await saveGuildSetup(branchSetup as never);
+    await prepareAndSubmit("log", {
+      customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: uniformType, uniform: "one",
+    }, `branch-${branch.toLowerCase()}`);
+    assert.ok(sends.some((entry) => (entry as { id: string }).id === channelId));
+    rows.clear(); sends = []; sentMessages.clear();
+    resetUniformSubmissionStateForTests(); resetUniformDeliveryStoreForTests();
+  }
+  delete setup.uniforms.armySeqmChannelId;
+  delete setup.uniforms.marinesSeqmChannelId;
+  delete setup.uniforms.navySeqmChannelId;
+  await saveGuildSetup(setup as never);
 });
 
 test("rejects a gap in ordered optional shirt attachments", async () => {
@@ -371,7 +402,7 @@ test("requires one matching uniform type for every optional shirt", async () => 
 
 test("persists selected moderated shirt indexes on a multi-shirt handoff", async () => {
   await prepareAndSubmit("log", {
-    customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform_type2: "DressBlue",
+      customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform_type2: "ClassB",
   }, "multi-select");
   const before = await getUniformDelivery("multi-select");
   assert.equal(before?.publishing?.state, "awaiting-result");
@@ -385,7 +416,7 @@ test("persists selected moderated shirt indexes on a multi-shirt handoff", async
 
 test("completes a mixed multi-shirt result with one link and deferred moderation copy", async () => {
   await prepareAndSubmit("log", {
-    customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform_type2: "DressBlue",
+    customer: "Customer", seqm: "SEQM", qm: "QM", uniform_type: "ClassA", uniform: "one", uniform2: "two", uniform_type2: "ClassB",
   }, "multi-mixed");
   await handleUniformPublishingModerationSelect({
     customId: "uniform:publish-moderated-select:multi-mixed",
@@ -537,8 +568,8 @@ test("splits SEQM links so published shirts reach the customer and only pending 
   const seqmSetup = { ...setup, seniorQuartermasterRoleId: "20000000000000001" };
   await saveGuildSetup(seqmSetup as never);
   const commandInteraction = interaction("created" as never, {
-    customer: "Customer", uniform_type: "ClassA", uniform: "one",
-    uniform2: "two", uniform_type2: "DressBlue",
+      customer: "Customer", uniform_type: "ClassA", uniform: "one",
+     uniform2: "two", uniform_type2: "ClassB",
   }, "seqm-split");
   await handleUniformCommand(commandInteraction as never, seqmSetup as never);
   const nonce = componentId(commandInteraction.edits[0], 0).split(":")[2]!;
@@ -1068,7 +1099,7 @@ test("posts a quiet relog audit with the frozen ticket, customer, credits, and r
     guild, guildId: guild.id, user: { id: "seqm-discord" },
     options: {
       getChannel: () => ({ id: "relog-ticket", type: ChannelType.GuildText }),
-      getString: () => "99",
+       getString: (name: string) => name === "uniform_type" ? "ClassA" : "99",
     },
     editReply: async (payload: unknown) => { edits.push(payload); },
   } as never);
@@ -1105,7 +1136,7 @@ test("keeps the original delivery intact until a replacement PNG is published", 
     guild, guildId: guild.id, user: { id: "seqm-discord" },
     options: {
       getChannel: () => ({ id: "relog-attachment-ticket", type: ChannelType.GuildText }),
-      getString: () => null,
+       getString: (name: string) => name === "uniform_type" ? "ClassA" : null,
       getAttachment: () => ({
         name: "uniform.png", contentType: "image/png", size: classicShirtPng.length,
         url: "https://cdn.discordapp.com/uniform.png",
@@ -1148,6 +1179,68 @@ test("keeps the original delivery intact until a replacement PNG is published", 
   assert.notEqual(completed?.customerMessageId, original?.customerMessageId);
 });
 
+test("forwards an unpublished replacement link to the shared publisher and requires that exact link", async () => {
+  await prepareAndSubmit("log", {
+    qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer",
+    shirtid1: "42", channel: "relog-publisher-ticket",
+  }, "relog-publisher");
+  await handleUniformRelogCommand({
+    guild, guildId: guild.id, user: { id: "seqm-discord" },
+    options: {
+      getChannel: () => ({ id: "relog-publisher-ticket", type: ChannelType.GuildText }),
+      getString: (name: string) => name === "uniform_type" ? "ClassA" : null,
+      getAttachment: () => ({
+        name: "uniform.png", contentType: "image/png", size: classicShirtPng.length,
+        url: "https://cdn.discordapp.com/uniform.png",
+      }),
+    },
+    editReply: async () => undefined,
+  } as never);
+  const seqmPending = await getUniformDelivery("relog-publisher");
+  const nonce = seqmPending!.relogHandoff!.nonce;
+  unpublishedAssetIds.add(99);
+  await handleUniformRelogPublishingModal({
+    customId: `uniform:relog-publish-modal:relog-publisher:${nonce}`,
+    guild, guildId: guild.id, user: { id: "seqm-discord" },
+    fields: { getTextInputValue: () => "https://www.roblox.com/catalog/99" },
+    deferReply: async () => undefined, editReply: async () => undefined,
+  } as never);
+  const publisherPending = await getUniformDelivery("relog-publisher");
+  assert.equal(publisherPending?.relogHandoff?.stage, "publisher");
+  assert.equal(publisherPending?.relogHandoff?.state, "awaiting-result");
+  assert.equal(publisherPending?.relogHandoff?.publishedAsset?.id, 99);
+  const publisherHandoff = sends.at(-1) as { payload: {
+    files?: unknown[];
+    nonce: string;
+    embeds: Array<{ data: { description: string } }>;
+  } };
+  assert.equal(publisherHandoff.payload.files, undefined);
+  assert.match(publisherHandoff.payload.embeds[0]!.data.description, /exact SEQM-approved replacement link/i);
+  assert.notEqual(
+    publisherHandoff.payload.nonce,
+    (sends.at(-2) as { payload: { nonce: string } }).payload.nonce,
+  );
+
+  unpublishedAssetIds.delete(99);
+  await assert.rejects(handleUniformRelogPublishingModal({
+    customId: `uniform:relog-publish-modal:relog-publisher:${nonce}`,
+    guild, guildId: guild.id, user: { id: "seqm-discord" },
+    fields: { getTextInputValue: () => "https://www.roblox.com/catalog/100" },
+    deferReply: async () => undefined, editReply: async () => undefined,
+  } as never), /exact SEQM-approved replacement asset/i);
+  assert.equal((await getUniformDelivery("relog-publisher"))?.rows[0]?.at(-1),
+    "https://www.roblox.com/catalog/42");
+
+  await handleUniformRelogPublishingModal({
+    customId: `uniform:relog-publish-modal:relog-publisher:${nonce}`,
+    guild, guildId: guild.id, user: { id: "seqm-discord" },
+    fields: { getTextInputValue: () => "https://www.roblox.com/catalog/99" },
+    deferReply: async () => undefined, editReply: async () => undefined,
+  } as never);
+  assert.equal((await getUniformDelivery("relog-publisher"))?.rows[0]?.at(-1),
+    "https://www.roblox.com/catalog/99");
+});
+
 test("logs a rejected replacement without changing its successful row or customer message", async () => {
   await prepareAndSubmit("log", {
     qm: "QM", seqm: "SEQM", publisher: "Publisher", customer: "Customer",
@@ -1158,7 +1251,7 @@ test("logs a rejected replacement without changing its successful row or custome
     guild, guildId: guild.id, user: { id: "seqm-discord" },
     options: {
       getChannel: () => ({ id: "relog-rejected-ticket", type: ChannelType.GuildText }),
-      getString: () => null,
+       getString: (name: string) => name === "uniform_type" ? "ClassA" : null,
       getAttachment: () => ({
         name: "uniform.png", contentType: "image/png", size: classicShirtPng.length,
         url: "https://cdn.discordapp.com/uniform.png",
@@ -1172,8 +1265,16 @@ test("logs a rejected replacement without changing its successful row or custome
     customId: `uniform:relog-publish-moderated:relog-rejected:${nonce}`,
     guild, guildId: guild.id, user: { id: "seqm-discord" },
     message: { id: "notice-3" },
+    showModal: async () => undefined,
     deferUpdate: async () => undefined,
     editReply: async () => undefined,
+  } as never);
+  await handleUniformRelogPublishingModal({
+    customId: `uniform:relog-moderated-modal:relog-rejected:${nonce}`,
+    guild, guildId: guild.id, user: { id: "seqm-discord" },
+    message: { id: "notice-3" },
+    fields: { getTextInputValue: () => "https://www.roblox.com/catalog/99" },
+    deferReply: async () => undefined, editReply: async () => undefined,
   } as never);
   const rejected = await getUniformDelivery("relog-rejected");
   assert.equal(rejected?.relogHandoff?.state, "moderated");
@@ -1181,7 +1282,7 @@ test("logs a rejected replacement without changing its successful row or custome
   assert.equal(rejected?.rows[0]?.at(-1), "https://www.roblox.com/catalog/42");
   assert.equal(rejected?.customerMessageId, original?.customerMessageId);
   assert.equal(rows.get("Uniform Logs")?.[0]?.at(-1), "https://www.roblox.com/catalog/42");
-  assert.deepEqual(rows.get("Moderated Logs"), [["QM", "Senior Publisher", "Customer", ""]]);
+  assert.deepEqual(rows.get("Moderated Logs"), [["QM", "Senior Publisher", "Customer", "https://www.roblox.com/catalog/99"]]);
   assert.ok(sends.every((message, index) =>
     index < 2 || (message as { id: string }).id !== "relog-rejected-ticket"));
 });

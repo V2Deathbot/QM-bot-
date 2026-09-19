@@ -131,6 +131,10 @@ export interface UniformSettings {
   logChannelId?: string;
   /** Channel where Senior Quartermasters review and upload created PNGs. */
   seqmReviewChannelId?: string;
+  /** Branch-specific Senior Quartermaster review channels. */
+  armySeqmChannelId?: string;
+  marinesSeqmChannelId?: string;
+  navySeqmChannelId?: string;
   /** Channel where publishers receive approved Classic Shirts. */
   publisherChannelId?: string;
   /** Channel used by /moderated. Undefined means that command is not configured. */

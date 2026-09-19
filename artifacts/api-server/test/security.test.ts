@@ -282,6 +282,7 @@ function command(
 ) {
   const localReplies: unknown[] = [];
   let deferCalls = 0;
+  let deferEphemeral: boolean | undefined;
   const messageId = `component-message-${++componentMessageSequence}`;
   return {
     inGuild: () => true,
@@ -302,7 +303,10 @@ function command(
         name === "discord_user" && discordUserId ? { id: discordUserId } : null,
       getRole: () => null,
     },
-    deferReply: async () => { deferCalls += 1; },
+    deferReply: async (options?: { ephemeral?: boolean }) => {
+      deferCalls += 1;
+      deferEphemeral = options?.ephemeral;
+    },
     editReply: async (value: unknown) => {
       latestComponentMessageId = messageId;
       localReplies.push(value);
@@ -315,6 +319,7 @@ function command(
     },
     localReplies,
     get deferCalls() { return deferCalls; },
+    get deferEphemeral() { return deferEphemeral; },
   };
 }
 
@@ -712,6 +717,17 @@ async function setMaintenance(active: boolean, actor = "admin-a", reason = "main
   await dispatchRaw(button(actor, lastMaintenanceConfirmationId(menu)));
 }
 
+test("keeps slash-command responses private except for the public blacklist lookup", async () => {
+  await setSecurity({});
+  const normal = command("admin-a", "security_status");
+  await dispatch(normal);
+  assert.equal(normal.deferEphemeral, true);
+
+  const lookup = command("member", "blacklist_lookup", { username: "Builder" });
+  await dispatch(lookup);
+  assert.equal(lookup.deferEphemeral, false);
+});
+
 const originalLogin = Client.prototype.login;
 const originalGuildFetch = GuildManager.prototype.fetch;
 const originalFetch = globalThis.fetch;
@@ -845,7 +861,7 @@ test("registers setup plus requested moderation and uniform commands", () => {
   assert.deepEqual(moderated?.options?.map((option) => option.name), [
     "uploader", "publisher", "customer", "shirtid", "channel",
   ]);
-  assert.deepEqual(relog?.options?.map((option) => option.name), ["channel", "uniform"]);
+  assert.deepEqual(relog?.options?.map((option) => option.name), ["channel", "uniform_type", "uniform"]);
   assert.ok(relog?.options?.every((option) => option.required === true));
   assert.ok(
     definitions.every((command) => command.default_member_permissions == null),
@@ -1038,19 +1054,23 @@ test("navigates to Uploading configuration, seals modal fields, saves, resets, a
   const shown = shownModals.at(-1);
   assert.equal(shownModals.length, modalCount + 1);
   assert.deepEqual(modalTextInputIds(shown!), [
-    "seqm_review_channel_id",
+     "army_seqm_channel_id",
+     "marines_seqm_channel_id",
+     "navy_seqm_channel_id",
     "publisher_channel_id",
     "moderated_channel_id",
   ]);
 
   await dispatchRaw(modal("setup-owner", shown!.customId, {
-    seqm_review_channel_id: "12345678901234567",
+     army_seqm_channel_id: "12345678901234567",
+     marines_seqm_channel_id: "12345678901234568",
+     navy_seqm_channel_id: "12345678901234569",
     publisher_channel_id: "12345678901234567",
     moderated_channel_id: "12345678901234568",
   }));
   let saved = await store.getGuildSetup(guild.id);
-  assert.equal(saved?.uniforms?.seqmReviewChannelId, "12345678901234567");
-  assert.equal(saved?.uniforms?.publisherChannelId, "12345678901234567");
+   assert.equal(saved?.uniforms?.armySeqmChannelId, "12345678901234567");
+   assert.equal(saved?.uniforms?.publisherChannelId, "12345678901234567");
   assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["member"]);
 
   // A modal captured while the user was an administrator cannot be used after
@@ -1059,16 +1079,20 @@ test("navigates to Uploading configuration, seals modal fields, saves, resets, a
   const staleForDemotion = shownModals.at(-1)!;
   members.set("setup-owner", { administrator: false });
   await dispatchRaw(modal("setup-owner", staleForDemotion.customId, {
-    seqm_review_channel_id: "",
+     army_seqm_channel_id: "",
+     marines_seqm_channel_id: "",
+     navy_seqm_channel_id: "",
     publisher_channel_id: "",
     moderated_channel_id: "",
   }));
   saved = await store.getGuildSetup(guild.id);
-  assert.equal(saved?.uniforms?.seqmReviewChannelId, "12345678901234567");
+   assert.equal(saved?.uniforms?.armySeqmChannelId, "12345678901234567");
   members.set("setup-owner", { administrator: true });
 
   await dispatchRaw(modal("setup-owner", staleForDemotion.customId, {
-    seqm_review_channel_id: "",
+     army_seqm_channel_id: "",
+     marines_seqm_channel_id: "",
+     navy_seqm_channel_id: "",
     publisher_channel_id: "",
     moderated_channel_id: "",
   }));

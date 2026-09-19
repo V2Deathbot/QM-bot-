@@ -68,6 +68,7 @@ export interface UniformDeliveryRecord {
       | "moderated"
       | "unresolved";
     uniformType: string;
+    uniformBranch?: "Army" | "Marines" | "Navy";
     /** Per-shirt Roblox descriptions, ordered with attachments. */
     uniformTypes?: string[];
     publisherName: string;
@@ -150,6 +151,11 @@ export interface UniformDeliveryRecord {
     publisherName?: string;
     rowIndex: number;
     uniformType: string;
+    uniformBranch?: "Army" | "Marines" | "Navy";
+    publisherChannelId?: string;
+    stage?: "seqm" | "publisher";
+    seqmChannelId?: string;
+    seqmRoleId?: string;
     attachment: {
       name: string;
       contentType: "image/png";

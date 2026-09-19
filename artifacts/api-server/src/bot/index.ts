@@ -4544,7 +4544,9 @@ async function handleInteraction(
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  // Keep command responses private by default. The read-only blacklist lookup
+  // is the sole intentionally public slash-command response.
+  await interaction.deferReply({ ephemeral: interaction.commandName !== "blacklist_lookup" });
 
   // This is intentionally the first command decision after acknowledging the
   // interaction. It precedes setup reads, provider calls, audit writes, and
