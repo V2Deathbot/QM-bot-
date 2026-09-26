@@ -27,7 +27,7 @@ export function Layout({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let title = "Quartermaster Bot";
-    let desc = "The official website for Quartermaster, a Discord bot supporting moderation, administration, uniforms, payouts, and operational workflows for The US Military 1940s.";
+    let desc = "Quartermaster is a Discord bot for blacklisting and moderation, with Trello and Roblox integrations, audit records, role enforcement, and server setup.";
     
     if (location === "/terms") {
       title = "Terms of Service | Quartermaster";
@@ -94,7 +94,7 @@ export function Layout({ children }: { children: ReactNode }) {
                 </div>
               </div>
               <p className="text-sm text-muted-foreground max-w-xs leading-relaxed">
-                Disciplined operations and infrastructure management for Discord communities. Not affiliated with Discord or Roblox.
+                Discord blacklisting and moderation with Trello and Roblox integrations, audit records, and role enforcement. Not affiliated with Discord, Roblox, or Trello.
               </p>
             </div>
 

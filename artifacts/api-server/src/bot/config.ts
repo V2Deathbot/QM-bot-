@@ -45,13 +45,6 @@ export const config = {
     process.env["BOT_SETUP_FILE"] ?? "data/guild-settings.json",
   securityFile:
     process.env["BOT_SECURITY_FILE"] ?? "data/guild-security.json",
-  uniformSubmissionLedgerFile:
-    process.env["UNIFORM_SUBMISSION_LEDGER_FILE"] ?? "data/uniform-submission-ledger.json",
-  uniformDeliveryFile:
-    process.env["UNIFORM_DELIVERY_FILE"] ?? "data/uniform-deliveries.json",
-  /** Durable payout snapshots and reset state. Kept separate from delivery audit history. */
-  payoutFile:
-    process.env["PAYOUT_ARCHIVE_FILE"] ?? "data/payout-runs.json",
   /** Test-only file fallback for recovery telemetry. */
   runtimeStateFile:
     process.env["BOT_RUNTIME_STATE_FILE"] ??

@@ -103,7 +103,7 @@ export default function Home() {
           System Status
         </h1>
         <p className="text-muted-foreground max-w-2xl text-lg leading-relaxed">
-          Real-time operational status for the Quartermaster infrastructure. This surface provides transparency into subsystem connectivity and backend gateway health.
+          Real-time status for Quartermaster, a Discord bot for blacklisting and moderation. The bot supports Trello and Roblox integrations, audit records, role enforcement, and server setup.
         </p>
       </motion.div>
 
@@ -240,7 +240,7 @@ export default function Home() {
       >
         <div className="px-6 py-5 border-b border-border">
           <p className="font-mono text-xs uppercase tracking-widest text-muted-foreground">Service Stewardship</p>
-          <h2 id="service-stewardship" className="text-xl font-semibold tracking-tight mt-1">Quartermaster leadership</h2>
+          <h2 id="service-stewardship" className="text-xl font-semibold tracking-tight mt-1">Quartermaster service</h2>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-3">
           <div className="p-6 flex gap-4 border-b md:border-b-0 md:border-r border-border">

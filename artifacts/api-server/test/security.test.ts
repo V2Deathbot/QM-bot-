@@ -25,16 +25,9 @@ process.env.TRELLO_BOARD_ID = "security-test-board";
 process.env.BOT_SETUP_FILE = path.join(directory, "setup.json");
 process.env.BOT_SECURITY_FILE = path.join(directory, "security.json");
 process.env.ROLE_SNAPSHOT_FILE = path.join(directory, "snapshots.json");
-process.env.UNIFORM_SUBMISSION_LEDGER_FILE = path.join(directory, "uniform-submission-ledger.json");
-process.env.UNIFORM_DELIVERY_FILE = path.join(directory, "uniform-deliveries.json");
 
 const { config } = await import("../src/bot/config.ts");
 const { saveGuildSetup } = await import("../src/bot/setup-store.ts");
-const {
-  resetGoogleSheetsProxyForTests,
-  setGoogleSheetsProxyForTests,
-  UNIFORM_SHEET_HEADERS,
-} = await import("../src/bot/google-sheets.ts");
 const { administratorInEscalationWindow, getSecurityState, mutateSecurityState } =
   await import("../src/bot/security-store.ts");
 const { findActiveSnapshot, findRoleSnapshot, saveRoleSnapshot } = await import("../src/bot/role-store.ts");
@@ -100,45 +93,6 @@ let client: Client | undefined;
 let applicationOwner: { id: string } | { id: string; ownerId: string } = { id: "setup-owner" };
 let componentMessageSequence = 0;
 let latestComponentMessageId = "component-message-0";
-const spreadsheetRows = new Map<string, unknown[][]>([
-  ["Uniform Logs", [Array.from(UNIFORM_SHEET_HEADERS)]],
-  ["Moderated Logs", [Array.from(UNIFORM_SHEET_HEADERS)]],
-]);
-
-function sheetTab(pathname: string): string {
-  const decoded = decodeURIComponent(pathname);
-  const match = /\/values\/'((?:''|[^'])+)'!/.exec(decoded);
-  if (!match) throw new Error(`Unexpected Sheets range: ${decoded}`);
-  return match[1]!.replaceAll("''", "'");
-}
-
-setGoogleSheetsProxyForTests(async (pathname, options) => {
-  if (pathname.includes("?fields=")) {
-    return new Response(JSON.stringify({
-      sheets: [
-        { properties: { title: "Uniform Logs", sheetId: 1 } },
-        { properties: { title: "Moderated Logs", sheetId: 2 } },
-      ],
-    }));
-  }
-  const method = options?.method ?? "GET";
-  if (method === "GET") {
-    return new Response(JSON.stringify({ values: spreadsheetRows.get(sheetTab(pathname)) ?? [] }));
-  }
-  if (method === "PUT") {
-    spreadsheetRows.set(sheetTab(pathname), [Array.from(UNIFORM_SHEET_HEADERS)]);
-    return new Response(JSON.stringify({ updatedRows: 1 }));
-  }
-  if (method === "POST" && pathname.includes(":append")) {
-    const body = options?.body as { values?: unknown[][] } | undefined;
-    const tab = sheetTab(pathname);
-    const rows = spreadsheetRows.get(tab) ?? [Array.from(UNIFORM_SHEET_HEADERS)];
-    rows.push(...(body?.values ?? []));
-    spreadsheetRows.set(tab, rows);
-    return new Response(JSON.stringify({ updates: { updatedRows: body?.values?.length ?? 0 } }));
-  }
-  return new Response(JSON.stringify({}));
-});
 
 function presentationReplyText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -828,41 +782,25 @@ test.before(async () => {
   await refreshBot();
 });
 
-test("registers setup plus requested moderation and uniform commands", () => {
+test("registers only setup and blacklist commands", () => {
   const definitions = getRegisteredCommandDefinitions();
   assert.deepEqual(definitions.map((command) => command.name), [
     "setup",
     "settings",
-    "payout",
     "blacklist",
     "revoke_blacklist",
     "blacklist_lookup",
-    "create",
-    "moderated",
-    "relog",
   ]);
   const blacklist = definitions.find((command) => command.name === "blacklist");
-  const payout = definitions.find((command) => command.name === "payout");
   const revoke = definitions.find((command) => command.name === "revoke_blacklist");
-  const log = definitions.find((command) => command.name === "create");
-  const moderated = definitions.find((command) => command.name === "moderated");
-  const relog = definitions.find((command) => command.name === "relog");
+  const lookup = definitions.find((command) => command.name === "blacklist_lookup");
   assert.deepEqual(blacklist?.options?.map((option) => option.name), [
     "username",
     "type",
     "reason",
   ]);
   assert.deepEqual(revoke?.options?.map((option) => option.name), ["username"]);
-  assert.deepEqual(payout?.options, []);
-  assert.deepEqual(log?.options?.map((option) => option.name), [
-    "customer", "uniform_type", "channel", "uniform", "uniform2", "uniform_type2", "uniform3", "uniform_type3", "uniform4", "uniform_type4", "uniform5", "uniform_type5", "proof1", "proof2", "proof3", "proof4", "proof5",
-  ]);
-  assert.equal(log?.options?.filter((option) => option.required).map((option) => option.name).at(-1), "uniform");
-  assert.deepEqual(moderated?.options?.map((option) => option.name), [
-    "uploader", "publisher", "customer", "shirtid", "channel",
-  ]);
-  assert.deepEqual(relog?.options?.map((option) => option.name), ["channel", "uniform_type", "uniform"]);
-  assert.ok(relog?.options?.every((option) => option.required === true));
+  assert.deepEqual(lookup?.options?.map((option) => option.name), ["username"]);
   assert.ok(
     definitions.every((command) => command.default_member_permissions == null),
     "Discord must deliver configurable commands to the bot so runtime grants can be enforced",
@@ -874,7 +812,6 @@ test.after(() => {
   (GuildManager.prototype as unknown as { fetch: typeof originalGuildFetch }).fetch =
     originalGuildFetch;
   globalThis.fetch = originalFetch;
-  resetGoogleSheetsProxyForTests();
 });
 
 test("denies normal members and non-Administrator moderators before administrative handlers execute", async () => {
@@ -903,7 +840,7 @@ test("enforces the per-Administrator destructive-action limit", async () => {
   assert.match(replies.at(-1) ?? "", /Blacklist rate limit reached/i);
 });
 
-test("unobserved administrators cannot race destructive commands or payout ahead of gateway events", async () => {
+test("unobserved administrators cannot race destructive blacklist commands ahead of gateway events", async () => {
   await setSecurity({ recentPermissionEscalationProtection: true });
   const writes = trelloWrites.length;
   const roleCalls = roleMutationCalls;
@@ -917,19 +854,15 @@ test("unobserved administrators cannot race destructive commands or payout ahead
   assert.match(JSON.stringify(second.localReplies), /delayed for 10 minutes/);
   const observed = (await getSecurityState(guild.id)).observedAdministrators["admin-a"];
   assert.ok(Number.isFinite(Date.parse(observed!)));
-  await dispatch(command("admin-a", "payout"));
-  assert.match(replies.at(-1) ?? "", /Payout is delayed for 10 minutes/);
-  await dispatch(command("owner", "payout"));
-  assert.match(replies.at(-1) ?? "", /Payout is delayed for 10 minutes/);
   assert.equal((await getSecurityState(guild.id)).observedAdministrators["admin-a"], observed);
   assert.equal((await getSecurityState(guild.id)).destructiveActions.length, 0);
   assert.equal(trelloWrites.length, writes);
   assert.equal(roleMutationCalls, roleCalls);
 
-  await dispatch(command("admin-b", "payout"));
-  assert.match(replies.at(-1) ?? "", /Payout is delayed for 10 minutes/);
-  await dispatch(command("owner", "payout"));
-  assert.match(replies.at(-1) ?? "", /Payout is delayed for 10 minutes/);
+  await dispatch(command("admin-b", "group_blacklist", { id: "126", reason: "race" }));
+  assert.match(replies.at(-1) ?? "", /delayed for 10 minutes/);
+  await dispatch(command("owner", "group_blacklist", { id: "127", reason: "race" }));
+  assert.match(replies.at(-1) ?? "", /delayed for 10 minutes/);
   const restarted = await import(`../src/bot/security-store.ts?escalation=${Date.now()}`);
   assert.equal((await restarted.getSecurityState(guild.id)).observedAdministrators["admin-a"], observed);
 });
@@ -1027,237 +960,6 @@ test("audits an Administrator security-setting change through the setup interact
   const saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
   assert.equal(saved?.security?.confirmationsRequired, false);
   assert.ok(auditEvents.length > beforeAudits, "configuration change must emit an audit event");
-});
-
-test("navigates to Uploading configuration, seals modal fields, saves, resets, and rechecks admin permission", async () => {
-  await setSecurity({});
-  const store = await import("../src/bot/setup-store.ts");
-  const current = await store.getGuildSetup(guild.id);
-  assert.ok(current);
-  await saveGuildSetup({
-    ...current!,
-    uniforms: {
-      logChannelId: "12345678901234567",
-      moderatedChannelId: "12345678901234568",
-      authorizedRoleIds: ["moderator-role"],
-      authorizedMemberIds: ["member"],
-    },
-  });
-
-  const { root } = await openSettings("setup-owner");
-  const uniforms = await chooseSettingsCategory("setup-owner", root, "uploading");
-  const uniformPageInteraction = await chooseSettingsAction("setup-owner", uniforms, "setup:uniforms");
-  const uniformPage = latestComponentPayload(uniformPageInteraction);
-  const configure = renderedButton(uniformPage, "Uploading Configuration", "setup:");
-  const modalCount = shownModals.length;
-  await dispatchRaw(button("setup-owner", configure));
-  const shown = shownModals.at(-1);
-  assert.equal(shownModals.length, modalCount + 1);
-  assert.deepEqual(modalTextInputIds(shown!), [
-     "army_seqm_channel_id",
-     "marines_seqm_channel_id",
-     "navy_seqm_channel_id",
-    "publisher_channel_id",
-    "moderated_channel_id",
-  ]);
-
-  await dispatchRaw(modal("setup-owner", shown!.customId, {
-     army_seqm_channel_id: "12345678901234567",
-     marines_seqm_channel_id: "12345678901234568",
-     navy_seqm_channel_id: "12345678901234569",
-    publisher_channel_id: "12345678901234567",
-    moderated_channel_id: "12345678901234568",
-  }));
-  let saved = await store.getGuildSetup(guild.id);
-   assert.equal(saved?.uniforms?.armySeqmChannelId, "12345678901234567");
-   assert.equal(saved?.uniforms?.publisherChannelId, "12345678901234567");
-  assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["member"]);
-
-  const veteranConfigure = renderedButton(
-    uniformPage,
-    "Veteran SEQM Configuration",
-    "setup:",
-  );
-  await dispatchRaw(button("setup-owner", veteranConfigure));
-  const veteranModal = shownModals.at(-1)!;
-  assert.deepEqual(modalTextInputIds(veteranModal), ["veteran_seqm_channel_id"]);
-  await dispatchRaw(modal("setup-owner", veteranModal.customId, {
-    veteran_seqm_channel_id: "12345678901234570",
-  }));
-  saved = await store.getGuildSetup(guild.id);
-  assert.equal(saved?.uniforms?.veteranSeqmChannelId, "12345678901234570");
-
-  // A modal captured while the user was an administrator cannot be used after
-  // the member is demoted.
-  await dispatchRaw(button("setup-owner", configure));
-  const staleForDemotion = shownModals.at(-1)!;
-  members.set("setup-owner", { administrator: false });
-  await dispatchRaw(modal("setup-owner", staleForDemotion.customId, {
-     army_seqm_channel_id: "",
-     marines_seqm_channel_id: "",
-     navy_seqm_channel_id: "",
-    publisher_channel_id: "",
-    moderated_channel_id: "",
-  }));
-  saved = await store.getGuildSetup(guild.id);
-   assert.equal(saved?.uniforms?.armySeqmChannelId, "12345678901234567");
-  members.set("setup-owner", { administrator: true });
-
-  await dispatchRaw(modal("setup-owner", staleForDemotion.customId, {
-     army_seqm_channel_id: "",
-     marines_seqm_channel_id: "",
-     navy_seqm_channel_id: "",
-    publisher_channel_id: "",
-    moderated_channel_id: "",
-  }));
-
-  // Serialized modal field IDs are stable, while the modal itself remains
-  // nonce-bound to this settings session.
-  await dispatchRaw(modal("setup-owner", shown!.customId.replace(/[a-f0-9]{32}$/, "00000000000000000000000000000000"), {
-    seqm_review_channel_id: "",
-    publisher_channel_id: "",
-    moderated_channel_id: "",
-  }));
-  assert.match(replies.at(-1) ?? "", /expired|another administrator/i);
-
-  const resetInteraction = button("setup-owner", renderedButton(uniformPage, "Reset Uniforms", "setup:"));
-  await dispatchRaw(resetInteraction);
-  saved = await store.getGuildSetup(guild.id);
-  assert.equal(saved?.uniforms?.logChannelId, undefined);
-  assert.deepEqual(saved?.uniforms?.authorizedRoleIds, ["moderator-role"]);
-  assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["member"]);
-  const resetPayload = latestComponentPayload(resetInteraction);
-  const backToCategory = renderedButton(resetPayload, "Back to Category", "settings:back:");
-  const backInteraction = button("setup-owner", backToCategory);
-  await dispatchRaw(backInteraction);
-  assert.match(presentationReplyText(backInteraction.localReplies.at(-1)), /Uploading/);
-});
-
-test("limits legacy uniform delivery recovery to its scoped Administrator settings modal", async () => {
-  await setSecurity({});
-  const { getGuildSetup } = await import("../src/bot/setup-store.ts");
-  const { getUniformDelivery, saveUniformDelivery } = await import("../src/bot/uniform-delivery-store.ts");
-  const current = await getGuildSetup(guild.id);
-  assert.ok(current);
-  const submissionId = "1234567890123456789";
-  await saveUniformDelivery({
-    submissionId, guildId: guild.id, command: "log", actorId: "original-submitter",
-    customerId: "customer", seqmId: "seqm", destinationChannelId: "customer-channel",
-    uploadLogChannelId: "upload-log", spreadsheet: {
-      spreadsheetId: "sheet", logTab: "Uniform Logs", moderatedTab: "Moderated Logs",
-    }, rows: [["a", "b", "c", "d", "e"]], sheetState: "saved", customerName: "Customer",
-    assets: [{ id: 1, url: "https://www.roblox.com/catalog/1" }],
-    logNoticeState: "unresolved", customerDeliveryState: "pending", legacyNonceRejected: true,
-    createdAt: new Date().toISOString(),
-  });
-  const rowCount = spreadsheetRows.get("Uniform Logs")?.length;
-  const { root } = await openSettings("setup-owner");
-  const uniforms = await chooseSettingsCategory("setup-owner", root, "uploading");
-  const pageInteraction = await chooseSettingsAction("setup-owner", uniforms, "setup:uniforms");
-  const page = latestComponentPayload(pageInteraction);
-  assert.match(presentationReplyText(page), new RegExp(submissionId));
-  const recover = renderedButton(page, "Recover Delivery", "setup:");
-  await dispatchRaw(button("setup-owner", recover));
-  const shown = shownModals.at(-1)!;
-  assert.deepEqual(modalTextInputIds(shown), ["submission_id"]);
-  assert.deepEqual(modalTextInputValues(shown), [submissionId]);
-
-  await dispatchRaw(modal("admin-a", shown.customId, { submission_id: submissionId }));
-  assert.match(replies.at(-1) ?? "", /expired|another administrator/i);
-  assert.match(replies.at(-1) ?? "", new RegExp("Submission ID: `" + submissionId + "`"));
-  assert.doesNotMatch(replies.at(-1) ?? "", /Retry Delivery/);
-  assert.equal((await getUniformDelivery(submissionId))?.logNoticeState, "unresolved");
-
-  await dispatchRaw(modal("setup-owner", shown.customId, { submission_id: submissionId }));
-  const recovered = await getUniformDelivery(submissionId);
-  assert.equal(recovered?.sheetState, "saved");
-  assert.equal(recovered?.logNoticeState, "pending");
-  assert.equal(recovered?.customerDeliveryState, "pending");
-  assert.equal(recovered?.legacyNonceRejected, undefined);
-  assert.equal(spreadsheetRows.get("Uniform Logs")?.length, rowCount);
-  assert.match(replies.at(-1) ?? "", new RegExp("Submission ID: `" + submissionId + "`"));
-  assert.match(replies.at(-1) ?? "", /Retry Delivery/);
-
-  await dispatchRaw(modal("setup-owner", shown.customId, { submission_id: submissionId }));
-  assert.match(replies.at(-1) ?? "", /not eligible/i);
-  assert.equal((await getUniformDelivery(submissionId))?.logNoticeState, "pending");
-});
-
-test("configures Spreadsheet Configuration with stable nonce-bound fields and preserves uploading access", async () => {
-  await setSecurity({});
-  members.set("12345678901234570", { administrator: false });
-  const store = await import("../src/bot/setup-store.ts");
-  const current = await store.getGuildSetup(guild.id);
-  assert.ok(current);
-  await saveGuildSetup({
-    ...current!,
-    uniforms: {
-      logChannelId: "12345678901234567",
-      moderatedChannelId: "12345678901234568",
-      authorizedRoleIds: ["12345678901234569"],
-      authorizedMemberIds: ["12345678901234570"],
-    },
-  });
-
-  const { root } = await openSettings("setup-owner");
-  const uniforms = await chooseSettingsCategory("setup-owner", root, "uploading");
-  const uniformPageInteraction = await chooseSettingsAction("setup-owner", uniforms, "setup:uniforms");
-  let uniformPage = latestComponentPayload(uniformPageInteraction);
-  const configure = renderedButton(uniformPage, "Spreadsheet Configuration", "setup:");
-  assert.match(configure, /^setup:uniforms-spreadsheet-config:[a-f0-9]{32}$/);
-  await dispatchRaw(button("setup-owner", configure));
-  let shown = shownModals.at(-1)!;
-  assert.deepEqual(modalTextInputIds(shown), [
-    "spreadsheet_id",
-    "log_tab",
-    "moderated_tab",
-    "log_range",
-    "moderated_range",
-  ]);
-  assert.deepEqual(modalTextInputValues(shown), ["", "Uniform Logs", "Moderated Logs", "A2:E", "A2:D"]);
-  assert.match(shown.customId, /^setup-modal:uniforms-spreadsheet:[a-f0-9]{32}$/);
-
-  await dispatchRaw(modal("setup-owner", shown.customId, {
-    spreadsheet_id: "https://docs.google.com/spreadsheets/d/sheet-id/edit",
-    log_tab: "Uniform Logs",
-    moderated_tab: "Moderated Logs",
-    log_range: "A2:E",
-    moderated_range: "A2:D",
-  }));
-  let saved = await store.getGuildSetup(guild.id);
-  assert.equal(saved?.uniforms?.spreadsheet?.spreadsheetId, "sheet-id");
-  assert.equal(saved?.uniforms?.spreadsheet?.logRange, "A2:E");
-  assert.equal(saved?.uniforms?.spreadsheet?.moderatedRange, "A2:D");
-  assert.equal(saved?.uniforms?.logChannelId, "12345678901234567");
-  assert.deepEqual(saved?.uniforms?.authorizedRoleIds, ["12345678901234569"]);
-  assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["12345678901234570"]);
-
-  // The Discord application owner retains settings access after losing
-  // Administrator so command permissions can never become unmanageable.
-  uniformPage = latestComponentPayload(uniformPageInteraction);
-  const secondConfigure = renderedButton(uniformPage, "Spreadsheet Configuration", "setup:");
-  await dispatchRaw(button("setup-owner", secondConfigure));
-  shown = shownModals.at(-1)!;
-  members.set("setup-owner", { administrator: false });
-  await dispatchRaw(modal("setup-owner", shown.customId, {
-    spreadsheet_id: "sheet-id",
-    log_tab: "Uniform Logs",
-    moderated_tab: "Moderated Logs",
-    log_range: "A2:E",
-    moderated_range: "A2:D",
-  }));
-  assert.match(replies.at(-1) ?? "", /Spreadsheet Configuration Saved/i);
-  saved = await store.getGuildSetup(guild.id);
-  assert.equal(saved?.uniforms?.spreadsheet?.spreadsheetId, "sheet-id");
-  members.set("setup-owner", { administrator: true });
-
-  const reset = button("setup-owner", renderedButton(uniformPage, "Reset Spreadsheet", "setup:"));
-  await dispatchRaw(reset);
-  saved = await store.getGuildSetup(guild.id);
-  assert.equal(saved?.uniforms?.spreadsheet, undefined);
-  assert.equal(saved?.uniforms?.logChannelId, "12345678901234567");
-  assert.deepEqual(saved?.uniforms?.authorizedRoleIds, ["12345678901234569"]);
-  assert.deepEqual(saved?.uniforms?.authorizedMemberIds, ["12345678901234570"]);
 });
 
 test("manual lockdown stops destructive handlers without stopping authorized status commands", async () => {
@@ -1916,17 +1618,15 @@ test("rejects setup controls clicked by another administrator and expired setup 
   }
 });
 
-test("/settings traverses categories and opens nonce-bound parameter modals", async () => {
+test("/settings exposes blacklist and security setup without unrelated feature pages", async () => {
   await setSecurity({ confirmationsRequired: true });
   shownModals.splice(0);
   const expectedCategories: Record<string, string[]> = {
-    uploading: ["setup:uniforms"],
     blacklisting: [
       "setup:blacklist", "setup:trello", "settings-action:sync",
       "settings-action:group", "settings-action:note", "settings-action:identity-lookup",
     ],
     global: [
-      "setup:discord",
       "setup:permissions",
       "setup:security", "settings-action:lockdown", "settings-action:unlock",
       "setup:identity", "setup:audit",
@@ -1936,12 +1636,11 @@ test("/settings traverses categories and opens nonce-bound parameter modals", as
   };
   const rootResult = await openSettings("admin-a");
   assert.deepEqual(renderedOptions(rootResult.payload), [
-    "settings-category:uploading",
     "settings-category:blacklisting",
     "settings-category:global",
   ]);
   const globalCategory = await chooseSettingsCategory("admin-a", rootResult.root, "global");
-  assert.match(JSON.stringify(globalCategory.payload), /Payout Owner & Discord Roles/);
+  assert.doesNotMatch(JSON.stringify(globalCategory.payload), /Payout|Uniform|Uploading|Spreadsheet/i);
   for (const [categoryName, expectedOptions] of Object.entries(expectedCategories)) {
     const { payload } = await chooseSettingsCategory("admin-a", rootResult.root, categoryName);
     assert.deepEqual(
@@ -1966,7 +1665,7 @@ test("/settings traverses categories and opens nonce-bound parameter modals", as
   }
 });
 
-test("only the Discord application owner can edit per-command role and user grants", async () => {
+test("only the Discord application owner can edit blacklist role and user grants", async () => {
   await setSecurity({ confirmationsRequired: false });
   members.set("12345678901234570", { administrator: false });
 
@@ -1988,15 +1687,15 @@ test("only the Discord application owner can edit per-command role and user gran
   );
   const commandSelectId = commandComponent?.data?.custom_id ?? commandComponent?.custom_id;
   assert.ok(commandSelectId);
-  const payoutOption = (commandComponent?.data?.options ?? commandComponent?.options ?? [])
+  const blacklistOption = (commandComponent?.data?.options ?? commandComponent?.options ?? [])
     .map((option) => option.value ?? option.data?.value)
-    .find((value) => value?.replace(/:[a-f0-9]{32}$/, "") === "setup:permissions-command:payout");
-  assert.ok(payoutOption);
-  const payoutPageInteraction = select("setup-owner", commandSelectId, [payoutOption]);
-  await dispatchRaw(payoutPageInteraction);
-  const payoutPage = latestComponentPayload(payoutPageInteraction);
+    .find((value) => value?.replace(/:[a-f0-9]{32}$/, "") === "setup:permissions-command:blacklist");
+  assert.ok(blacklistOption);
+  const blacklistPageInteraction = select("setup-owner", commandSelectId, [blacklistOption]);
+  await dispatchRaw(blacklistPageInteraction);
+  const blacklistPage = latestComponentPayload(blacklistPageInteraction);
   const permissionComponentId = (prefix: string) => {
-    const component = componentRows(payoutPage).find((item) =>
+    const component = componentRows(blacklistPage).find((item) =>
       (item.data?.custom_id ?? item.custom_id)?.startsWith(prefix),
     );
     const id = component?.data?.custom_id ?? component?.custom_id;
@@ -2006,19 +1705,19 @@ test("only the Discord application owner can edit per-command role and user gran
   await dispatchRaw(nativeSelect(
     "role",
     "setup-owner",
-    permissionComponentId("setup:permissions-roles:payout:"),
+    permissionComponentId("setup:permissions-roles:blacklist:"),
     ["12345678901234569"],
   ));
   await dispatchRaw(nativeSelect(
     "user",
     "setup-owner",
-    permissionComponentId("setup:permissions-users:payout:"),
+    permissionComponentId("setup:permissions-users:blacklist:"),
     ["12345678901234570"],
   ));
 
   const saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
-  assert.deepEqual(saved?.commandPermissions?.payout?.roleIds, ["12345678901234569"]);
-  assert.deepEqual(saved?.commandPermissions?.payout?.memberIds, ["12345678901234570"]);
+  assert.deepEqual(saved?.commandPermissions?.blacklist?.roleIds, ["12345678901234569"]);
+  assert.deepEqual(saved?.commandPermissions?.blacklist?.memberIds, ["12345678901234570"]);
   applicationOwner = { id: "setup-owner" };
   members.set("setup-owner", { administrator: true });
 });
@@ -2055,7 +1754,7 @@ test("commands default to Administrator-only and grants never leak across comman
   assert.ok(granted);
   assert.equal(await canUseRegisteredCommand(ungranted, granted!, "blacklist"), true);
   assert.equal(await canUseRegisteredCommand(ungranted, granted!, "revoke_blacklist"), false);
-  assert.equal(await canUseRegisteredCommand(ungranted, granted!, "payout"), false);
+  assert.equal(await canUseRegisteredCommand(ungranted, granted!, "revoke_blacklist"), false);
   assert.equal(
     await canUseRegisteredCommand(command("12345678901234572", "blacklist", {}), granted!, "blacklist"),
     true,
@@ -2264,7 +1963,7 @@ test("/settings restricts the maintenance menu while allowing emergency status",
   await setMaintenance(false, "admin-a", "restriction test complete");
 });
 
-test("/settings performs first-time setup with native audit and Quartermaster selectors", async () => {
+test("/settings performs first-time blacklist setup with the required audit channel", async () => {
   applicationOwner = { id: "owner" };
   await writeFile(config.setupFile, JSON.stringify({ guilds: [] }), "utf8");
   await mutateSecurityState(guild.id, (state) => {
@@ -2288,76 +1987,15 @@ test("/settings performs first-time setup with native audit and Quartermaster se
   assertDiscordComponentLimits(initial);
   const audit = nativeSelect("channel", "owner", customId(initial, "settings:initial-audit:"), ["12345678901234567"]);
   await dispatchRaw(audit);
-  const senior = nativeSelect("role", "owner", customId(latestComponentPayload(audit), "settings:initial-senior-quartermaster:"), ["senior-quartermaster-role"]);
-  await dispatchRaw(senior);
-  const quartermaster = nativeSelect("role", "owner", customId(latestComponentPayload(senior), "settings:initial-quartermaster:"), ["quartermaster-role"]);
-  await dispatchRaw(quartermaster);
-  const securityOwner = nativeSelect("user", "owner", customId(latestComponentPayload(quartermaster), "settings:initial-security-owner:"), ["admin-a"]);
-  await dispatchRaw(securityOwner);
-  const save = button("owner", renderedButton(
-    latestComponentPayload(securityOwner),
-    "Save Core Setup",
-  ));
+  const save = button("owner", renderedButton(latestComponentPayload(audit), "Save Setup"));
   await dispatchRaw(save);
   const persisted = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
   assert.equal(persisted?.auditChannelId, "12345678901234567");
-  assert.equal(persisted?.seniorQuartermasterRoleId, "senior-quartermaster-role");
-  assert.equal(persisted?.quartermasterRoleId, "quartermaster-role");
-  assert.equal(persisted?.securityOwnerId, "admin-a");
+  assert.equal(persisted?.seniorQuartermasterRoleId, undefined);
+  assert.equal(persisted?.quartermasterRoleId, undefined);
+  assert.equal(persisted?.securityOwnerId, undefined);
   assert.equal("presence" in (persisted ?? {}), false);
   applicationOwner = { id: "setup-owner" };
-});
-
-test("upload role policy edits remain application-owner-only and preserve named role separation", async () => {
-  await setSecurity({});
-  await mutateSecurityState(guild.id, (state) => {
-    state.maintenance = {
-      active: false, reason: "", startedAt: null, startedBy: null,
-      revision: state.maintenance.revision + 1,
-    };
-  });
-  const adminRoot = await openSettings("admin-a");
-  const adminGlobal = await chooseSettingsCategory("admin-a", adminRoot.root, "global");
-  const adminPolicy = await chooseSettingsAction("admin-a", adminGlobal, "setup:discord");
-  const adminPayload = latestComponentPayload(adminPolicy);
-  const adminSeniorId = componentRows(adminPayload).find((item) =>
-    (item.data?.custom_id ?? item.custom_id)?.startsWith("setup:discord-senior-quartermaster:"),
-  )?.data?.custom_id;
-  assert.ok(adminSeniorId);
-  await dispatchRaw(nativeSelect("role", "admin-a", adminSeniorId, ["forbidden-senior-role"]));
-  let saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
-  assert.notEqual(saved?.seniorQuartermasterRoleId, "forbidden-senior-role");
-  assert.match(replies.at(-1) ?? "", /Discord application owner/i);
-
-  const { root } = await openSettings("setup-owner");
-  const global = await chooseSettingsCategory("setup-owner", root, "global");
-  const policy = await chooseSettingsAction("setup-owner", global, "setup:discord");
-  const permissionPayload = latestComponentPayload(policy);
-  const selectorId = (prefix: string) => {
-    const component = componentRows(permissionPayload).find((item) =>
-      (item.data?.custom_id ?? item.custom_id)?.startsWith(prefix),
-    );
-    const id = component?.data?.custom_id ?? component?.custom_id;
-    assert.ok(id, `expected ${prefix} role selector`);
-    return id;
-  };
-  const senior = nativeSelect(
-    "role", "setup-owner", selectorId("setup:discord-senior-quartermaster:"), ["senior-role-updated"],
-  );
-  await dispatchRaw(senior);
-  assert.equal(senior.localReplies.length, 1, `role selector did not respond: ${JSON.stringify(senior.localReplies)}`);
-  saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
-  assert.equal(saved?.seniorQuartermasterRoleId, "senior-role-updated");
-  assert.notEqual(saved?.moderatorRoleId, "senior-role-updated");
-
-  // A copied native selector ID still carries the session owner/message guard.
-  const copied = nativeSelect(
-    "role", "moderator", selectorId("setup:discord-quartermaster:"), ["forbidden-quartermaster"],
-  );
-  await dispatchRaw(copied);
-  saved = await (await import("../src/bot/setup-store.ts")).getGuildSetup(guild.id);
-  assert.notEqual(saved?.quartermasterRoleId, "forbidden-quartermaster");
-  assert.match(replies.at(-1) ?? "", /settings session|administrator/i);
 });
 
 test("Trello mapping edits and resets retain the independently selected board", async () => {

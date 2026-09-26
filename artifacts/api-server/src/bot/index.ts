@@ -91,7 +91,6 @@ import {
   securitySettingsFor,
   auditSettingsFor,
   trelloMappingsFor,
-  uniformSettingsFor,
   commandPermissionFor,
   commandPermissionNames,
   commandPermissionName,
@@ -124,44 +123,6 @@ import {
   safePresentationText,
   titleCaseHeading,
 } from "./presentation";
-import {
-  handleUniformCommand,
-  handleUniformAssistanceModal,
-  handleUniformCancelButton,
-  handleUniformCustomerButton,
-  handleUniformSettingsComponent,
-  handleUniformSettingsModal,
-  handleUniformRecoveryModal,
-  handleUniformRelogCommand,
-  handleUniformRelogSelection,
-  handleUniformRelogPublishingButton,
-  handleUniformRelogPublishingModal,
-  handleUniformPublishingButton,
-  handleUniformPublishingModerationSelect,
-  handleUniformPublishingModal,
-  handleUniformSpreadsheetSettingsModal,
-  handleUniformSubmitButton,
-  handleUniformRetryButton,
-  handleUniformUserSelection,
-  recoverPendingUniformReviews,
-  UniformDeliveryRecoveryError,
-  UniformNotificationError,
-  renderUniformSettings,
-  uniformDeliveryRecoveryResponse,
-  uniformCommandNames,
-  uniformRelogCommandName,
-  uniformCommands,
-} from "./uniforms";
-import { normalizeUniformSpreadsheetConfig, withPayoutAwareUniformActivity } from "./google-sheets";
-import {
-  archivePayoutPreview,
-  acknowledgeUncertainPayoutReport,
-  confirmArchivedPayout,
-  googlePayoutSheetsClient,
-  readPayoutSnapshot,
-  recoverUnknownPayoutClear,
-} from "./payout";
-import { activePayoutRunForGuild, getPayoutRun, payoutLockForWorkbook, type PayoutRun } from "./payout-store";
 
 const setupCommand = new SlashCommandBuilder()
   .setName("setup")
@@ -169,11 +130,7 @@ const setupCommand = new SlashCommandBuilder()
 
 const settingsCommand = new SlashCommandBuilder()
   .setName("settings")
-  .setDescription("Quartermaster administration, setup, security, and records.");
-
-const payoutCommand = new SlashCommandBuilder()
-  .setName("payout")
-  .setDescription("Preview and confirm the current uniform payout reset.");
+  .setDescription("Blacklist setup, permissions, security, audit, and records.");
 
 const moderationCommands = [
   new SlashCommandBuilder()
@@ -220,11 +177,10 @@ const moderationCommands = [
 // These recovery controls must remain reachable before first-time setup. In
 // particular, maintenance must never make a partially configured guild stuck.
 const setupOnlyCommands = [setupCommand, settingsCommand].map((command) => command.toJSON());
-const enabledCommands = [setupCommand, settingsCommand, payoutCommand, ...moderationCommands].map((command) =>
+const enabledCommands = [setupCommand, settingsCommand, ...moderationCommands].map((command) =>
   command.toJSON(),
 );
-const enabledUniformCommands = uniformCommands.map((command) => command.toJSON());
-const allEnabledCommands = [...enabledCommands, ...enabledUniformCommands];
+const allEnabledCommands = enabledCommands;
 
 /** Snapshot of the exact command contract sent to Discord. */
 export function getRegisteredCommandDefinitions() {
@@ -290,7 +246,7 @@ function persistRecoveryState(): void {
     logger.error({ err: error }, "Could not persist bot recovery state");
   });
 }
-type SettingsCategory = "uploading" | "blacklisting" | "global";
+type SettingsCategory = "blacklisting" | "global";
 
 type SettingsLocation =
   | { kind: "root" }
@@ -311,9 +267,6 @@ interface SetupSession {
   /** Unsaved, server-native first-time setup selections. */
   initialSetup?: {
     auditChannelId?: string;
-    seniorQuartermasterRoleId?: string;
-    quartermasterRoleId?: string;
-    securityOwnerId?: string;
   };
 }
 const setupSessions = new Map<string, SetupSession>();
@@ -359,18 +312,6 @@ const maintenanceConfirmations = new Map<string, {
   original: ChatInputCommandInteraction | ModalSubmitInteraction;
   claimed?: boolean;
 }>();
-interface PayoutConfirmation {
-  userId: string;
-  guildId: string;
-  runId: string;
-  expiresAt: number;
-  original: ChatInputCommandInteraction;
-  messageId?: string;
-  claimed?: boolean;
-  mode?: "confirm" | "resume" | "acknowledge" | "recover-clear";
-}
-const payoutConfirmations = new Map<string, PayoutConfirmation>();
-
 const destructiveCommands = new Set(["blacklist", "group_blacklist", "revoke_blacklist"]);
 const blacklistAccessCommands = new Set([...destructiveCommands, "blacklist_lookup"]);
 const ownerOnlySecurityControls = new Set([
@@ -382,7 +323,6 @@ const ownerOnlySecurityControls = new Set([
   "setup-modal:threshold",
   "setup-modal:protected-users",
   "setup-modal:protected-roles",
-  "setup:security-owner",
 ]);
 const setupSessionLifetimeMs = 10 * 60_000;
 
@@ -546,8 +486,8 @@ export async function canUseModerationCommands(
 /**
  * Command entry authorization. Administrators and the server owner are always
  * accepted; the public lookup is deliberately not represented in persisted
- * grants. Legacy blacklist/uniform lists are consulted only when a command
- * has no explicit new-model entry, preserving old configured access while
+ * grants. Legacy blacklist access is consulted only when a command
+ * has no explicit new-model entry, preserving legacy configured access while
  * allowing an owner to intentionally clear a command independently.
  */
 export async function canUseRegisteredCommand(
@@ -645,47 +585,6 @@ async function currentAdministrator(guild: Guild, userId: string): Promise<boole
   const member = await guild.members.fetch({ user: userId, force: true });
   return guild.ownerId === member.id ||
     member.permissions.has(PermissionFlagsBits.Administrator);
-}
-
-async function requireServerOwner(
-  guild: Guild,
-  userId: string,
-  setup?: GuildSetup,
-  command?: string,
-): Promise<void> {
-  if (guild.ownerId === userId) return;
-  if (setup) {
-    await auditBestEffort(guild, setup, {
-      action: "Server-owner-only command denied",
-      status: "failed",
-      actorId: userId,
-      fields: command ? [{ name: "Command", value: command }] : [],
-    });
-  }
-  throw new Error("Only the Discord server owner may use this command.");
-}
-
-async function requireConfiguredSecurityOwner(
-  guild: Guild,
-  userId: string,
-  setup: GuildSetup,
-  command?: string,
-): Promise<void> {
-  if (
-    (setup.securityOwnerId && setup.securityOwnerId === userId) ||
-    (!setup.securityOwnerId && guild.ownerId === userId)
-  ) return;
-  await auditBestEffort(guild, setup, {
-    action: "Configured security owner authorization denied",
-    status: "failed",
-    actorId: userId,
-    fields: command ? [{ name: "Command", value: command }] : [],
-  });
-  throw new Error(
-    setup.securityOwnerId
-      ? "Only the configured Security / Payout Owner may use this command."
-      : "Select a Security / Payout Owner in setup before using this command.",
-  );
 }
 
 async function requireCurrentAdministrator(
@@ -1084,9 +983,8 @@ const settingsCategories: Array<{
   label: string;
   description: string;
 }> = [
-  { id: "uploading", label: "Uploading", description: "Uniform destinations, spreadsheets, and submitter access" },
   { id: "blacklisting", label: "Blacklisting", description: "Blacklist rules, records, Trello, and identity lookup" },
-  { id: "global", label: "Global", description: "Payout owner, security, audit, and essential bot controls" },
+  { id: "global", label: "Security & Setup", description: "Permissions, security, audit, and bot controls" },
 ];
 
 type SettingsOption = {
@@ -1125,7 +1023,7 @@ function settingsCategoryOptions(
   if (!configured) {
     if (category === "global") {
       return [
-        { label: "Complete First-time Setup", value: "settings-action:initial-audit", description: "Select required audit and Quartermaster roles" },
+        { label: "Complete First-time Setup", value: "settings-action:initial-audit", description: "Select the required audit channel" },
         { label: "System Status", value: "settings-action:status", description: "View setup and command registration status" },
         { label: "Security Lockdown", value: "settings-action:lockdown", description: "Immediately stop destructive actions" },
         { label: "Security Unlock", value: "settings-action:unlock", description: "Unlock after confirmation" },
@@ -1137,10 +1035,6 @@ function settingsCategoryOptions(
   }
 
   switch (category) {
-    case "uploading":
-      return [
-        { label: "Uniform Uploading", value: "setup:uniforms", description: "Channels, spreadsheet, recovery, and submitter access" },
-      ];
     case "blacklisting":
       return [
         { label: "Blacklist Rules", value: "setup:blacklist", description: "Discord role and Trello list mappings" },
@@ -1152,8 +1046,7 @@ function settingsCategoryOptions(
       ];
     case "global":
       return [
-        { label: "Payout Owner & Discord Roles", value: "setup:discord", description: "Set the payout owner and named Quartermaster roles" },
-        { label: "Permissions", value: "setup:permissions", description: "Configure narrowly-scoped uploading and blacklist access grants" },
+        { label: "Permissions", value: "setup:permissions", description: "Configure settings and blacklist access grants" },
         { label: "Security Configuration", value: "setup:security", description: "Limits, protections, and confirmations" },
         { label: "Security Lockdown", value: "settings-action:lockdown", description: "Immediately stop destructive actions" },
         { label: "Security Unlock", value: "settings-action:unlock", description: "Unlock after confirmation" },
@@ -1180,14 +1073,13 @@ function settingsMenu(
   const categories = settingsRootCategories(configured, maintenance);
   return {
     embeds: [brandedEmbed(
-      maintenance ? "EMERGENCY SETTINGS" : "QUARTERMASTER SETTINGS",
+      maintenance ? "EMERGENCY SETTINGS" : "BLACKLIST BOT SETTINGS",
       maintenance
         ? "Maintenance is active. Choose an emergency category. Normal configuration and moderation controls are hidden and remain unavailable."
         : configured
-          ? `**Core setup: ${setup?.auditChannelId && setup?.seniorQuartermasterRoleId && setup?.quartermasterRoleId && setup?.securityOwnerId ? "complete" : "incomplete—review Payout Owner & Discord Roles"}**\n` +
-            `**Optional locations: ${setup?.uniforms?.spreadsheet ? "spreadsheet configured" : "spreadsheet not configured"}; ${setup?.uniforms?.logChannelId || setup?.uniforms?.moderatedChannelId ? "uniform channel configured" : "uniform channels not configured"}**\n\n` +
-            "Choose a category to manage Quartermaster. Controls are private, expire after 10 minutes, and re-check your current Administrator, server-owner, or application-owner/granted command access. **Uploading** contains uniform channels, spreadsheet, and recovery. **Blacklisting** contains blacklist rules, Trello monitoring, records, and identity lookup. **Global** contains the payout owner, security, audit, maintenance, and per-command Permissions."
-          : "Initial setup is required. Open Global to select the audit channel, Senior Quartermaster, Quartermaster, and Security / Payout Owner. Emergency status and security controls remain available.",
+          ? `**Setup: ${setup?.auditChannelId ? "complete" : "incomplete—select the audit channel"}**\n\n` +
+            "Choose a category to manage the blacklist bot. Controls are private, expire after 10 minutes, and re-check your current Administrator, server-owner, or application-owner/granted command access. **Blacklisting** contains blacklist rules, Trello monitoring, records, and identity lookup. **Security & Setup** contains permissions, security, audit, and maintenance."
+          : "Initial setup is required. Open Security & Setup to select an audit channel. Emergency status and security controls remain available.",
     )],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
       new StringSelectMenuBuilder()
@@ -1217,34 +1109,19 @@ function selectedSettingsValue(interaction: SettingsSelectInteraction): string {
 
 function initialSetupPanel(session: SetupSession): {
   embeds: EmbedBuilder[];
-  components: Array<
-    | ActionRowBuilder<ChannelSelectMenuBuilder>
-    | ActionRowBuilder<RoleSelectMenuBuilder>
-    | ActionRowBuilder<UserSelectMenuBuilder>
-    | ActionRowBuilder<ButtonBuilder>
-  >;
+  components: Array<ActionRowBuilder<ChannelSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>>;
 } {
   const selected = session.initialSetup ?? {};
-  const ready = Boolean(
-    selected.auditChannelId &&
-    selected.seniorQuartermasterRoleId &&
-    selected.quartermasterRoleId &&
-    selected.securityOwnerId,
-  );
-  const status = (value: string | undefined, prefix: "#" | "@&" | "@") =>
-    value ? `<${prefix}${value}> — selected` : "Required — not selected";
+  const ready = Boolean(selected.auditChannelId);
+  const status = (value: string | undefined) =>
+    value ? `<#${value}> — selected` : "Required — not selected";
   return {
     embeds: [brandedEmbed(
-      "Complete Quartermaster Setup",
-      "Select the required server resources, then save. Each selector is limited to this server. " +
-      "Senior Quartermaster and Quartermaster roles authorize **uniform logging only**; " +
-      "Discord Administrator permission remains required for settings, payouts, and blacklists.",
+      "Complete Blacklist Bot Setup",
+      "Select the audit text channel, then save. Current Discord Administrator permission remains required for settings and server administration unless a blacklist command grant is configured.",
     ).addFields(
-      { name: "Audit Channel", value: status(selected.auditChannelId, "#"), inline: true },
-      { name: "Senior Quartermaster", value: status(selected.seniorQuartermasterRoleId, "@&"), inline: true },
-      { name: "Quartermaster", value: status(selected.quartermasterRoleId, "@&"), inline: true },
-      { name: "Security / Payout Owner", value: status(selected.securityOwnerId, "@"), inline: true },
-      { name: "Next step", value: ready ? "All required selections are ready. Choose **Save Core Setup**." : "Choose all four required selections before saving." },
+      { name: "Audit Channel", value: status(selected.auditChannelId), inline: true },
+      { name: "Next step", value: ready ? "The required selection is ready. Choose **Save Setup**." : "Choose an audit text channel before saving." },
     )],
     components: [
       new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(
@@ -1255,97 +1132,16 @@ function initialSetupPanel(session: SetupSession): {
           .setMinValues(1)
           .setMaxValues(1),
       ),
-      new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
-        new RoleSelectMenuBuilder()
-          .setCustomId(`settings:initial-senior-quartermaster:${session.nonce}`)
-          .setPlaceholder("Select the Senior Quartermaster role")
-          .setMinValues(1)
-          .setMaxValues(1),
-      ),
-      new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
-        new RoleSelectMenuBuilder()
-          .setCustomId(`settings:initial-quartermaster:${session.nonce}`)
-          .setPlaceholder("Select the Quartermaster role")
-          .setMinValues(1)
-          .setMaxValues(1),
-      ),
-      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
-        new UserSelectMenuBuilder()
-          .setCustomId(`settings:initial-security-owner:${session.nonce}`)
-          .setPlaceholder("Select the security and payout owner")
-          .setMinValues(1)
-          .setMaxValues(1),
-      ),
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId(`settings:initial-save:${session.nonce}`)
-          .setLabel("Save Core Setup")
+          .setLabel("Save Setup")
           .setStyle(ButtonStyle.Success)
           .setDisabled(!ready),
         new ButtonBuilder()
           .setCustomId(`settings:back:root:${session.nonce}`)
           .setLabel("Back to Categories")
           .setStyle(ButtonStyle.Secondary),
-      ),
-    ],
-  };
-}
-
-function discordRolePanel(setup: GuildSetup, nonce: string): {
-  embeds: EmbedBuilder[];
-  components: Array<
-    | ActionRowBuilder<RoleSelectMenuBuilder>
-    | ActionRowBuilder<UserSelectMenuBuilder>
-    | ActionRowBuilder<ButtonBuilder>
-  >;
-} {
-  const role = (id: string | undefined) => id ? `<@&${id}>` : "Not configured";
-  const member = (id: string | undefined) => id ? `<@${id}>` : "Not configured";
-  return {
-    embeds: [outcomeEmbed(
-      "Payout Owner & Discord Roles",
-      "The Security / Payout Owner is the only configured member allowed to run payouts or change destructive-action security limits, and only the Discord server owner can replace that member. " +
-      "The named Quartermaster roles are persistent, narrowly scoped uniform submitter access. " +
-      "They do not grant Discord Administrator access, settings access, payout access, or blacklist privileges. " +
-      "The moderator-role record remains separate and also does not replace current Discord Administrator checks. " +
-      "Choose a replacement role to save it immediately.",
-      "info",
-      [
-        { name: "Moderation role record", value: role(setup.moderatorRoleId === setup.guildId ? undefined : setup.moderatorRoleId), inline: true },
-        { name: "Senior Quartermaster", value: role(setup.seniorQuartermasterRoleId), inline: true },
-        { name: "Quartermaster", value: role(setup.quartermasterRoleId), inline: true },
-        { name: "Security / Payout Owner", value: member(setup.securityOwnerId), inline: true },
-        { name: "Administrative authorization", value: "Current Discord Administrator or server owner only" },
-      ],
-    )],
-    components: [
-      new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
-        new RoleSelectMenuBuilder()
-          .setCustomId(`setup:discord-moderator:${nonce}`)
-          .setPlaceholder("Select recorded moderator role")
-          .setMinValues(1)
-          .setMaxValues(1),
-      ),
-      new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
-        new RoleSelectMenuBuilder()
-          .setCustomId(`setup:discord-senior-quartermaster:${nonce}`)
-          .setPlaceholder("Select Senior Quartermaster role")
-          .setMinValues(1)
-          .setMaxValues(1),
-      ),
-      new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(
-        new RoleSelectMenuBuilder()
-          .setCustomId(`setup:discord-quartermaster:${nonce}`)
-          .setPlaceholder("Select Quartermaster role")
-          .setMinValues(1)
-          .setMaxValues(1),
-      ),
-      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
-        new UserSelectMenuBuilder()
-          .setCustomId(`setup:security-owner:${nonce}`)
-          .setPlaceholder("Select Security / Payout Owner")
-          .setMinValues(1)
-          .setMaxValues(1),
       ),
     ],
   };
@@ -1611,9 +1407,7 @@ function setupMenu(nonce: string): {
     ["trello", "Trello Settings"],
     ["security", "Security Settings"],
     ["audit", "Audit Settings"],
-    ["discord", "Discord Settings"],
     ["identity", "Identity / Alt Detection"],
-    ["uniforms", "Uniform Uploading"],
     ["bot-state", "Bot State"],
     ["view", "View Configuration"],
   ] as const;
@@ -1846,17 +1640,8 @@ function settingsCategoryForAction(id: string): SettingsCategory | undefined {
     id === "settings-action:lockdown" ||
     id === "settings-action:unlock"
   ) return "global";
-  if (id === "setup:audit" || id === "setup:discord") return "global";
+  if (id === "setup:audit") return "global";
   if (id === "setup:permissions") return "global";
-  if (
-    id === "setup:uniforms" ||
-    id === "setup:uniforms-config" ||
-    id === "setup:uniforms-veteran-config" ||
-    id === "setup:uniforms-reset" ||
-    id === "setup:uniforms-spreadsheet-config" ||
-    id === "setup:uniforms-spreadsheet-reset" ||
-    id === "setup:uniforms-recover"
-  ) return "uploading";
   if (
     id === "setup:bot-state" ||
     id === "setup:view" ||
@@ -1999,7 +1784,7 @@ async function handleSettingsComponent(
     return;
   }
   if (id === "settings-action:initial-audit") {
-    if (setup) throw new Error("Setup is already complete. Use Discord Identity & Uniform Roles to update role assignments.");
+    if (setup) throw new Error("Setup is already complete. Use the settings pages to update configuration.");
     session.initialSetup ??= {};
     await interaction.update(initialSetupPanel(session));
     return;
@@ -2020,52 +1805,14 @@ async function handleSettingsComponent(
       await interaction.update(initialSetupPanel(session));
       return;
     }
-    if (id === "settings:initial-senior-quartermaster" || id === "settings:initial-quartermaster") {
-      await requireDiscordApplicationOwner(interaction.guild!, interaction.user.id);
-      const roleId = selectedSettingsValue(interaction as SettingsSelectInteraction);
-      const role = await interaction.guild!.roles.fetch(roleId);
-      if (!role) throw new Error("The selected role does not exist in this server.");
-      validateModeratorRole(interaction.guild!, role);
-      if (id === "settings:initial-senior-quartermaster") {
-        session.initialSetup.seniorQuartermasterRoleId = roleId;
-      } else {
-        session.initialSetup.quartermasterRoleId = roleId;
-      }
-      await interaction.update(initialSetupPanel(session));
-      return;
-    }
-    if (id === "settings:initial-security-owner") {
-      await requireServerOwner(interaction.guild!, interaction.user.id, undefined, id);
-      const ownerId = selectedSettingsValue(interaction as SettingsSelectInteraction);
-      const owner = await interaction.guild!.members.fetch({ user: ownerId, force: true });
-      if (
-        owner.id !== interaction.guild!.ownerId &&
-        !owner.permissions.has(PermissionFlagsBits.Administrator)
-      ) {
-        throw new Error("The selected Security / Payout Owner must be the server owner or a current Administrator.");
-      }
-      session.initialSetup.securityOwnerId = ownerId;
-      await interaction.update(initialSetupPanel(session));
-      return;
-    }
     if (id === "settings:initial-save") {
       const selected = session.initialSetup;
-      if (
-        !selected.auditChannelId ||
-        !selected.seniorQuartermasterRoleId ||
-        !selected.quartermasterRoleId ||
-        !selected.securityOwnerId
-      ) {
-        throw new Error("Select an audit channel, Senior Quartermaster role, Quartermaster role, and Security / Payout Owner before saving.");
-      }
+      if (!selected.auditChannelId) throw new Error("Select an audit channel before saving.");
       const initial: GuildSetup = {
         guildId: interaction.guild!.id,
         // Kept for compatibility with older records; it grants no authorization.
         moderatorRoleId: interaction.guild!.id,
         auditChannelId: selected.auditChannelId,
-        seniorQuartermasterRoleId: selected.seniorQuartermasterRoleId,
-        quartermasterRoleId: selected.quartermasterRoleId,
-        securityOwnerId: selected.securityOwnerId,
         security: defaultSecuritySettings(),
         monitoring: defaultMonitoringSettings(),
         trello: defaultTrelloMappings(),
@@ -2080,8 +1827,6 @@ async function handleSettingsComponent(
         action: "Bot setup completed", status: "success", actorId: interaction.user.id,
         fields: [
           { name: "Audit channel", value: `<#${initial.auditChannelId}>` },
-          { name: "Senior Quartermaster", value: `<@&${initial.seniorQuartermasterRoleId}>` },
-          { name: "Quartermaster", value: `<@&${initial.quartermasterRoleId}>` },
         ],
       });
       await registerGuildCommands(interaction.guild!, true);
@@ -2090,7 +1835,7 @@ async function handleSettingsComponent(
       guildSetupComplete = true;
       setRecoveryStatus("successful");
       await interaction.update(responseWithEmbed(
-        "Core setup is saved. Open /settings to configure Trello, blacklist mappings, audit destinations, and uniform spreadsheet settings.",
+        "Setup is saved. Open /settings to configure Trello, blacklist mappings, security, and audit settings.",
         "Setup Complete",
         "success",
       ));
@@ -2247,7 +1992,6 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
       },
     });
   }
-  const componentId = interaction.customId.replace(/:([a-f0-9]{32})$/, "");
   const rawId = interaction.isStringSelectMenu() ? interaction.values[0]! : interaction.customId;
   const id = rawId.replace(/:([a-f0-9]{32})$/, "");
   if (
@@ -2256,20 +2000,12 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
     id.startsWith("setup:permissions-roles:") ||
     id.startsWith("setup:permissions-users:") ||
     id.startsWith("setup:permissions-clear-roles:") ||
-    id.startsWith("setup:permissions-clear-users:") ||
-    id === "setup:permissions-senior-quartermaster" ||
-    id === "setup:permissions-quartermaster" ||
-    id === "setup:discord-senior-quartermaster" ||
-    id === "setup:discord-quartermaster"
+    id.startsWith("setup:permissions-clear-users:")
   ) {
     await requireDiscordApplicationOwner(guild, interaction.user.id);
   }
   if (ownerOnlySecurityControls.has(id)) {
-    if (id === "setup:security-owner") {
-      await requireServerOwner(guild, interaction.user.id, setup, id);
-    } else {
-      await requireConfiguredSecurityOwner(guild, interaction.user.id, setup, id);
-    }
+    await requireCurrentAdministrator(guild, interaction.user.id, setup, id);
   }
   const nonce = rawId.match(/:([a-f0-9]{32})$/)?.[1];
   if (nonce && activeSession?.nonce !== nonce) {
@@ -2278,7 +2014,7 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
   if (activeSession?.nonceRequired && id.startsWith("setup:")) {
     const pageIds = new Set([
       "setup:blacklist", "setup:trello", "setup:security", "setup:lockdown",
-      "setup:audit", "setup:discord", "setup:permissions", "setup:identity", "setup:uniforms", "setup:bot-state", "setup:view",
+      "setup:audit", "setup:permissions", "setup:identity", "setup:bot-state", "setup:view",
     ]);
     if (pageIds.has(id)) {
       const current = settingsNavigation(activeSession).at(-1);
@@ -2345,10 +2081,6 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
     });
     return;
   }
-  if (id === "setup:uniforms") {
-    await renderUniformSettings(interaction as ButtonInteraction, setup, botAvatarUrl());
-    return;
-  }
   if (id === "setup:permissions") {
     await interaction.update(permissionsPanel(setup, activeSession?.nonce ?? nonce ?? ""));
     return;
@@ -2362,8 +2094,8 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
     await interaction.update(permissionsCommandPanel(setup, activeSession?.nonce ?? nonce ?? "", selected));
     return;
   }
-  const permissionAction = /^(?:setup:permissions-(roles|users|clear-roles|clear-users)):(settings|payout|blacklist|revoke_blacklist|log|moderated|relog)$/.exec(id);
-  if (permissionAction) {
+  const permissionAction = /^(?:setup:permissions-(roles|users|clear-roles|clear-users)):(.+)$/.exec(id);
+  if (permissionAction && (commandPermissionNames as readonly string[]).includes(permissionAction[2]!)) {
     const kind = permissionAction[1]!;
     const command = permissionAction[2] as CommandPermissionName;
     const current = commandPermissionFor(setup, command);
@@ -2385,103 +2117,6 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
     if (!interaction.isUserSelectMenu()) throw new Error("Choose users with the server user selector.");
     const updated = await saveCommandPermission(guild, setup, interaction.user.id, command, current.roleIds, [...interaction.values]);
     await interaction.update(permissionsCommandPanel(updated, activeSession?.nonce ?? nonce ?? "", command));
-    return;
-  }
-  if (id === "setup:permissions-senior-quartermaster" || id === "setup:permissions-quartermaster") {
-    if (!interaction.isRoleSelectMenu()) {
-      throw new Error("Choose the uploading role with the server role selector.");
-    }
-    const roleId = selectedSettingsValue(interaction);
-    const role = await guild.roles.fetch(roleId);
-    if (!role) throw new Error("The selected role does not exist in this server.");
-    validateModeratorRole(guild, role);
-    const key = id === "setup:permissions-senior-quartermaster"
-      ? "seniorQuartermasterRoleId"
-      : "quartermasterRoleId";
-    const updated = await saveSetupChange(
-      guild,
-      { ...setup, [key]: roleId },
-      interaction.user.id,
-      key === "seniorQuartermasterRoleId"
-        ? "Senior Quartermaster uniform role"
-        : "Quartermaster uniform role",
-      setup[key] ?? "Not configured",
-      roleId,
-    );
-    await interaction.update(permissionsPanel(updated, activeSession?.nonce ?? nonce ?? ""));
-    return;
-  }
-  if (id === "setup:discord") {
-    await interaction.update(discordRolePanel(setup, activeSession?.nonce ?? nonce ?? ""));
-    return;
-  }
-  if (
-    id === "setup:discord-moderator" ||
-    id === "setup:discord-senior-quartermaster" ||
-    id === "setup:discord-quartermaster"
-  ) {
-    if (!interaction.isRoleSelectMenu()) {
-      throw new Error("Choose the Quartermaster role with the server role selector.");
-    }
-    const roleId = selectedSettingsValue(interaction);
-    const role = await guild.roles.fetch(roleId);
-    if (!role) throw new Error("The selected role does not exist in this server.");
-    validateModeratorRole(guild, role);
-    const key = id === "setup:discord-moderator"
-      ? "moderatorRoleId"
-      : id === "setup:discord-senior-quartermaster"
-        ? "seniorQuartermasterRoleId"
-        : "quartermasterRoleId";
-    const updated = await saveSetupChange(
-      guild,
-      { ...setup, [key]: roleId },
-      interaction.user.id,
-      key === "moderatorRoleId"
-        ? "Recorded moderator role"
-        : key === "seniorQuartermasterRoleId"
-          ? "Senior Quartermaster uniform role"
-          : "Quartermaster uniform role",
-      setup[key] ?? "Not configured",
-      roleId,
-    );
-    await interaction.update(discordRolePanel(updated, activeSession?.nonce ?? nonce ?? ""));
-    return;
-  }
-  if (id === "setup:security-owner") {
-    if (!interaction.isUserSelectMenu()) {
-      throw new Error("Choose the Security / Payout Owner with the server member selector.");
-    }
-    const ownerId = selectedSettingsValue(interaction);
-    const owner = await guild.members.fetch({ user: ownerId, force: true });
-    if (
-      owner.id !== guild.ownerId &&
-      !owner.permissions.has(PermissionFlagsBits.Administrator)
-    ) {
-      throw new Error("The selected Security / Payout Owner must be the server owner or a current Administrator.");
-    }
-    const updated = await saveSetupChange(
-      guild,
-      { ...setup, securityOwnerId: ownerId },
-      interaction.user.id,
-      "Security / Payout Owner",
-      setup.securityOwnerId ?? "Not configured",
-      ownerId,
-    );
-    await interaction.update(discordRolePanel(updated, activeSession?.nonce ?? nonce ?? ""));
-    return;
-  }
-  if (
-    id === "setup:uniforms-config" ||
-    id === "setup:uniforms-veteran-config" ||
-    id === "setup:uniforms-reset" ||
-    id === "setup:uniforms-spreadsheet-config" ||
-    id === "setup:uniforms-spreadsheet-reset" ||
-    id === "setup:uniforms-recover"
-  ) {
-    if (!interaction.isButton()) {
-      throw new Error("Uniforms settings controls must be used from their settings page.");
-    }
-    await handleUniformSettingsComponent(interaction, setup);
     return;
   }
   if (id === "setup:bot-state") {
@@ -2885,15 +2520,12 @@ async function handleSetupComponent(interaction: SettingsComponentInteraction): 
     return;
   }
   if (id === "setup:view") {
-    const uniforms = uniformSettingsFor(setup);
     await interaction.update({ embeds: [outcomeEmbed("Configuration", "Saved server configuration and authorization policy.", "info", [
       { name: "Audit Channel", value: `<#${setup.auditChannelId}>` },
       { name: "Blacklist Role", value: setup.blacklistRoleId ? `<@&${setup.blacklistRoleId}>` : "Not configured" },
-       { name: "Administration", value: "Current Administrator permission only" },
-       { name: "Senior Quartermaster", value: setup.seniorQuartermasterRoleId ? `<@&${setup.seniorQuartermasterRoleId}> — uniform logging only` : "Not configured" },
-       { name: "Quartermaster", value: setup.quartermasterRoleId ? `<@&${setup.quartermasterRoleId}> — uniform logging only` : "Not configured" },
-      { name: "Uniform /log", value: uniforms.logChannelId ? `<#${uniforms.logChannelId}>` : "Not configured", inline: true },
-      { name: "Uniform /moderated", value: uniforms.moderatedChannelId ? `<#${uniforms.moderatedChannelId}>` : "Not configured", inline: true },
+      { name: "Administration", value: "Current Administrator permission only" },
+      { name: "Blacklist access", value: "Configured command-specific roles/users, if any" },
+      { name: "Trello board", value: trelloMappingsFor(setup).boardId ? "Configured" : "Not configured" },
     ])], components: [] });
   }
 }
@@ -2904,7 +2536,7 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
   const rawId = interaction.customId;
   const id = rawId.replace(/:([a-f0-9]{32})$/, "");
   if (ownerOnlySecurityControls.has(id)) {
-    await requireConfiguredSecurityOwner(guild, interaction.user.id, setup, id);
+    await requireCurrentAdministrator(guild, interaction.user.id, setup, id);
   }
   const nonce = rawId.match(/:([a-f0-9]{32})$/)?.[1];
   const session = setupSessions.get(setupSessionId(guild.id, interaction.user.id));
@@ -2914,18 +2546,6 @@ async function handleSetupModal(interaction: ModalSubmitInteraction): Promise<vo
   if (id === "setup-modal:maintenance-reason") {
     const reason = cleanText(interaction.fields.getTextInputValue("reason"), "Maintenance reason");
     await createMaintenanceConfirmation(interaction, true, reason);
-    return;
-  }
-  if (id === "setup-modal:uniforms" || id === "setup-modal:uniforms-veteran") {
-    await handleUniformSettingsModal(interaction, setup);
-    return;
-  }
-  if (id === "setup-modal:uniforms-recover") {
-    await handleUniformRecoveryModal(interaction, setup);
-    return;
-  }
-  if (id === "setup-modal:uniforms-spreadsheet") {
-    await handleUniformSpreadsheetSettingsModal(interaction, setup);
     return;
   }
   if (
@@ -4291,241 +3911,6 @@ function handleRevoke(
   });
 }
 
-function payoutPreviewFields(snapshot: Awaited<ReturnType<typeof readPayoutSnapshot>>) {
-  return [
-    ...snapshot.roles.map((role) => ({
-      name: role.role,
-      value: `${role.total} Robux · ${role.participants.length} participant${role.participants.length === 1 ? "" : "s"}`,
-      inline: true,
-    })),
-    { name: "Grand Total", value: `${snapshot.grandTotal} Robux`, inline: true },
-    { name: "Source", value: "Payout Logging1 (read only)", inline: true },
-    { name: "Uniform clear", value: `${snapshot.spreadsheet.logTab}!${snapshot.grids.log.range.a1}; F${snapshot.grids.log.range.startRow}:F${snapshot.grids.log.range.endRow}`, inline: false },
-    { name: "Moderated clear", value: `${snapshot.spreadsheet.moderatedTab}!${snapshot.grids.moderated.range.a1}`, inline: false },
-  ];
-}
-
-async function requirePayoutSafety(
-  guild: Guild,
-  actorId: string,
-  setup: GuildSetup,
-  command: string,
-): Promise<void> {
-  const authorized = await canUseRegisteredCommand({
-    guild,
-    user: { id: actorId },
-  } as ChatInputCommandInteraction, setup, "payout");
-  if (!authorized) {
-    throw new Error("Only an Administrator, the server owner, or a configured payout grant may use this command.");
-  }
-  const denial = await mutateSecurityState(guild.id, (state) => {
-    if (state.lockdown.active) {
-      return `Security lockdown is active: ${state.lockdown.reason || "no reason provided"}.`;
-    }
-    if (
-      securitySettingsFor(setup).recentPermissionEscalationProtection &&
-      administratorInEscalationWindow(state, actorId)
-    ) {
-      return "This administrator permission was granted recently or has not previously been observed. Payout is delayed for 10 minutes.";
-    }
-    if (state.maintenance.active) {
-      return "Bot maintenance mode is active. Payout is temporarily unavailable.";
-    }
-    return undefined;
-  });
-  if (denial) throw new Error(denial);
-}
-
-function payoutRecoveryDetails(run: PayoutRun): {
-  text: string;
-  label: string;
-  mode: NonNullable<PayoutConfirmation["mode"]>;
-  style: ButtonStyle;
-} {
-  if (run.state === "complete") {
-    return {
-      text: "This archived payout is already complete but retained a legacy workbook lock. Finalizing removes only that matching lock; it sends no report and changes no spreadsheet cells.",
-      label: "Finalize Completed Lock",
-      mode: "resume",
-      style: ButtonStyle.Danger,
-    };
-  }
-  if (run.state === "unsafe" || run.state === "cleared" || run.state === "clearing") {
-    return {
-      text: run.state === "cleared"
-        ? "The archived reset completed, but local completion bookkeeping did not finish. This recovery only verifies the exact archived ranges are blank and Sold is false, then finalizes records. It never sends another DM or repeats deletion."
-        : run.state === "clearing"
-          ? "The bot stopped while the Google Sheets reset was being attempted. This recovery only verifies the exact archived ranges are blank and Sold is false, then finalizes records. It never sends another DM or repeats deletion."
-        : "The prior Google Sheets reset response was unknown. This recovery will only verify the exact archived ranges are already blank and Sold is false; it will never send another DM or repeat deletion. It refuses a newer/changed payout source.",
-      label: "Verify and Finalize Reset",
-      mode: "recover-clear",
-      style: ButtonStyle.Danger,
-    };
-  }
-  if (run.reportState === "uncertain") {
-    return {
-      text: "Discord could not confirm the private payout report. Do not continue unless you personally received the complete report (all pages). Choosing the confirmation below records that acknowledgement and then clears the archived uniform ranges; it will not send any DM again.",
-      label: "I Received Full Report — Clear",
-      mode: "acknowledge",
-      style: ButtonStyle.Danger,
-    };
-  }
-  return {
-    text: run.reportState === "delivered"
-      ? "The private report was already delivered. Resume only the archived reset; no report will be sent again."
-      : "This archived payout has a pending private report. Resume sends only undelivered report pages, then clears the archived ranges.",
-    label: "Resume Payout",
-    mode: "resume",
-    style: ButtonStyle.Danger,
-  };
-}
-
-async function renderPayoutRecovery(
-  interaction: ChatInputCommandInteraction,
-  run: PayoutRun,
-): Promise<void> {
-  const details = payoutRecoveryDetails(run);
-  const nonce = crypto.randomUUID().replaceAll("-", "");
-  const pending: PayoutConfirmation = {
-    userId: interaction.user.id, guildId: interaction.guild!.id, runId: run.runId,
-    expiresAt: Date.now() + 10 * 60_000, original: interaction, mode: details.mode,
-  };
-  payoutConfirmations.set(nonce, pending);
-  const reply = await interaction.editReply({
-    content: "",
-    embeds: [outcomeEmbed(
-      "Payout Recovery Required",
-      `${details.text}\n\nRun: ${run.runId}\nState: ${run.state}; report: ${run.reportState}.`,
-      "warning",
-    )],
-    components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`payout:${details.mode}:${nonce}`).setLabel(details.label).setStyle(details.style),
-      new ButtonBuilder().setCustomId(`payout:cancel:${nonce}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
-    )],
-    allowedMentions: noMentions,
-  });
-  pending.messageId = reply.id;
-}
-
-async function handlePayoutCommand(interaction: ChatInputCommandInteraction, setup: GuildSetup): Promise<void> {
-  await requirePayoutSafety(interaction.guild!, interaction.user.id, setup, "/payout");
-  // Discover by guild before consulting current settings. An administrator may
-  // have edited the configured workbook after a run started; that must not
-  // turn the archived lock into a permanently unreachable recovery.
-  const guildActive = await activePayoutRunForGuild(interaction.guild!.id);
-  if (guildActive) {
-    await renderPayoutRecovery(interaction, guildActive);
-    return;
-  }
-  const spreadsheet = uniformSettingsFor(setup).spreadsheet;
-  if (!spreadsheet) throw new Error("Google Sheets uniform logging is not configured.");
-  const normalized = normalizeUniformSpreadsheetConfig(spreadsheet);
-  const locked = await payoutLockForWorkbook(normalized.spreadsheetId);
-  if (locked) {
-    const active = await getPayoutRun(locked.runId);
-    if (!active || active.spreadsheetId !== normalized.spreadsheetId || active.state === "complete") {
-      throw new Error("The payout lock archive is inconsistent; do not start a new payout until it is reviewed.");
-    }
-    await renderPayoutRecovery(interaction, active);
-    return;
-  }
-  const snapshot = await readPayoutSnapshot(googlePayoutSheetsClient, spreadsheet);
-  const run = await archivePayoutPreview(snapshot, interaction.guild!.id, interaction.user.id);
-  const nonce = crypto.randomUUID().replaceAll("-", "");
-  const pending: PayoutConfirmation = { userId: interaction.user.id, guildId: interaction.guild!.id, runId: run.runId,
-    expiresAt: Date.now() + 10 * 60_000, original: interaction };
-  payoutConfirmations.set(nonce, pending);
-  const reply = await interaction.editReply({
-    content: "",
-    embeds: [outcomeEmbed("Payout Preview",
-      "No spreadsheet cells have changed. Confirmation privately reports this payout, then clears the listed uniform data. This does not transfer Robux.",
-      "warning", payoutPreviewFields(snapshot))],
-    components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`payout:confirm:${nonce}`).setLabel("Confirm Payout").setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId(`payout:cancel:${nonce}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
-    )],
-    allowedMentions: noMentions,
-  });
-  pending.messageId = reply.id;
-}
-
-async function handlePayoutConfirmation(interaction: ButtonInteraction): Promise<void> {
-  const match = /^payout:(confirm|cancel|resume|acknowledge|recover-clear):([a-f0-9]{32})$/.exec(interaction.customId);
-  const pending = match && payoutConfirmations.get(match[2]);
-  if (!match || !pending || pending.expiresAt <= Date.now() || pending.userId !== interaction.user.id ||
-      pending.guildId !== interaction.guildId || !interaction.guild ||
-      (match[1] !== "cancel" && match[1] !== (pending.mode ?? "confirm")) ||
-      (pending.messageId !== undefined && interaction.message.id !== pending.messageId)) {
-    throw new Error("This payout confirmation has expired or belongs to another administrator.");
-  }
-  if (pending.claimed) throw new Error("This payout confirmation is already being processed.");
-  pending.claimed = true;
-  try {
-    const setup = await getGuildSetup(pending.guildId);
-    if (!setup) throw new Error("Complete setup before confirming a payout.");
-    await requirePayoutSafety(interaction.guild, interaction.user.id, setup, "/payout confirmation");
-    if (match[1] === "cancel") {
-      payoutConfirmations.delete(match[2]);
-      await interaction.update({ ...responseWithEmbed("Payout preview cancelled. No spreadsheet cells changed.", "Payout Cancelled", "info"), components: [] });
-      return;
-    }
-    const current = await getPayoutRun(pending.runId);
-    const configured = uniformSettingsFor(setup).spreadsheet;
-    const recovery = match[1] === "resume" || match[1] === "acknowledge" || match[1] === "recover-clear";
-    if (!current || current.guildId !== pending.guildId ||
-        (!recovery && (current.actorId !== interaction.user.id || !configured ||
-          normalizeUniformSpreadsheetConfig(configured).spreadsheetId !== current.spreadsheetId))) {
-      throw new Error("The archived payout or configured workbook changed. Run /payout again.");
-    }
-    if (!recovery) {
-      if (!configured) throw new Error("Google Sheets uniform logging is not configured.");
-      const latest = await readPayoutSnapshot(googlePayoutSheetsClient, configured);
-      if (latest.sourceFingerprint !== current.sourceFingerprint ||
-          latest.clearCells.some((cell, index) => cell.range !== current.clearCells[index]?.range)) {
-        payoutConfirmations.delete(match[2]);
-        throw new Error("Payout source or reset configuration changed after preview. Run /payout again; no cells changed.");
-      }
-    }
-    payoutConfirmations.delete(match[2]);
-    await interaction.deferUpdate();
-    if (match[1] === "acknowledge") {
-      await acknowledgeUncertainPayoutReport(pending.runId, interaction.user.id);
-    }
-    const completed = match[1] === "recover-clear"
-      ? await recoverUnknownPayoutClear(googlePayoutSheetsClient, pending.runId)
-      : await confirmArchivedPayout(googlePayoutSheetsClient, pending.runId, {
-        sendPage: async (_run, page) => {
-          const embeds = page.map((embed) => ({
-          title: embed.title, description: embed.description, fields: embed.fields, footer: { text: embed.footer },
-        }));
-        const message = await interaction.user.send({ embeds, allowedMentions: noMentions });
-        return message.id;
-      },
-      });
-    await pending.original.editReply({
-      ...responseWithEmbed(`Payout run ${completed.runId} is complete. Your private payout summary was delivered before the reset.`,
-        "Payout Complete", "success"),
-      components: [],
-    });
-  } catch (error) {
-    pending.claimed = false;
-    throw error;
-  }
-}
-
-async function withUniformInteractionActivity<T>(
-  guildId: string | null,
-  work: () => Promise<T>,
-): Promise<T> {
-  if (!guildId) return work();
-  const setup = await getGuildSetup(guildId);
-  const spreadsheet = setup && uniformSettingsFor(setup).spreadsheet;
-  // Let the established uniform handler return its normal setup error if
-  // there is no configured workbook; there is no workbook to serialize then.
-  if (!spreadsheet) return work();
-  return withPayoutAwareUniformActivity(spreadsheet, work);
-}
-
 async function handleInteraction(
   interaction: ChatInputCommandInteraction,
 ): Promise<void> {
@@ -4723,61 +4108,6 @@ async function handleInteraction(
       "This server has not completed bot setup. Ask the server owner or an administrator to run /settings first.",
       "Setup Required",
     ));
-    return;
-  }
-
-  if (interaction.commandName === "payout") {
-    try {
-      if (!(await canUseRegisteredCommand(interaction, setup, "payout"))) {
-        throw new Error("Only an Administrator, the server owner, or a configured payout grant may use this command.");
-      }
-      await handlePayoutCommand(interaction, setup);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Could not prepare a payout preview.";
-      await interaction.editReply(errorResponse(message, "Payout Unavailable"));
-    }
-    return;
-  }
-
-  // Uniform logging is intentionally independent of blacklist validation,
-  // Trello readiness, destructive-action limits, and security lockdown.
-  // Maintenance remains the existing global emergency block above.
-  if (uniformCommandNames.has(interaction.commandName)) {
-    try {
-      if (!(await canUseRegisteredCommand(interaction, setup, interaction.commandName))) {
-        throw new Error("Only an Administrator, the server owner, or a configured command grant may use this command.");
-      }
-      const spreadsheet = uniformSettingsFor(setup).spreadsheet;
-      if (spreadsheet) {
-        await withPayoutAwareUniformActivity(spreadsheet, () => handleUniformCommand(interaction, setup, botAvatarUrl()));
-      } else {
-        await handleUniformCommand(interaction, setup, botAvatarUrl());
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "The uniform log failed unexpectedly.";
-      await interaction.editReply(errorResponse(
-        error instanceof UniformNotificationError
-          ? message
-          : `Could not complete the uniform log: ${message}`,
-        error instanceof UniformNotificationError ? "Saved, Notification Failed" : "Uniform Log Failed",
-      ));
-    }
-    return;
-  }
-  if (interaction.commandName === uniformRelogCommandName) {
-    try {
-      if (!(await canUseRegisteredCommand(interaction, setup, "relog"))) {
-        throw new Error("Only an Administrator, the server owner, or a configured relog grant may use this command.");
-      }
-      await withUniformInteractionActivity(interaction.guildId, () => handleUniformRelogCommand(interaction));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "The relog failed unexpectedly.";
-      await interaction.editReply(
-        error instanceof UniformDeliveryRecoveryError
-          ? uniformDeliveryRecoveryResponse(error)
-          : errorResponse(`Could not replace the uniform link: ${message}`, "Uniform Relog Failed"),
-      );
-    }
     return;
   }
 
@@ -5087,36 +4417,9 @@ async function replyInteractionError(
   error: unknown,
 ): Promise<void> {
   const message = error instanceof Error ? error.message : "The interaction failed unexpectedly.";
-  let payload: ReturnType<typeof errorResponse> | ReturnType<typeof uniformDeliveryRecoveryResponse>;
-  if (error instanceof UniformDeliveryRecoveryError) {
-    payload = uniformDeliveryRecoveryResponse(error);
-  } else {
-    // A recovery modal is authorized by the surrounding settings session
-    // before its handler runs. If that authorization fails, expose only the
-    // submitted ID and never manufacture a retry control for the caller.
-    let recoverySubmissionId: string | undefined;
-    if (interaction.customId.startsWith("setup-modal:uniforms-recover") && "fields" in interaction) {
-      try {
-        const candidate = interaction.fields.getTextInputValue("submission_id").trim();
-        if (/^\d{17,25}$/.test(candidate)) recoverySubmissionId = candidate;
-      } catch {
-        recoverySubmissionId = undefined;
-      }
-    }
-    payload = recoverySubmissionId
-      ? uniformDeliveryRecoveryResponse(new UniformDeliveryRecoveryError(
-        recoverySubmissionId,
-        message,
-        "none",
-      ))
-      : errorResponse(message, "Interaction Error");
-  }
+  const payload = errorResponse(message, "Interaction Error");
   if (interaction.deferred || interaction.replied) {
-    if (error instanceof UniformDeliveryRecoveryError && typeof interaction.editReply === "function") {
-      await interaction.editReply(payload).catch(() => undefined);
-    } else {
-      await interaction.followUp({ ...payload, ephemeral: true }).catch(() => undefined);
-    }
+    await interaction.followUp({ ...payload, ephemeral: true }).catch(() => undefined);
   } else {
     await interaction.reply({ ...payload, ephemeral: true }).catch(() => undefined);
   }
@@ -5157,7 +4460,6 @@ async function connectDiscord(): Promise<void> {
               );
               await observeExistingAdministrators(guild);
               await runGuildBlacklistSync(guild, "startup");
-              await recoverPendingUniformReviews(guild);
             } else {
               clearBlacklistSyncTimer();
               setRecoveryStatus(
@@ -5189,43 +4491,6 @@ async function connectDiscord(): Promise<void> {
         }
         if (interaction.customId.startsWith("identity-prompt:")) {
           await handleIdentityPromptButton(interaction);
-          return;
-        }
-        if (interaction.customId.startsWith("payout:")) {
-          await handlePayoutConfirmation(interaction);
-          return;
-        }
-        if (interaction.customId.startsWith("uniform:") && interaction.guildId && await maintenanceActive(interaction.guildId)) {
-          await interaction.reply({
-            ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"),
-            ephemeral: true,
-          });
-          return;
-        }
-        if (interaction.customId.startsWith("uniform:submit:")) {
-          await withUniformInteractionActivity(interaction.guildId, () => handleUniformSubmitButton(interaction, maintenanceActive));
-          return;
-        }
-        if (interaction.customId.startsWith("uniform:retry:")) {
-          await withUniformInteractionActivity(interaction.guildId, () => handleUniformRetryButton(interaction, maintenanceActive));
-          return;
-        }
-        if (interaction.customId.startsWith("uniform:publish-success:") ||
-            interaction.customId.startsWith("uniform:publish-moderated:")) {
-          await withUniformInteractionActivity(interaction.guildId, () => handleUniformPublishingButton(interaction));
-          return;
-        }
-        if (interaction.customId.startsWith("uniform:relog-publish-success:") ||
-            interaction.customId.startsWith("uniform:relog-publish-moderated:")) {
-          await withUniformInteractionActivity(interaction.guildId, () => handleUniformRelogPublishingButton(interaction));
-          return;
-        }
-        if (interaction.customId.startsWith("uniform:cancel:")) {
-          await withUniformInteractionActivity(interaction.guildId, () => handleUniformCancelButton(interaction));
-          return;
-        }
-        if (interaction.customId.startsWith("uniform:purchase:") || interaction.customId.startsWith("uniform:assist:")) {
-          await withUniformInteractionActivity(interaction.guildId, () => handleUniformCustomerButton(interaction));
           return;
         }
         const [, confirmationId] = interaction.customId.split(/:(.+)/);
@@ -5293,29 +4558,13 @@ async function connectDiscord(): Promise<void> {
           await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
           return;
         }
-        await withUniformInteractionActivity(interaction.guildId, () => handleUniformUserSelection(interaction));
+        await interaction.reply({
+          ...errorResponse("This interaction is no longer supported.", "Interaction Unavailable"),
+          ephemeral: true,
+        });
       })().catch((error) => replyInteractionError(interaction, error));
     } else if (interaction.isStringSelectMenu()) {
       void (async () => {
-        if (interaction.customId.startsWith("uniform:publish-moderated-select:")) {
-          if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
-            await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
-            return;
-          }
-          await withUniformInteractionActivity(interaction.guildId, () => handleUniformPublishingModerationSelect(interaction));
-          return;
-        }
-        if (interaction.customId.startsWith("uniform:relog-select:")) {
-          if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
-            await interaction.reply({
-              ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"),
-              ephemeral: true,
-            });
-            return;
-          }
-          await withUniformInteractionActivity(interaction.guildId, () => handleUniformRelogSelection(interaction));
-          return;
-        }
         if (interaction.customId.startsWith("settings:")) {
           await handleSettingsComponent(interaction);
           return;
@@ -5337,30 +4586,6 @@ async function connectDiscord(): Promise<void> {
         }
         if (interaction.customId.startsWith("settings-modal:")) {
           await handleSettingsModal(interaction);
-          return;
-        }
-        if (interaction.customId.startsWith("uniform:assist-modal:")) {
-          if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
-            await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
-            return;
-          }
-          await withUniformInteractionActivity(interaction.guildId, () => handleUniformAssistanceModal(interaction));
-          return;
-        }
-        if (interaction.customId.startsWith("uniform:publish-modal:")) {
-          if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
-            await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
-            return;
-          }
-          await withUniformInteractionActivity(interaction.guildId, () => handleUniformPublishingModal(interaction));
-          return;
-        }
-        if (interaction.customId.startsWith("uniform:relog-publish-modal:")) {
-          if (interaction.guildId && await maintenanceActive(interaction.guildId)) {
-            await interaction.reply({ ...responseWithEmbed(maintenanceMessage, "Maintenance Active", "warning"), ephemeral: true });
-            return;
-          }
-          await withUniformInteractionActivity(interaction.guildId, () => handleUniformRelogPublishingModal(interaction));
           return;
         }
         if (interaction.guildId && await maintenanceActive(interaction.guildId)) {

@@ -51,26 +51,26 @@ export default function Terms() {
           <li>Utilize the Service in any manner that violates the Discord Terms of Service or Roblox Terms of Use.</li>
         </ul>
 
-        <h2>3. Command Authorization and Workflow Execution</h2>
+        <h2>3. Command Authorization and Moderation</h2>
         <p>
-          The Service facilitates administrative workflows, moderation actions, uniform management, and external platform syncing based on commands issued by authorized users. 
+          The Service provides server setup and blacklist moderation tools, including audit records, role enforcement, and integrations with Trello and Roblox. It acts only on commands and configuration provided by authorized users.
         </p>
         <ul>
           <li><strong>Delegation of Authority:</strong> When an authorized user issues a command, they direct the Service to execute actions within the Guild or on integrated platforms. The Guild administrator is solely responsible for determining which users possess the roles required to issue such commands.</li>
-          <li><strong>Accuracy:</strong> You are responsible for ensuring the accuracy of data provided to the Service. {OPERATOR_NAME} is not liable for unintended moderation actions, blacklist entries, or workflow executions resulting from inaccurate inputs or misconfigured roles.</li>
+          <li><strong>Accuracy:</strong> You are responsible for ensuring the accuracy of data provided to the Service. {OPERATOR_NAME} is not liable for unintended moderation actions or blacklist entries resulting from inaccurate inputs or misconfigured roles.</li>
         </ul>
 
         <h2>4. Third-Party Platforms and Integrations</h2>
         <p>
-          The Service is an independent application and is <strong>not affiliated with, endorsed by, or sponsored by Discord Inc., Roblox Corporation, Trello (Atlassian), or Google LLC.</strong>
+          The Service is an independent application and is <strong>not affiliated with, endorsed by, or sponsored by Discord Inc., Roblox Corporation, or Trello (Atlassian).</strong>
         </p>
         <p>
-          To provide its features, the Service interacts with third-party APIs. Your use of the Service is subject to your compliance with the respective terms and policies of these third-party platforms. We do not control and are not responsible for the availability, uptime, or functionality of these external APIs.
+          To provide its blacklist moderation and integration features, the Service may interact with Discord, Roblox, and Trello APIs. Your use of the Service is subject to your compliance with the respective terms and policies of these third-party platforms. We do not control and are not responsible for the availability, uptime, or functionality of these external APIs.
         </p>
 
         <h2>5. User-Submitted Content</h2>
         <p>
-          Through the Service, you may submit text, Roblox asset identifiers, configuration settings, or other data ("User Content"). By submitting User Content, you grant {OPERATOR_NAME} a worldwide, non-exclusive, royalty-free license to process, store, and transmit this content solely for the purpose of operating and maintaining the Service. You retain all ownership rights to your User Content. You are entirely responsible for the legality and appropriateness of all User Content processed through your Guild.
+          Through the Service, you may submit usernames, moderation reasons, server configuration, and other information needed for blacklisting and moderation ("User Content"). By submitting User Content, you grant {OPERATOR_NAME} a worldwide, non-exclusive, royalty-free license to process, store, and transmit this content solely for the purpose of operating and maintaining the Service. You retain all ownership rights to your User Content. You are entirely responsible for the legality and appropriateness of all User Content processed through your Guild.
         </p>
 
         <h2>6. Service Changes and Availability</h2>

@@ -34,9 +34,19 @@ export interface GuildSetup {
 }
 
 export const commandPermissionNames = [
-  "settings", "payout", "blacklist", "revoke_blacklist", "create", "moderated", "relog",
+  "settings", "blacklist", "revoke_blacklist", "blacklist_lookup",
 ] as const;
-export type CommandPermissionName = typeof commandPermissionNames[number] | "created" | "log";
+/**
+ * Legacy command names remain part of the persisted document contract so
+ * records written by older bot versions can still be read without migration
+ * or loss of their old grants. Only commandPermissionNames are exposed by the
+ * current settings UI.
+ */
+const persistedCommandPermissionNames = [
+  ...commandPermissionNames,
+  "payout", "create", "moderated", "relog", "created", "log",
+] as const;
+export type CommandPermissionName = typeof persistedCommandPermissionNames[number];
 export interface CommandPermissionGrant {
   roleIds: string[];
   memberIds: string[];
@@ -44,8 +54,6 @@ export interface CommandPermissionGrant {
 
 export function commandPermissionName(command: string): CommandPermissionName | undefined {
   if (command === "setup" || command === "settings") return "settings";
-  if (command === "log") return "log";
-  if (command === "created") return "created";
   if ((commandPermissionNames as readonly string[]).includes(command)) {
     return command as CommandPermissionName;
   }
@@ -161,30 +169,6 @@ export interface UniformSpreadsheetSettings {
   createMissingTabs?: boolean;
 }
 
-export const defaultUniformSettings = (): UniformSettings => ({
-  authorizedRoleIds: [],
-  authorizedMemberIds: [],
-});
-
-export function uniformSettingsFor(setup: GuildSetup): UniformSettings {
-  const spreadsheet = setup.uniforms?.spreadsheet
-    ? {
-        ...setup.uniforms.spreadsheet,
-        logTab: setup.uniforms.spreadsheet.logTab || "Uniform Logs",
-        moderatedTab: setup.uniforms.spreadsheet.moderatedTab || "Moderated Logs",
-        logRange: setup.uniforms.spreadsheet.logRange || "A2:E",
-        moderatedRange: setup.uniforms.spreadsheet.moderatedRange || "A2:D",
-      }
-    : undefined;
-  return {
-    ...defaultUniformSettings(),
-    ...setup.uniforms,
-    authorizedRoleIds: [...(setup.uniforms?.authorizedRoleIds ?? [])],
-    authorizedMemberIds: [...(setup.uniforms?.authorizedMemberIds ?? [])],
-    ...(spreadsheet ? { spreadsheet } : {}),
-  };
-}
-
 /** Blacklist submitter grants are deliberately separate from all other roles. */
 export function blacklistAccessFor(setup: GuildSetup): {
   authorizedRoleIds: string[];
@@ -195,14 +179,6 @@ export function blacklistAccessFor(setup: GuildSetup): {
     authorizedRoleIds: [...new Set((setup.blacklistAuthorizedRoleIds ?? []).filter(valid))],
     authorizedMemberIds: [...new Set((setup.blacklistAuthorizedMemberIds ?? []).filter(valid))],
   };
-}
-
-/** Roles which receive the narrowly-scoped uniform submitter permission. */
-export function quartermasterUniformRoleIds(setup: GuildSetup): string[] {
-  return [...new Set([
-    setup.seniorQuartermasterRoleId,
-    setup.quartermasterRoleId,
-  ].filter((id): id is string => Boolean(id)))];
 }
 
 export const defaultSecuritySettings = (): SecuritySettings => ({
@@ -287,7 +263,7 @@ function isGuildSetup(value: unknown): value is GuildSetup {
   const validCommandPermissions = permissions === undefined || Boolean(
     permissions && typeof permissions === "object" &&
     Object.entries(permissions).every(([name, value]) =>
-      ((commandPermissionNames as readonly string[]).includes(name) || name === "log") &&
+      (persistedCommandPermissionNames as readonly string[]).includes(name) &&
       Boolean(value) && typeof value === "object" &&
       validOptionalIds((value as Record<string, unknown>)["roleIds"]) &&
       validOptionalIds((value as Record<string, unknown>)["memberIds"]),
